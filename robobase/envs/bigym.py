@@ -27,6 +27,7 @@ from demonstrations.utils import Metadata
 
 from typing import List, Dict, Tuple, Callable
 import copy
+import inspect
 
 UNIT_TEST = False
 
@@ -144,16 +145,22 @@ class BiGymEnvFactory(EnvFactory):
                 floating_base=True,
             )
 
-        return bigym_class(
+        env_kwargs = dict(
             render_mode=cfg.env.render_mode,
             action_mode=action_mode,
             observation_config=ObservationConfig(
                 cameras=camera_configs if cfg.pixels else [],
                 proprioception=True,
-                privileged_information=False if cfg.pixels else True,
+                privileged_information=cfg.env.get(
+                    "privileged_information", (not cfg.pixels)
+                ),
             ),
             control_frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
         )
+        if "arm_action_mode" in inspect.signature(bigym_class.__init__).parameters:
+            env_kwargs["arm_action_mode"] = cfg.env.get("arm_action_mode", "scripted")
+
+        return bigym_class(**env_kwargs)
 
     def make_train_env(self, cfg: DictConfig) -> gym.vector.VectorEnv:
         vec_env_class = gym.vector.SyncVectorEnv
