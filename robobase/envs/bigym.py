@@ -22,7 +22,8 @@ import logging
 import numpy as np
 
 from demonstrations.demo import DemoStep
-from demonstrations.demo_store import DemoStore
+from demonstrations.demo_store import DemoStore, DemoNotFoundError
+from demonstrations.demo_converter import DemoConverter
 from demonstrations.utils import Metadata
 
 from typing import List, Dict, Tuple, Callable
@@ -61,6 +62,37 @@ def _task_name_to_env_class(task_name: str) -> type[BiGymEnv]:
 
 
 class BiGymEnvFactory(EnvFactory):
+    def _load_human_arm_fallback_demos(
+        self, cfg: DictConfig, num_demos: int, target_env: BiGymEnv, target_frequency: int
+    ):
+        base_task_name = cfg.env.task_name.removeprefix("human_arm_")
+        fallback_cfg = copy.deepcopy(cfg)
+        fallback_cfg.env.task_name = base_task_name
+
+        source_env = self._create_env(fallback_cfg)
+        demo_store = DemoStore()
+        source_demos = demo_store.get_demos(
+            Metadata.from_env(source_env, is_lightweight=True),
+            amount=num_demos,
+        )
+
+        target_robot = Metadata.from_env(target_env).get_robot()
+        converted_demos = []
+        for demo in source_demos:
+            if target_frequency != CONTROL_FREQUENCY_MAX:
+                demo = DemoConverter.decimate(
+                    demo,
+                    target_frequency,
+                    CONTROL_FREQUENCY_MAX,
+                    robot=target_robot,
+                )
+            converted_demo = DemoConverter.create_demo_in_new_env(demo, target_env)
+            demo_store.cache_demo(converted_demo, frequency=target_frequency)
+            converted_demos.append(converted_demo)
+
+        source_env.close()
+        return converted_demos
+
     def _wrap_env(self, env, cfg, demo_env=False, train=True, return_raw_spaces=False):
         # last two are grippers
         assert cfg.demos != 0
@@ -191,16 +223,29 @@ class BiGymEnvFactory(EnvFactory):
 
         logging.info("Start to load demos.")
         env = self._create_env(cfg)
+        target_frequency = CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate
 
         demo_store = DemoStore()
         if np.isinf(num_demos):
             num_demos = -1
 
-        demos = demo_store.get_demos(
-            Metadata.from_env(env),
-            amount=num_demos,
-            frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
-        )
+        try:
+            demos = demo_store.get_demos(
+                Metadata.from_env(env),
+                amount=num_demos,
+                frequency=target_frequency,
+            )
+        except DemoNotFoundError:
+            if not cfg.env.task_name.startswith("human_arm_"):
+                env.close()
+                raise
+            logging.info(
+                "Direct demos for %s were not found. Falling back to base task demos.",
+                cfg.env.task_name,
+            )
+            demos = self._load_human_arm_fallback_demos(
+                cfg, num_demos, env, target_frequency
+            )
 
         for demo in demos:
             for ts in demo.timesteps:
