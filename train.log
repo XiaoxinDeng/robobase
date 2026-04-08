@@ -1,0 +1,95 @@
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/train.py", line 14, in main
+    workspace = Workspace(cfg)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 128, in __init__
+    env_factory = _create_default_envs(cfg)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 98, in _create_default_envs
+    if cfg.env.env_name == "rlbench":
+omegaconf.errors.ConfigAttributeError: Key 'env' is not in struct
+    full_key: env
+    object_type=dict
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/train.py", line 14, in main
+    workspace = Workspace(cfg)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 128, in __init__
+    env_factory = _create_default_envs(cfg)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 98, in _create_default_envs
+    if cfg.env.env_name == "rlbench":
+omegaconf.errors.ConfigAttributeError: Key 'env' is not in struct
+    full_key: env
+    object_type=dict
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[2026-04-01 03:58:58,080][OpenGL.acceleratesupport][INFO] - No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[2026-04-01 03:58:58,294][absl][INFO] - MUJOCO_GL=egl, attempting to import specified OpenGL backend.
+[2026-04-01 03:58:58,300][absl][INFO] - MuJoCo library version is: 3.1.5
+workspace: /home/xd1125/Workspace/safe_bigym_hoi/external/robobase/exp_local/pixel_act/bigym_drawer_top_open_20260401035856
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/xd1125/.netrc.
+wandb: Currently logged in as: nixsuperdai (2530670013-tsinghua-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run fjc3cw0p
+wandb: Tracking run with wandb version 0.25.0
+wandb: Run data is saved locally in /home/xd1125/Workspace/safe_bigym_hoi/external/robobase/wandb/run-20260401_035859-fjc3cw0p
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run act
+wandb: ⭐️ View project at https://wandb.ai/2530670013-tsinghua-university/act_bigym
+wandb: 🚀 View run at https://wandb.ai/2530670013-tsinghua-university/act_bigym/runs/fjc3cw0p
+[2026-04-01 03:59:00,917][root][INFO] - Start to load demos.
+[2026-04-01 03:59:05,334][root][INFO] - Demos are cached already: /home/xd1125/.bigym/demonstrations/0.9.0
+[2026-04-01 03:59:05,335][root][INFO] - Demos are cached already: /home/xd1125/.bigym/demonstrations/0.9.0
+[2026-04-01 03:59:05,335][root][INFO] - Demos are cached already: /home/xd1125/.bigym/demonstrations/0.9.0
+[2026-04-01 03:59:05,948][root][INFO] - Finished loading demos.
+/home/xd1125/miniconda3/envs/safe_bigym_hoi/lib/python3.10/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.is_vector_env to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.is_vector_env` for environment variables or `env.get_wrapper_attr('is_vector_env')` that will search the reminding wrappers.[0m
+  logger.warn(
+/home/xd1125/miniconda3/envs/safe_bigym_hoi/lib/python3.10/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.is_demo_env to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.is_demo_env` for environment variables or `env.get_wrapper_attr('is_demo_env')` that will search the reminding wrappers.[0m
+  logger.warn(
+/home/xd1125/miniconda3/envs/safe_bigym_hoi/lib/python3.10/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/xd1125/miniconda3/envs/safe_bigym_hoi/lib/python3.10/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=ResNet18_Weights.IMAGENET1K_V1`. You can also use `weights=ResNet18_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+[2026-04-01 03:59:15,812][root][WARNING] - Multicam fusion is enabled but view_fusion_model is not set!
+[2026-04-01 03:59:16,298][root][INFO] - 	 saving to disk: /tmp/tmpqtv4z174
+[2026-04-01 03:59:16,300][root][INFO] - Creating a UniformReplayBuffer replay memory with the following parameters:
+[2026-04-01 03:59:16,300][root][INFO] - 	 frame_stack: 1
+[2026-04-01 03:59:16,300][root][INFO] - 	 replay_capacity: 1000000
+[2026-04-01 03:59:16,300][root][INFO] - 	 batch_size: 256
+[2026-04-01 03:59:16,300][root][INFO] - 	 nstep: 1
+[2026-04-01 03:59:16,300][root][INFO] - 	 gamma: 0.990000
+Skipping failed demonstration 10
+Skipping failed demonstration 24
+/home/xd1125/miniconda3/envs/safe_bigym_hoi/lib/python3.10/site-packages/gymnasium/core.py:311: UserWarning: [33mWARN: env.is_vector_env to get variables from other wrappers is deprecated and will be removed in v1.0, to get this variable you can do `env.unwrapped.is_vector_env` for environment variables or `env.get_wrapper_attr('is_vector_env')` that will search the reminding wrappers.[0m
+  logger.warn(
+[2026-04-01 03:59:16,604][root][INFO] - Clearing disk replay buffer.
+Error executing job with overrides: ['method=act', 'env=bigym/drawer_top_open.yaml', 'launch=act_pixel_bigym']
+Traceback (most recent call last):
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/train.py", line 20, in main
+    workspace.train()
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 337, in train
+    raise e
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 334, in train
+    self._train()
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 341, in _train
+    self._load_demos()
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/workspace.py", line 513, in _load_demos
+    self.env_factory.load_demos_into_replay(
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/envs/bigym.py", line 361, in load_demos_into_replay
+    add_demo_to_replay_buffer(demo_env, buffer)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/utils.py", line 594, in add_demo_to_replay_buffer
+    replay_buffer.add(
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/replay_buffer/uniform_replay_buffer.py", line 409, in add
+    self._check_add_types(transition, self._storage_signature)
+  File "/home/xd1125/Workspace/safe_bigym_hoi/external/robobase/robobase/replay_buffer/uniform_replay_buffer.py", line 507, in _check_add_types
+    raise ValueError(
+ValueError: Add expects 11 elements, received 10.
+list of expected:
+['action', 'demo', 'low_dim_state', 'mode_label', 'proprioception_floating_base_actions', 'reward', 'rgb_head', 'rgb_left_wrist', 'rgb_right_wrist', 'terminal', 'truncated']
+list of actual:
+['action', 'demo', 'low_dim_state', 'proprioception_floating_base_actions', 'reward', 'rgb_head', 'rgb_left_wrist', 'rgb_right_wrist', 'terminal', 'truncated']
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mact[0m at: [34mhttps://wandb.ai/2530670013-tsinghua-university/act_bigym/runs/fjc3cw0p[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20260401_035859-fjc3cw0p/logs[0m
