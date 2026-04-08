@@ -29,9 +29,67 @@ from demonstrations.utils import Metadata
 from typing import List, Dict, Tuple, Callable
 import copy
 import inspect
+from bigym.const import CACHE_PATH
+import os
+import json
+from pathlib import Path
+
 
 UNIT_TEST = False
 
+def _load_mode_label_index(cfg: DictConfig):
+    manifest_path = cfg.env.get("mode_label_manifest", None)
+    if manifest_path is None:
+        return None
+
+    manifest_path = Path(manifest_path).expanduser()
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        entries = json.load(f)
+
+    return {
+        str(entry["uuid"]): Path(entry["mode_label_path"])
+        for entry in entries
+        if entry.get("mode_label_path") is not None
+    }
+
+def _attach_mode_labels_from_sidecar(cfg, demos):
+    mode_label_index = _load_mode_label_index(cfg)
+    if mode_label_index is None:
+        return demos
+
+    kept = []
+    dropped = []
+
+    for demo in demos:
+        demo_uuid = str(demo.uuid)
+        if demo_uuid not in mode_label_index:
+            dropped.append(demo_uuid)
+            continue
+
+        label_path = mode_label_index[demo_uuid]
+        sidecar = np.load(label_path, allow_pickle=True)
+        mode_labels = sidecar["mode_labels"]
+
+        if len(mode_labels) != len(demo.timesteps):
+            print(
+                f"[mode_label] length mismatch for {demo_uuid}: "
+                f"{len(mode_labels)} vs {len(demo.timesteps)}; dropping demo"
+            )
+            dropped.append(demo_uuid)
+            continue
+
+        for i, ts in enumerate(demo.timesteps):
+            if ts.info is None:
+                ts.info = {}
+            ts.info["mode_label"] = int(mode_labels[i])
+
+        kept.append(demo)
+
+    print(f"[mode_label] kept {len(kept)} demos with labels, dropped {len(dropped)} without labels")
+    if dropped:
+        print("[mode_label] dropped uuids:", dropped[:10])
+
+    return kept
 
 def rescale_demo_actions(
     rescale_fn: Callable, demos: List[List[DemoStep]], cfg: DictConfig
@@ -259,6 +317,7 @@ class BiGymEnvFactory(EnvFactory):
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         demos = self._get_demo_fn(cfg, num_demos)
+        demos = _attach_mode_labels_from_sidecar(cfg, demos)
         self._raw_demos = demos
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)

@@ -405,6 +405,22 @@ class UniformReplayBuffer(ReplayBuffer):
         transition.update(kwargs)
         transition.update(observation)
 
+        # auto-fill missing extra replay elements
+        for element_name, space in self.extra_replay_elements.items():
+            if element_name not in transition:
+                if space.shape == ():
+                    transition[element_name] = np.zeros((), dtype=space.dtype)
+                else:
+                    transition[element_name] = np.zeros(space.shape, dtype=space.dtype)
+        # auto-fill missing extra replay elements
+        for element_name, space in self.extra_replay_elements.items():
+            if element_name not in transition:
+                if space.shape == ():
+                    transition[element_name] = np.zeros((), dtype=space.dtype)
+                else:
+                    transition[element_name] = np.zeros(space.shape, dtype=space.dtype)
+
+
         # Check transition shape is correct
         self._check_add_types(transition, self._storage_signature)
 

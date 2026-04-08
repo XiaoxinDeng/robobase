@@ -281,6 +281,9 @@ class ActBCAgent(BC):
         lr_backbone: float = 1e-5,
         weight_decay: float = 1e-4,
         use_lang_cond: bool = False,
+        mode_loss_weight: float = 1.0,
+        num_modes: int = 3,   # MOVE / PAUSE / RESUME
+        enable_mode_head: bool = True,
         *args,
         **kwargs,
     ):
@@ -294,6 +297,9 @@ class ActBCAgent(BC):
         """
         self.lr_backbone = lr_backbone
         self.weight_decay = weight_decay
+        self.mode_loss_weight = mode_loss_weight
+        self.num_modes = num_modes
+        self.enable_mode_head = enable_mode_head
         super().__init__(*args, **kwargs)
 
         # sanity check
@@ -316,13 +322,29 @@ class ActBCAgent(BC):
             encoder_model=self.encoder,
         ).to(self.device)
 
+        if self.enable_mode_head:
+            low_dim_dim = int(np.prod(self.observation_space["low_dim_state"].shape))
+            self.mode_head = nn.Sequential(
+                nn.Linear(low_dim_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.num_modes),
+            ).to(self.device)
+        else:
+            self.mode_head = None
+            
         param_dicts = [
             {
                 "params": [
                     p
                     for n, p in self.actor.named_parameters()
                     if "backbone" not in n and p.requires_grad
-                ]
+                ] + (
+                    list(self.mode_head.parameters())
+                    if self.mode_head is not None
+                    else []
+                )
             },
             {
                 "params": [
@@ -337,6 +359,11 @@ class ActBCAgent(BC):
         self.actor_opt = torch.optim.AdamW(
             param_dicts, lr=self.lr, weight_decay=self.weight_decay
         )
+    
+    def predict_mode_logits(self, qpos: torch.Tensor) -> torch.Tensor:
+        if self.mode_head is None:
+            return None
+        return self.mode_head(qpos)
 
     def train(self, training=True):
         self.training = training
@@ -355,13 +382,20 @@ class ActBCAgent(BC):
                 stack_tensor_dictionary(extract_many_from_batch(obs, r"rgb.*"), 1),
                 has_view_axis=True,
             )
-
             image = rgb.float().detach()
 
         action = self.actor(qpos, image)
 
-        return action
+        if self.mode_head is None:
+            return action
 
+        mode_logits = self.predict_mode_logits(qpos)
+        mode_pred = torch.argmax(mode_logits, dim=-1)
+
+        return action, {
+            "mode_logits": mode_logits,
+            "mode_pred": mode_pred,
+        }
     @override
     def update(
         self, replay_iter, step: int, replay_buffer: ReplayBuffer = None
@@ -382,6 +416,12 @@ class ActBCAgent(BC):
         metrics = dict()
         batch = next(replay_iter)
         batch = {k: v.float().to(self.device) for k, v in batch.items()}
+
+        mode_label = None
+        if self.enable_mode_head and "mode_label" in batch:
+            mode_label = batch["mode_label"].long().to(self.device)
+            if mode_label.ndim > 1:
+                mode_label = mode_label[:, 0]
 
         actions = batch["action"]
         reward = batch["reward"]
@@ -415,13 +455,21 @@ class ActBCAgent(BC):
             qpos, image, actions=actions, is_pad=is_pad, task_emb=task_emb
         )
 
+        total_loss = loss_dict["loss"]
+
+        if self.enable_mode_head and mode_label is not None:
+            mode_logits = self.predict_mode_logits(qpos)
+            mode_loss = nn.functional.cross_entropy(mode_logits, mode_label)
+            total_loss = total_loss + self.mode_loss_weight * mode_loss
+            loss_dict["mode_loss"] = mode_loss
+
         # calculate gradient
         if self.use_pixels and self.encoder_opt is not None:
             self.encoder_opt.zero_grad(set_to_none=True)
             if self.use_multicam_fusion and self.view_fusion_opt is not None:
                 self.view_fusion_opt.zero_grad(set_to_none=True)
         self.actor_opt.zero_grad(set_to_none=True)
-        loss_dict["loss"].backward()
+        total_loss.backward()
 
         # step optimizer
         if self.actor_grad_clip:
@@ -442,6 +490,8 @@ class ActBCAgent(BC):
             metrics["actor_l1_loss"] = loss_dict["l1"].item()
             metrics["actor_kl_loss"] = loss_dict["kl"].item()
             metrics["batch_reward"] = reward.mean().item()
+            if "mode_loss" in loss_dict:
+                metrics["mode_loss"] = loss_dict["mode_loss"].item()
 
         return metrics
 

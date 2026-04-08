@@ -29,6 +29,40 @@ from torch.utils.data import DataLoader
 
 torch.backends.cudnn.benchmark = True
 
+import mujoco
+import numpy as np
+
+def _joint_qpos_idx(model, joint_name: str) -> int:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    if jid == -1:
+        raise ValueError(f"Joint '{joint_name}' not found in MuJoCo model.")
+    return int(model.jnt_qposadr[jid])
+
+def make_pause_hold_action_from_qpos(env):
+    uenv = env.unwrapped
+    model = uenv._mojo.model
+    data = uenv._mojo.data
+
+    # Replace these with the ACTUAL controlled robot joint names
+    # in the exact same order as your action vector expects.
+    controlled_joint_names = [
+        # "left_shoulder_pitch",
+        # "left_shoulder_roll",
+        # ...
+    ]
+
+    # Include exactly the floating-base joints that are in your action space
+    floating_joint_names = [
+        "pelvis_x",
+        "pelvis_y",   # remove if not used
+        "pelvis_z",
+        "pelvis_rz",
+    ]
+    qpos_indices = [_joint_qpos_idx(model, n) for n in controlled_joint_names]
+    qpos_indices += [_joint_qpos_idx(model, n) for n in floating_joint_names]
+
+    hold_action = np.asarray([data.qpos[i] for i in qpos_indices], dtype=np.float32)
+    return hold_action
 
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
@@ -45,6 +79,12 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+    extra_replay_elements["mode_label"] = spaces.Box(
+        low=0,
+        high=2,
+        shape=(),
+        dtype=np.uint8,
+    )
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
     if cfg.replay.prioritization:
@@ -365,7 +405,7 @@ class Workspace:
                 step += 1
             if episode == 0:
                 first_rollout = np.array(self.eval_video_recorder.frames)
-            self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
+            self.eval_video_recorder.save(f"episode_{episode:03d}_envstep_{self.global_env_steps}.mp4")
             success = info.get("task_success")
             if success is not None:
                 successes += np.array(success).astype(int).item()
@@ -545,9 +585,22 @@ class Workspace:
                 torch_observations = {
                     k: v.unsqueeze(0) for k, v in torch_observations.items()
                 }
-            action = self.agent.act(
-                torch_observations, self.main_loop_iterations, eval_mode=eval_mode
-            )
+            if hasattr(self.agent, "enable_mode_head"):
+                if self.agent.enable_mode_head is True:
+                    action, act_info  = self.agent.act(
+                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
+                    )
+                    if eval_mode:
+                        mode_pred = act_info["mode_pred"].detach().cpu().numpy()
+                        # suppose 1 == PAUSE
+                        if np.any(mode_pred == 1):
+                            action = make_pause_hold_action_from_qpos(env)
+                else:
+                    action = self.agent.act(
+                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
+                    )
+                    
+            
             metrics = {}
             # Below is testing a feature which can be enforced in v6.
             # The ability will allow agent info to be passed to environments.
@@ -731,18 +784,20 @@ class Workspace:
         shutil.copy(snapshot, latest_snapshot)
 
     def load_snapshot(self, path_to_snapshot_to_load=None):
-        if path_to_snapshot_to_load is None:
-            path_to_snapshot_to_load = (
-                self.work_dir / "snapshots" / "latest_snapshot.pt"
-            )
-        else:
-            path_to_snapshot_to_load = Path(path_to_snapshot_to_load)
-        if not path_to_snapshot_to_load.is_file():
-            raise ValueError(
-                f"Provided file '{str(path_to_snapshot_to_load)}' is not a snapshot."
-            )
-        with path_to_snapshot_to_load.open("rb") as f:
-            payload = torch.load(f, map_location="cpu")
-        self.agent.load_state_dict(payload.pop("agent"))
+        snapshot = (
+            self.work_dir / "snapshots" / "latest_snapshot.pt"
+            if path_to_snapshot_to_load is None
+            else Path(path_to_snapshot_to_load)
+        )
+
+        if not snapshot.is_file():
+            raise ValueError(f"Provided file '{snapshot}' is not a snapshot.")
+
+        with snapshot.open("rb") as f:
+            payload = torch.load(f, map_location="cpu", weights_only=False)
+
+        agent_state = payload.pop("agent")
+        self.agent.load_state_dict(agent_state, strict=True)
+
         for k, v in payload.items():
-            self.__dict__[k] = v
+            setattr(self, k, v)
