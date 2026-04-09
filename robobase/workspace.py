@@ -26,43 +26,10 @@ import numpy as np
 import torch
 import gymnasium as gym
 from torch.utils.data import DataLoader
+import numpy as np
 
 torch.backends.cudnn.benchmark = True
 
-import mujoco
-import numpy as np
-
-def _joint_qpos_idx(model, joint_name: str) -> int:
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-    if jid == -1:
-        raise ValueError(f"Joint '{joint_name}' not found in MuJoCo model.")
-    return int(model.jnt_qposadr[jid])
-
-def make_pause_hold_action_from_qpos(env):
-    uenv = env.unwrapped
-    model = uenv._mojo.model
-    data = uenv._mojo.data
-
-    # Replace these with the ACTUAL controlled robot joint names
-    # in the exact same order as your action vector expects.
-    controlled_joint_names = [
-        # "left_shoulder_pitch",
-        # "left_shoulder_roll",
-        # ...
-    ]
-
-    # Include exactly the floating-base joints that are in your action space
-    floating_joint_names = [
-        "pelvis_x",
-        "pelvis_y",   # remove if not used
-        "pelvis_z",
-        "pelvis_rz",
-    ]
-    qpos_indices = [_joint_qpos_idx(model, n) for n in controlled_joint_names]
-    qpos_indices += [_joint_qpos_idx(model, n) for n in floating_joint_names]
-
-    hold_action = np.asarray([data.qpos[i] for i in qpos_indices], dtype=np.float32)
-    return hold_action
 
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
