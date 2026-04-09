@@ -79,12 +79,17 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
-    extra_replay_elements["mode_label"] = spaces.Box(
-        low=0,
-        high=2,
-        shape=(),
-        dtype=np.uint8,
+    use_mode_labels = (
+        cfg.is_imitation_learning
+        and getattr(cfg.method, "enable_mode_head", False)
     )
+    if use_mode_labels:
+        extra_replay_elements["mode_label"] = spaces.Box(
+            low=0,
+            high=2,
+            shape=(),
+            dtype=np.uint8,
+        )
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
     if cfg.replay.prioritization:
@@ -585,22 +590,9 @@ class Workspace:
                 torch_observations = {
                     k: v.unsqueeze(0) for k, v in torch_observations.items()
                 }
-            if hasattr(self.agent, "enable_mode_head"):
-                if self.agent.enable_mode_head is True:
-                    action, act_info  = self.agent.act(
-                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
-                    )
-                    if eval_mode:
-                        mode_pred = act_info["mode_pred"].detach().cpu().numpy()
-                        # suppose 1 == PAUSE
-                        if np.any(mode_pred == 1):
-                            action = make_pause_hold_action_from_qpos(env)
-                else:
-                    action = self.agent.act(
-                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
-                    )
-                    
-            
+            action = self.agent.act(
+                torch_observations, self.main_loop_iterations, eval_mode=eval_mode
+            )
             metrics = {}
             # Below is testing a feature which can be enforced in v6.
             # The ability will allow agent info to be passed to environments.

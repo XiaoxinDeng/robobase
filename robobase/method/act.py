@@ -420,8 +420,10 @@ class ActBCAgent(BC):
         mode_label = None
         if self.enable_mode_head and "mode_label" in batch:
             mode_label = batch["mode_label"].long().to(self.device)
-            if mode_label.ndim > 1:
-                mode_label = mode_label[:, 0]
+            if mode_label.ndim == 2 and mode_label.shape[1] == 1:
+                mode_label = mode_label.squeeze(1)
+            elif mode_label.ndim != 1:
+                raise ValueError(f"Unexpected mode_label shape: {mode_label.shape}")
 
         actions = batch["action"]
         reward = batch["reward"]

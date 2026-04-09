@@ -577,7 +577,7 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     while not (term or trunc):
         next_obs, rew, term, trunc, next_info = wrapped_env.step(fake_action)
         action = next_info.pop("demo_action")
-        mode_label = next_info.pop("mode_label", None)
+        mode_label = info.get("mode_label", None)   # align label with current obs
         assert np.all(action <= 1.0)
         assert np.all(action >= -1.0)
         ep.append([obs, action, rew, term, trunc, info, next_info, mode_label])
