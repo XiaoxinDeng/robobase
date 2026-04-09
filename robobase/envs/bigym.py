@@ -21,7 +21,7 @@ import multiprocessing as mp
 import logging
 import numpy as np
 
-from demonstrations.demo import DemoStep
+from demonstrations.demo import DemoStep, Demo
 from demonstrations.demo_store import DemoStore, DemoNotFoundError
 from demonstrations.demo_converter import DemoConverter
 from demonstrations.utils import Metadata
@@ -287,6 +287,11 @@ class BiGymEnvFactory(EnvFactory):
         if np.isinf(num_demos):
             num_demos = -1
 
+        # 1. Explicit human-arm demos by path
+        demo_manifest = cfg.env.get("demo_manifest", None)
+        if demo_manifest is not None:
+            demos = self._load_demos_from_manifest(demo_manifest, num_demos)
+
         try:
             demos = demo_store.get_demos(
                 Metadata.from_env(env),
@@ -297,13 +302,13 @@ class BiGymEnvFactory(EnvFactory):
             if not cfg.env.task_name.startswith("human_arm_"):
                 env.close()
                 raise
-            logging.info(
-                "Direct demos for %s were not found. Falling back to base task demos.",
-                cfg.env.task_name,
-            )
-            demos = self._load_human_arm_fallback_demos(
-                cfg, num_demos, env, target_frequency
-            )
+            # logging.info(
+            #     "Direct demos for %s were not found. Falling back to base task demos.",
+            #     cfg.env.task_name,
+            # )
+            # demos = self._load_human_arm_fallback_demos(
+            #     cfg, num_demos, env, target_frequency
+            # )
 
         for demo in demos:
             for ts in demo.timesteps:
@@ -329,6 +334,22 @@ class BiGymEnvFactory(EnvFactory):
         )
         self._demos = self._demo_to_steps(cfg, demo_list)
 
+    def _load_demos_from_manifest(self, manifest_path: str, amount: int = -1):
+        manifest_path = Path(manifest_path).expanduser()
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        if amount is not None and amount > 0:
+            entries = entries[:amount]
+
+        demos = []
+        for entry in entries:
+            demo_path = Path(entry["target_path"]).expanduser()
+            demo = Demo.load(demo_path)   # replace with your actual demo loader
+            demos.append(demo)
+
+        return demos
+    
     def load_demos_into_replay(self, cfg: DictConfig, buffer, is_demo_buffer):
         """See base class for documentation."""
         assert hasattr(self, "_demos"), (
