@@ -386,6 +386,8 @@ class BiGymEnvFactory(EnvFactory):
             # The demos from manifest are always successful
             successful_demo = True
             for demo in demo_list:
+                cur_demo = []
+                last_timestep = False
                 for i, step in enumerate(demo):
                     step.info.update({"demo": int(successful_demo)})
                     if i == 0:
@@ -402,7 +404,7 @@ class BiGymEnvFactory(EnvFactory):
                         cur_demo.append((step.observation, reward, term, trunc, step.info))
                 if last_timestep:
                     break
-            ret_demos.append(cur_demo)
+                ret_demos.append(cur_demo)
 
         return ret_demos
 
