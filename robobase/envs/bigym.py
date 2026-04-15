@@ -21,7 +21,7 @@ import multiprocessing as mp
 import logging
 import numpy as np
 
-from demonstrations.demo import DemoStep
+from demonstrations.demo import DemoStep, Demo
 from demonstrations.demo_store import DemoStore, DemoNotFoundError
 from demonstrations.demo_converter import DemoConverter
 from demonstrations.utils import Metadata
@@ -369,23 +369,19 @@ class BiGymEnvFactory(EnvFactory):
         if np.isinf(num_demos):
             num_demos = -1
 
+        demo_manifest = cfg.env.get("demo_manifest", None)
         try:
             demos = demo_store.get_demos(
                 Metadata.from_env(env),
                 amount=num_demos,
                 frequency=target_frequency,
             )
-        except DemoNotFoundError:
-            if not cfg.env.task_name.startswith("human_arm_"):
-                env.close()
-                raise
-            logging.info(
-                "Direct demos for %s were not found. Falling back to base task demos.",
-                cfg.env.task_name,
-            )
-            demos = self._load_human_arm_fallback_demos(
-                cfg, num_demos, env, target_frequency
-            )
+        except DemoNotFoundError:                
+            # Explicit human-arm demos by path
+            if demo_manifest is not None:
+                demos = self._load_demos_from_manifest(demo_manifest, num_demos)
+            env.close()
+            raise
 
         for demo in demos:
             for ts in demo.timesteps:
@@ -399,7 +395,7 @@ class BiGymEnvFactory(EnvFactory):
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         demos = self._get_demo_fn(cfg, num_demos)
-        demos = _validate_mode_labels_from_info(cfg, demos)
+        demos = _attach_mode_labels_from_sidecar(cfg, demos)
         self._raw_demos = demos
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)
@@ -411,6 +407,24 @@ class BiGymEnvFactory(EnvFactory):
         )
         self._demos = self._demo_to_steps(cfg, demo_list)
 
+    def _load_demos_from_manifest(self, manifest_path: str, amount: int = -1):
+        manifest_path = Path(manifest_path).expanduser()
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        if amount is not None and amount > 0:
+            entries = entries[:amount]
+
+        demos = []
+        for entry in entries:
+            # Filter unsuccessful tasks
+            if entry["success"] == 1:
+                demo_path = Path(entry["target_path"]).expanduser()
+                demo = Demo.from_safetensors(demo_path)   # replace with your actual demo loader
+                demos.append(demo)
+
+        return demos
+    
     def load_demos_into_replay(self, cfg: DictConfig, buffer, is_demo_buffer):
         """See base class for documentation."""
         assert hasattr(self, "_demos"), (

@@ -26,43 +26,10 @@ import numpy as np
 import torch
 import gymnasium as gym
 from torch.utils.data import DataLoader
+import numpy as np
 
 torch.backends.cudnn.benchmark = True
 
-import mujoco
-import numpy as np
-
-def _joint_qpos_idx(model, joint_name: str) -> int:
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-    if jid == -1:
-        raise ValueError(f"Joint '{joint_name}' not found in MuJoCo model.")
-    return int(model.jnt_qposadr[jid])
-
-def make_pause_hold_action_from_qpos(env):
-    uenv = env.unwrapped
-    model = uenv._mojo.model
-    data = uenv._mojo.data
-
-    # Replace these with the ACTUAL controlled robot joint names
-    # in the exact same order as your action vector expects.
-    controlled_joint_names = [
-        # "left_shoulder_pitch",
-        # "left_shoulder_roll",
-        # ...
-    ]
-
-    # Include exactly the floating-base joints that are in your action space
-    floating_joint_names = [
-        "pelvis_x",
-        "pelvis_y",   # remove if not used
-        "pelvis_z",
-        "pelvis_rz",
-    ]
-    qpos_indices = [_joint_qpos_idx(model, n) for n in controlled_joint_names]
-    qpos_indices += [_joint_qpos_idx(model, n) for n in floating_joint_names]
-
-    hold_action = np.asarray([data.qpos[i] for i in qpos_indices], dtype=np.float32)
-    return hold_action
 
 def _worker_init_fn(worker_id):
     seed = np.random.get_state()[1][0] + worker_id
@@ -79,12 +46,17 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
-    extra_replay_elements["mode_label"] = spaces.Box(
-        low=0,
-        high=2,
-        shape=(),
-        dtype=np.uint8,
+    use_mode_labels = (
+        cfg.is_imitation_learning
+        and getattr(cfg.method, "enable_mode_head", False)
     )
+    if use_mode_labels:
+        extra_replay_elements["mode_label"] = spaces.Box(
+            low=0,
+            high=2,
+            shape=(),
+            dtype=np.uint8,
+        )
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
     if cfg.replay.prioritization:
@@ -585,22 +557,9 @@ class Workspace:
                 torch_observations = {
                     k: v.unsqueeze(0) for k, v in torch_observations.items()
                 }
-            if hasattr(self.agent, "enable_mode_head"):
-                if self.agent.enable_mode_head is True:
-                    action, act_info  = self.agent.act(
-                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
-                    )
-                    if eval_mode:
-                        mode_pred = act_info["mode_pred"].detach().cpu().numpy()
-                        # suppose 1 == PAUSE
-                        if np.any(mode_pred == 1):
-                            action = make_pause_hold_action_from_qpos(env)
-                else:
-                    action = self.agent.act(
-                        torch_observations, self.main_loop_iterations, eval_mode=eval_mode
-                    )
-                    
-            
+            action = self.agent.act(
+                torch_observations, self.main_loop_iterations, eval_mode=eval_mode
+            )
             metrics = {}
             # Below is testing a feature which can be enforced in v6.
             # The ability will allow agent info to be passed to environments.
