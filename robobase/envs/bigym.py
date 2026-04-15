@@ -395,7 +395,7 @@ class BiGymEnvFactory(EnvFactory):
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         demos = self._get_demo_fn(cfg, num_demos)
-        demos = _attach_mode_labels_from_sidecar(cfg, demos)
+        demos = _validate_mode_labels_from_info(cfg, demos)
         self._raw_demos = demos
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)
