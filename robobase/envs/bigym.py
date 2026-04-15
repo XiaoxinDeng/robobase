@@ -51,30 +51,33 @@ def _validate_mode_labels_from_info(cfg, demos):
 
     kept = []
     dropped = []
-
+    error_type = {'1': "success", 
+                  "-1": "Missing Info", 
+                  "-2":"mode_label Not found in info", 
+                  "-3": "Failed to convert to int type"}
     for demo in demos:
         demo_uuid = str(demo.uuid)
-        ok = True
+        ok = 1
 
         for i, ts in enumerate(demo.timesteps):
             if ts.info is None:
-                ok = False
+                ok = -1
                 break
             if "mode_label" not in ts.info:
-                ok = False
+                ok = -2
                 break
 
             try:
                 ts.info["mode_label"] = int(ts.info["mode_label"])
             except Exception:
-                ok = False
+                ok = -3
                 break
 
         if ok:
             kept.append(demo)
         else:
             dropped.append(demo_uuid)
-            print(f"[mode_label] missing/invalid mode_label in demo {demo_uuid}; dropping demo")
+            logging.warning(f"Dropping demo; {error_type[ok]}")
 
     print(f"[mode_label] kept {len(kept)} demos with info labels, dropped {len(dropped)} without valid labels")
     if dropped:
@@ -350,16 +353,22 @@ class BiGymEnvFactory(EnvFactory):
     ) -> List[DemoStep]:
         ret_demos = []
 
-        for demo in demo_list:
-            cur_demo = []
-            last_timestep = False
-            
-            # Detect whether this demo is successful or not
-            rewards = []
-            for step in demo:
-                reward = step.reward
-                rewards.append(reward)
-            successful_demo = sum(rewards) > 0.25
+        if cfg.env.get("manifest", None) is None:
+            for demo in demo_list:
+                cur_demo = []
+                last_timestep = False
+                
+                # Detect whether this demo is successful or not
+                rewards = []
+                for step in demo:
+                    reward = step.reward
+                    if reward == None:
+                        raise("The reward is None")
+                    rewards.append(reward)
+                successful_demo = sum(rewards) > 0.25
+        else:
+            # The demos from manifest are always successful
+            successful_demo = True
             
             for i, step in enumerate(demo):
                 step.info.update({"demo": int(successful_demo)})
