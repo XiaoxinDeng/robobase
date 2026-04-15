@@ -242,43 +242,43 @@ class BiGymEnvFactory(EnvFactory):
         logging.info("Start to load demos.")
         env = self._create_env(cfg)
         target_frequency = CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate
-
+        demo_manifest = cfg.env.get("demo_manifest", None)
         demo_store = DemoStore()
+
         if np.isinf(num_demos):
             num_demos = -1
-
-        demo_manifest = cfg.env.get("demo_manifest", None)
-        try:
-            demos = demo_store.get_demos(
-                Metadata.from_env(env),
-                amount=num_demos,
-                frequency=target_frequency,
+        if demo_manifest is not None:
+            logging.info(
+                "Loading from manifest: %s",
+                cfg.env.task_name,
+                demo_manifest,
             )
-        except DemoNotFoundError:                
-            # Explicit human-arm demos by path
-            if demo_manifest is not None:
-                logging.info(
-                    "Direct demos for %s were not found in DemoStore. Loading from manifest: %s",
-                    cfg.env.task_name,
-                    demo_manifest,
+            demos = self._load_demos_from_manifest(demo_manifest, num_demos)
+            logging.info(f"Loaded {len(demos)} demos from manifest.")
+        else:
+            logging.info(
+                "Loading from DemoStore: %s",
+                cfg.env.task_name,
+            )
+            try:
+                demos = demo_store.get_demos(
+                    Metadata.from_env(env),
+                    amount=num_demos,
+                    frequency=target_frequency,
                 )
-                demos = self._load_demos_from_manifest(demo_manifest, num_demos)
-                if len(demos) == 0:
-                    env.close()
-                    raise RuntimeError(
-                        f"No demos loaded from manifest: {demo_manifest}"
-                    )
-                else:
-                    logging.info(f"Loaded {len(demos)} demos from manifest.")
-            env.close()
-            raise
-
+            except DemoNotFoundError:                
+                env.close()
+                raise
+        if len(demos) == 0:
+            raise RuntimeError(
+                f"No demos loaded from manifest: {demo_manifest}"
+            )
+        
         for demo in demos:
             for ts in demo.timesteps:
                 ts.observation = {
                     k: np.array(v, dtype=np.float32) for k, v in ts.observation.items()
                 }
-
         env.close()
         logging.info("Finished loading demos.")
         return demos
