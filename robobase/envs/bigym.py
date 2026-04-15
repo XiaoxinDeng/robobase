@@ -108,131 +108,6 @@ def _task_name_to_env_class(task_name: str) -> type[BiGymEnv]:
 
 
 class BiGymEnvFactory(EnvFactory):
-    def _load_human_arm_fallback_demos(
-        self, cfg: DictConfig, num_demos: int, target_env: BiGymEnv, target_frequency: int
-    ):
-        """
-        Load recorded human-arm demos from a manifest file instead of forcing a
-        fallback to base-task demos.
-
-        Expected manifest format: a JSON list of dicts, where successful entries
-        contain at least:
-            - "target_path": path to saved human-arm demo .safetensors
-            - "success": 1 or true
-
-        Example:
-            ~/.bigym/demonstrations/0.9.0/HumanArmDrawerTopOpen/
-            JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/
-            lightweight/batch_result_manifest.json
-        """
-        manifest_path = cfg.env.get("manifest", None)
-
-        if manifest_path is not None:
-            manifest_path = Path(manifest_path).expanduser()
-            if manifest_path.exists():
-                logging.info(
-                    "Loading recorded human-arm demos for %s from manifest: %s",
-                    cfg.env.task_name,
-                    str(manifest_path),
-                )
-
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    entries = json.load(f)
-
-                # keep successful entries with an existing saved target demo path
-                valid_entries = []
-                for entry in entries:
-                    target_path = entry.get("target_path", None)
-                    success = entry.get("success", 0)
-
-                    if not target_path:
-                        continue
-
-                    target_path = Path(target_path).expanduser()
-                    if not target_path.exists():
-                        logging.warning(
-                            "Skipping manifest entry with missing target_path: %s",
-                            str(target_path),
-                        )
-                        continue
-
-                    if not bool(success):
-                        continue
-
-                    valid_entries.append(target_path)
-
-                if len(valid_entries) > 0:
-                    if not np.isinf(num_demos) and num_demos > 0:
-                        valid_entries = valid_entries[:num_demos]
-
-                    demos = []
-                    target_robot = Metadata.from_env(target_env).get_robot()
-
-                    for demo_path in valid_entries:
-                        demo = Demo.from_safetensors(str(demo_path))
-
-                        # Match the target training frequency if needed
-                        if target_frequency != CONTROL_FREQUENCY_MAX:
-                            demo = DemoConverter.decimate(
-                                demo,
-                                target_frequency,
-                                CONTROL_FREQUENCY_MAX,
-                                robot=target_robot,
-                            )
-
-                        demos.append(demo)
-
-                    logging.info(
-                        "Loaded %d recorded human-arm demos from manifest for %s",
-                        len(demos),
-                        cfg.env.task_name,
-                    )
-                    return demos
-
-                logging.warning(
-                    "Manifest %s contained no usable successful recorded demos for %s. "
-                    "Falling back to base-task demos.",
-                    str(manifest_path),
-                    cfg.env.task_name,
-                )
-            else:
-                logging.warning(
-                    "Manifest path does not exist for %s: %s. Falling back to base-task demos.",
-                    cfg.env.task_name,
-                    str(manifest_path),
-                )
-
-        # -------------------------
-        # Final fallback: original behavior
-        # -------------------------
-        base_task_name = cfg.env.task_name.removeprefix("human_arm_")
-        fallback_cfg = copy.deepcopy(cfg)
-        fallback_cfg.env.task_name = base_task_name
-
-        source_env = self._create_env(fallback_cfg)
-        demo_store = DemoStore()
-        source_demos = demo_store.get_demos(
-            Metadata.from_env(source_env, is_lightweight=True),
-            amount=num_demos,
-        )
-
-        target_robot = Metadata.from_env(target_env).get_robot()
-        converted_demos = []
-        for demo in source_demos:
-            if target_frequency != CONTROL_FREQUENCY_MAX:
-                demo = DemoConverter.decimate(
-                    demo,
-                    target_frequency,
-                    CONTROL_FREQUENCY_MAX,
-                    robot=target_robot,
-                )
-            converted_demo = DemoConverter.create_demo_in_new_env(demo, target_env)
-            demo_store.cache_demo(converted_demo, frequency=target_frequency)
-            converted_demos.append(converted_demo)
-
-        source_env.close()
-        return converted_demos
-    
     def _wrap_env(self, env, cfg, demo_env=False, train=True, return_raw_spaces=False):
         # last two are grippers
         assert cfg.demos != 0
@@ -379,7 +254,19 @@ class BiGymEnvFactory(EnvFactory):
         except DemoNotFoundError:                
             # Explicit human-arm demos by path
             if demo_manifest is not None:
+                logging.info(
+                    "Direct demos for %s were not found in DemoStore. Loading from manifest: %s",
+                    cfg.env.task_name,
+                    demo_manifest,
+                )
                 demos = self._load_demos_from_manifest(demo_manifest, num_demos)
+                if len(demos) == 0:
+                    env.close()
+                    raise RuntimeError(
+                        f"No demos loaded from manifest: {demo_manifest}"
+                    )
+                else:
+                    logging.info(f"Loaded {len(demos)} demos from manifest.")
             env.close()
             raise
 
