@@ -33,28 +33,17 @@ from bigym.const import CACHE_PATH
 import os
 import json
 from pathlib import Path
+from pathlib import Path
+from demonstrations.demo import Demo
+
 
 
 UNIT_TEST = False
 
-def _load_mode_label_index(cfg: DictConfig):
-    manifest_path = cfg.env.get("mode_label_manifest", None)
-    if manifest_path is None:
-        return None
+def _validate_mode_labels_from_info(cfg, demos):
+    require_mode_label = cfg.env.get("require_mode_label", False)
 
-    manifest_path = Path(manifest_path).expanduser()
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        entries = json.load(f)
-
-    return {
-        str(entry["uuid"]): Path(entry["mode_label_path"])
-        for entry in entries
-        if entry.get("mode_label_path") is not None
-    }
-
-def _attach_mode_labels_from_sidecar(cfg, demos):
-    mode_label_index = _load_mode_label_index(cfg)
-    if mode_label_index is None:
+    if not require_mode_label:
         return demos
 
     kept = []
@@ -62,30 +51,29 @@ def _attach_mode_labels_from_sidecar(cfg, demos):
 
     for demo in demos:
         demo_uuid = str(demo.uuid)
-        if demo_uuid not in mode_label_index:
-            dropped.append(demo_uuid)
-            continue
-
-        label_path = mode_label_index[demo_uuid]
-        sidecar = np.load(label_path, allow_pickle=True)
-        mode_labels = sidecar["mode_labels"]
-
-        if len(mode_labels) != len(demo.timesteps):
-            print(
-                f"[mode_label] length mismatch for {demo_uuid}: "
-                f"{len(mode_labels)} vs {len(demo.timesteps)}; dropping demo"
-            )
-            dropped.append(demo_uuid)
-            continue
+        ok = True
 
         for i, ts in enumerate(demo.timesteps):
             if ts.info is None:
-                ts.info = {}
-            ts.info["mode_label"] = int(mode_labels[i])
+                ok = False
+                break
+            if "mode_label" not in ts.info:
+                ok = False
+                break
 
-        kept.append(demo)
+            try:
+                ts.info["mode_label"] = int(ts.info["mode_label"])
+            except Exception:
+                ok = False
+                break
 
-    print(f"[mode_label] kept {len(kept)} demos with labels, dropped {len(dropped)} without labels")
+        if ok:
+            kept.append(demo)
+        else:
+            dropped.append(demo_uuid)
+            print(f"[mode_label] missing/invalid mode_label in demo {demo_uuid}; dropping demo")
+
+    print(f"[mode_label] kept {len(kept)} demos with info labels, dropped {len(dropped)} without valid labels")
     if dropped:
         print("[mode_label] dropped uuids:", dropped[:10])
 
@@ -123,6 +111,100 @@ class BiGymEnvFactory(EnvFactory):
     def _load_human_arm_fallback_demos(
         self, cfg: DictConfig, num_demos: int, target_env: BiGymEnv, target_frequency: int
     ):
+        """
+        Load recorded human-arm demos from a manifest file instead of forcing a
+        fallback to base-task demos.
+
+        Expected manifest format: a JSON list of dicts, where successful entries
+        contain at least:
+            - "target_path": path to saved human-arm demo .safetensors
+            - "success": 1 or true
+
+        Example:
+            ~/.bigym/demonstrations/0.9.0/HumanArmDrawerTopOpen/
+            JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/
+            lightweight/batch_result_manifest.json
+        """
+        manifest_path = cfg.env.get("manifest", None)
+
+        if manifest_path is not None:
+            manifest_path = Path(manifest_path).expanduser()
+            if manifest_path.exists():
+                logging.info(
+                    "Loading recorded human-arm demos for %s from manifest: %s",
+                    cfg.env.task_name,
+                    str(manifest_path),
+                )
+
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+
+                # keep successful entries with an existing saved target demo path
+                valid_entries = []
+                for entry in entries:
+                    target_path = entry.get("target_path", None)
+                    success = entry.get("success", 0)
+
+                    if not target_path:
+                        continue
+
+                    target_path = Path(target_path).expanduser()
+                    if not target_path.exists():
+                        logging.warning(
+                            "Skipping manifest entry with missing target_path: %s",
+                            str(target_path),
+                        )
+                        continue
+
+                    if not bool(success):
+                        continue
+
+                    valid_entries.append(target_path)
+
+                if len(valid_entries) > 0:
+                    if not np.isinf(num_demos) and num_demos > 0:
+                        valid_entries = valid_entries[:num_demos]
+
+                    demos = []
+                    target_robot = Metadata.from_env(target_env).get_robot()
+
+                    for demo_path in valid_entries:
+                        demo = Demo.from_safetensors(str(demo_path))
+
+                        # Match the target training frequency if needed
+                        if target_frequency != CONTROL_FREQUENCY_MAX:
+                            demo = DemoConverter.decimate(
+                                demo,
+                                target_frequency,
+                                CONTROL_FREQUENCY_MAX,
+                                robot=target_robot,
+                            )
+
+                        demos.append(demo)
+
+                    logging.info(
+                        "Loaded %d recorded human-arm demos from manifest for %s",
+                        len(demos),
+                        cfg.env.task_name,
+                    )
+                    return demos
+
+                logging.warning(
+                    "Manifest %s contained no usable successful recorded demos for %s. "
+                    "Falling back to base-task demos.",
+                    str(manifest_path),
+                    cfg.env.task_name,
+                )
+            else:
+                logging.warning(
+                    "Manifest path does not exist for %s: %s. Falling back to base-task demos.",
+                    cfg.env.task_name,
+                    str(manifest_path),
+                )
+
+        # -------------------------
+        # Final fallback: original behavior
+        # -------------------------
         base_task_name = cfg.env.task_name.removeprefix("human_arm_")
         fallback_cfg = copy.deepcopy(cfg)
         fallback_cfg.env.task_name = base_task_name
@@ -150,7 +232,7 @@ class BiGymEnvFactory(EnvFactory):
 
         source_env.close()
         return converted_demos
-
+    
     def _wrap_env(self, env, cfg, demo_env=False, train=True, return_raw_spaces=False):
         # last two are grippers
         assert cfg.demos != 0
@@ -317,7 +399,7 @@ class BiGymEnvFactory(EnvFactory):
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         demos = self._get_demo_fn(cfg, num_demos)
-        demos = _attach_mode_labels_from_sidecar(cfg, demos)
+        demos = _validate_mode_labels_from_info(cfg, demos)
         self._raw_demos = demos
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)
@@ -454,3 +536,6 @@ class BiGymEnvFactory(EnvFactory):
             action_stats=self._action_stats,
             min_max_margin=cfg.min_max_margin,
         )
+
+
+

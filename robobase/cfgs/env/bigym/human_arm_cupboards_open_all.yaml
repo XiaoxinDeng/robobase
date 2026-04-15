@@ -6,6 +6,8 @@ defaults:
 
 env:
   task_name: human_arm_cupboards_open_all
+  manifest: ~/.bigym/demonstrations/0.9.0/HumanArmCupboardsOpenAll/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/lightweight/batch_result_manifest.json
+  require_mode_label: true
   stddev_schedule: linear(1.0,0.1,500000)
   episode_length: 22500
   demo_down_sample_rate: 25
