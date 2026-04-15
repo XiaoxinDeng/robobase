@@ -249,9 +249,8 @@ class BiGymEnvFactory(EnvFactory):
             num_demos = -1
         if demo_manifest is not None:
             logging.info(
-                "Loading from manifest: %s",
-                cfg.env.task_name,
-                demo_manifest,
+                "Loading Task %s from manifest: '%s'",
+                cfg.env.task_name, demo_manifest,
             )
             demos = self._load_demos_from_manifest(demo_manifest, num_demos)
             logging.info(f"Loaded {len(demos)} demos from manifest.")
