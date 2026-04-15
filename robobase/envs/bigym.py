@@ -365,23 +365,23 @@ class BiGymEnvFactory(EnvFactory):
                     if reward == None:
                         raise("The reward is None")
                     rewards.append(reward)
-                successful_demo = sum(rewards) > 0.25
-                for i, step in enumerate(demo):
-                    step.info.update({"demo": int(successful_demo)})
-                    if i == 0:
-                        cur_demo.append((step.observation, step.info))
-                    else:
-                        term, trunc = step.termination, step.truncation
-                        reward = step.reward
-                        if i == len(demo) - 1 or reward > 0:
-                            if not (term or trunc):
-                                term = False
-                                trunc = True
-                            last_timestep = True
+                    successful_demo = sum(rewards) > 0.25
+                    for i, step in enumerate(demo):
+                        step.info.update({"demo": int(successful_demo)})
+                        if i == 0:
+                            cur_demo.append((step.observation, step.info))
+                        else:
+                            term, trunc = step.termination, step.truncation
+                            reward = step.reward
+                            if i == len(demo) - 1 or reward > 0:
+                                if not (term or trunc):
+                                    term = False
+                                    trunc = True
+                                last_timestep = True
 
-                        cur_demo.append((step.observation, reward, term, trunc, step.info))
-                if last_timestep:
-                    break
+                            cur_demo.append((step.observation, reward, term, trunc, step.info))
+                    if last_timestep:
+                        break
         else:
             # The demos from manifest are always successful
             successful_demo = True
@@ -395,7 +395,7 @@ class BiGymEnvFactory(EnvFactory):
                     else:
                         term, trunc = step.termination, step.truncation
                         reward = step.reward
-                        if i == len(demo) - 1 or reward > 0:
+                        if i == len(demo) - 1 or step.info["success"]:
                             if not (term or trunc):
                                 term = False
                                 trunc = True
