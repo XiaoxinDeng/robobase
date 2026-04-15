@@ -36,7 +36,10 @@ from pathlib import Path
 from pathlib import Path
 from demonstrations.demo import Demo
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+)
 
 UNIT_TEST = False
 
