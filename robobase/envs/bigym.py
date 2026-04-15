@@ -242,7 +242,7 @@ class BiGymEnvFactory(EnvFactory):
         logging.info("Start to load demos.")
         env = self._create_env(cfg)
         target_frequency = CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate
-        demo_manifest = cfg.env.get("demo_manifest", None)
+        demo_manifest = cfg.env.get("manifest", None)
         demo_store = DemoStore()
 
         if np.isinf(num_demos):
