@@ -46,17 +46,14 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
-    use_mode_labels = (
-        cfg.is_imitation_learning
-        and getattr(cfg.method, "enable_mode_head", False)
-    )
-    if use_mode_labels:
+    if cfg.env.get("require_mode_label", False):
         extra_replay_elements["mode_label"] = spaces.Box(
             low=0,
             high=2,
             shape=(),
             dtype=np.uint8,
         )
+        observation_space["rgb_external"] = spaces.Box(low=0, high=255, shape=(3, 84, 84), dtype=np.uint8)
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
     if cfg.replay.prioritization:
