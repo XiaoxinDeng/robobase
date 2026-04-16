@@ -281,7 +281,7 @@ class BiGymEnvFactory(EnvFactory):
             for ts in demo.timesteps:
                 ts.observation = {
                     k: np.array(v, dtype=np.uint8 if k.startswith("rgb_") else np.float32) # Save rgb as uint8, save others as float32
-                    for k, v in ts.observation.items()
+                    for k, v in ts.observation.items() if k != "mode_label" or cfg.env.get("require_mode_label", False)
                 }
         env.close()
         logging.info("Finished loading demos.")
