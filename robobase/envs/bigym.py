@@ -347,67 +347,86 @@ class BiGymEnvFactory(EnvFactory):
         )
         for _ in range(len(demos)):
             add_demo_to_replay_buffer(demo_env, buffer)
-
+            
     def _demo_to_steps(
         self, cfg: DictConfig, demo_list: List[List[DemoStep]]
     ) -> List[DemoStep]:
         ret_demos = []
 
-        if cfg.env.get("manifest", None) is None:
-            for demo in demo_list:
-                cur_demo = []
-                last_timestep = False
-                
-                # Detect whether this demo is successful or not
+        demos_from_manifest = cfg.env.get("manifest", None) is not None
+
+        for demo in demo_list:
+            cur_demo = []
+            last_timestep = False
+
+            if len(demo) == 0:
+                continue
+
+            if demos_from_manifest:
+                # Manifest-selected demos are treated as successful by construction.
+                successful_demo = True
+            else:
+                # Compute success from transition rewards only.
+                # Skip i == 0 because the first timestep is the reset / initial state
+                # and may not have a valid reward.
                 rewards = []
-                for step in demo:
-                    reward = step.reward
-                    if reward == None:
-                        raise("The reward is None")
-                    rewards.append(reward)
-                    successful_demo = sum(rewards) > 0.25
-                    for i, step in enumerate(demo):
-                        step.info.update({"demo": int(successful_demo)})
-                        if i == 0:
-                            cur_demo.append((step.observation, step.info))
-                        else:
-                            term, trunc = step.termination, step.truncation
-                            reward = step.reward
-                            if i == len(demo) - 1 or reward > 0:
-                                if not (term or trunc):
-                                    term = False
-                                    trunc = True
-                                last_timestep = True
-
-                            cur_demo.append((step.observation, reward, term, trunc, step.info))
-                    if last_timestep:
-                        break
-        else:
-            # The demos from manifest are always successful
-            successful_demo = True
-            for demo in demo_list:
-                cur_demo = []
-                last_timestep = False
                 for i, step in enumerate(demo):
-                    step.info.update({"demo": int(successful_demo)})
                     if i == 0:
-                        cur_demo.append((step.observation, step.info))
-                    else:
-                        term, trunc = step.termination, step.truncation
-                        reward = step.reward
-                        if i == len(demo) - 1 or step.info["success"]:
-                            if not (term or trunc):
-                                term = False
-                                trunc = True
-                            last_timestep = True
+                        continue
 
-                        cur_demo.append((step.observation, reward, term, trunc, step.info))
+                    reward = step.reward
+                    if reward is None:
+                        raise RuntimeError(
+                            f"Reward is None in demo at transition step {i}"
+                        )
+
+                    rewards.append(float(reward))
+
+                successful_demo = sum(rewards) > 0.25
+
+            for i, step in enumerate(demo):
+                if step.info is None:
+                    step.info = {}
+
+                step.info.update({"demo": int(successful_demo)})
+
+                if i == 0:
+                    # Initial observation timestep: no reward / term / trunc payload.
+                    cur_demo.append((step.observation, step.info))
+                    continue
+
+                term, trunc = step.termination, step.truncation
+                reward = step.reward
+
+                # Be defensive in case reward is missing in some demos.
+                if reward is None:
+                    reward = 0.0
+
+                if demos_from_manifest:
+                    # Manifest demos are already filtered to successful recordings.
+                    # End on the final step or on explicit success flag in info.
+                    if i == len(demo) - 1 or bool(step.info.get("success", False)):
+                        if not (term or trunc):
+                            term = False
+                            trunc = True
+                        last_timestep = True
+                else:
+                    # Non-manifest demos: infer end-of-demo from final step or positive reward.
+                    if i == len(demo) - 1 or reward > 0:
+                        if not (term or trunc):
+                            term = False
+                            trunc = True
+                        last_timestep = True
+
+                cur_demo.append((step.observation, reward, term, trunc, step.info))
+
                 if last_timestep:
                     break
-                ret_demos.append(cur_demo)
+
+            ret_demos.append(cur_demo)
 
         return ret_demos
-
+    
     def _compute_action_stats(
         self, cfg: DictConfig, demos: List[List[DemoStep]]
     ) -> Dict:
