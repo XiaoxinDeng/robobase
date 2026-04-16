@@ -35,6 +35,7 @@ import json
 from pathlib import Path
 from pathlib import Path
 from demonstrations.demo import Demo
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,7 +280,7 @@ class BiGymEnvFactory(EnvFactory):
         for demo in demos:
             for ts in demo.timesteps:
                 ts.observation = {
-                    k: np.array(v, dtype=np.uint8) for k, v in ts.observation.items()
+                    k: np.array(v, dtype=np.float32) for k, v in ts.observation.items()
                 }
         env.close()
         logging.info("Finished loading demos.")
@@ -451,8 +452,15 @@ class BiGymEnvFactory(EnvFactory):
         }
         return action_stats
 
+
+
     def _compute_obs_stats(self, cfg: DictConfig, demos: List[List[DemoStep]]) -> Dict:
-        obs = []
+        count = defaultdict(int)
+        mean = {}
+        M2 = {}
+        min_val = {}
+        max_val = {}
+
         for demo in demos:
             for step in demo.timesteps:
                 obs.append(step.observation)
@@ -470,7 +478,7 @@ class BiGymEnvFactory(EnvFactory):
             "min": obs_min,
         }
         return obs_stats
-
+    
     def _get_gripper_action_stats(
         self, cfg: DictConfig
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
