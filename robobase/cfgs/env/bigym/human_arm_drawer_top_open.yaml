@@ -7,7 +7,7 @@ defaults:
 env:
   task_name: human_arm_drawer_top_open
   manifest: ~/.bigym/demonstrations/0.9.0/HumanArmDrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/full/manifest.json
-  require_mode_label: true
+  require_mode_label: true # The model dose not support external RGB yet
   stddev_schedule: linear(1.0,0.1,500000)
   episode_length: 22500
   demo_down_sample_rate: 25

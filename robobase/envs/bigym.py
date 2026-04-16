@@ -279,7 +279,7 @@ class BiGymEnvFactory(EnvFactory):
         for demo in demos:
             for ts in demo.timesteps:
                 ts.observation = {
-                    k: np.array(v, dtype=np.float32) for k, v in ts.observation.items()
+                    k: np.array(v, dtype=np.uint8) for k, v in ts.observation.items()
                 }
         env.close()
         logging.info("Finished loading demos.")
