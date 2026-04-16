@@ -53,6 +53,9 @@ def _create_default_replay_buffer(
             shape=(),
             dtype=np.uint8,
         )
+        print("=== eval_env.observation_space ===")
+        for k, v in observation_space.items():
+            print(f"{k}: shape={v.shape}, dtype={v.dtype}")
         observation_space["rgb_external"] = spaces.Box(low=0, high=255, shape=(3, 84, 84), dtype=np.uint8)
     # Create replay_class with buffer-specific hyperparameters
     replay_class = UniformReplayBuffer
