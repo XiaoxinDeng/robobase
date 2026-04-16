@@ -280,7 +280,8 @@ class BiGymEnvFactory(EnvFactory):
         for demo in demos:
             for ts in demo.timesteps:
                 ts.observation = {
-                    k: np.array(v, dtype=np.float32) for k, v in ts.observation.items()
+                    k: np.array(v, dtype=np.uint8 if k.startswith("rgb_") else np.float32) # Save rgb as uint8, save others as float32
+                    for k, v in ts.observation.items()
                 }
         env.close()
         logging.info("Finished loading demos.")
@@ -455,22 +456,34 @@ class BiGymEnvFactory(EnvFactory):
 
 
     def _compute_obs_stats(self, cfg: DictConfig, demos: List[List[DemoStep]]) -> Dict:
-        count = defaultdict(int)
-        mean = {}
-        M2 = {}
-        min_val = {}
-        max_val = {}
+        per_key = defaultdict(list)
+        valid_keys = None
 
         for demo in demos:
             for step in demo.timesteps:
-                obs.append(step.observation)
+                obs = step.observation
 
-        keys = obs[0].keys()
-        obs = {key: np.stack([o[key] for o in obs], axis=0) for key in keys}
-        obs_mean = {key: np.mean(obs[key], 0) for key in keys}
-        obs_std = {key: np.std(obs[key], 0) for key in keys}
-        obs_min = {key: np.min(obs[key], 0) for key in keys}
-        obs_max = {key: np.max(obs[key], 0) for key in keys}
+                if valid_keys is None:
+                    valid_keys = [
+                        k for k, v in obs.items()
+                        if np.asarray(v).ndim == 1 and k != "proprioception_floating_base_actions"
+                    ]
+
+                for k in valid_keys:
+                    per_key[k].append(obs[k])
+
+        obs_mean = {}
+        obs_std = {}
+        obs_min = {}
+        obs_max = {}
+
+        for k, values in per_key.items():
+            arr = np.asarray(values, dtype=np.float32)
+            obs_mean[k] = arr.mean(axis=0)
+            obs_std[k] = arr.std(axis=0)
+            obs_min[k] = arr.min(axis=0)
+            obs_max[k] = arr.max(axis=0)
+
         obs_stats = {
             "mean": obs_mean,
             "std": obs_std,
