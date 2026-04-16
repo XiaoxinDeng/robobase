@@ -50,7 +50,7 @@ def _create_default_replay_buffer(
         extra_replay_elements["mode_label"] = spaces.Box(
             low=0,
             high=2,
-            shape=(),
+            shape=(1, 3, 84, 84),
             dtype=np.uint8,
         )
         print("=== eval_env.observation_space ===")
