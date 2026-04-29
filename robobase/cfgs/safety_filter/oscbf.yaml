@@ -1,0 +1,12 @@
+# @package _global_
+
+safety_filter:
+  enabled: true
+  _target_: robobase.safetyfilter.oscbf.oscbffilter.OSCBFFilter
+  filter_all_except_gripper: true
+  max_action_delta: null
+  debug: true
+  
+  bridge:
+    _target_: robobase.safetyfilter.oscbf.oscbfbridge.OSCBFBridge
+    urdf_path: null

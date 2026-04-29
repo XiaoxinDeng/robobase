@@ -120,7 +120,12 @@ class Workspace:
             else work_dir
         )
         print(f"workspace: {self.work_dir}")
-        self.safety_filter = None
+        # Safety Filter
+        if cfg.get("safety_filter") and cfg.safety_filter.get("enabled", False):
+            self.safety_filter = hydra.utils.instantiate(cfg.safety_filter)
+        else:
+            self.safety_filter = None
+        print("safety_filter:", type(self.safety_filter).__name__ if self.safety_filter is not None else None)
 
         # Sanity checks
         if (
@@ -492,6 +497,11 @@ class Workspace:
     def _signal_handler(self, sig, frame):
         print("\nCtrl+C detected. Preparing to shutdown...")
         self._shutting_down = True
+        try:
+            self.shutdown()
+        except Exception as e:
+            print(f"Shutdown warning: {e}")
+        raise KeyboardInterrupt
 
     def _load_demos(self):
         if (num_demos := self.cfg.demos) != 0:
@@ -550,23 +560,21 @@ class Workspace:
         if not eval_mode:
             return action
 
-        # If no safety filter object is attached yet, just run bridge diagnostics
+        # No filter object yet: just debug once and pass through
         if self.safety_filter is None:
             try:
-                h1_state = extract_h1_state(env)
-                print("[safetyfilter] q_full shape:", h1_state.q_full.shape)
-                print("[safetyfilter] q_ctrl shape:", h1_state.q_ctrl.shape)
-                print("[safetyfilter] action shape:", action.shape)
+                extract_h1_state(env, print_diagnostics=True)
             except Exception as e:
                 print("[safetyfilter] state bridge failed:", repr(e))
             return action
-
-        # Later: real safety filter
-        return self.safety_filter.filter_action(
+        
+        action_safe = self.safety_filter.filter_action(
             action=action,
             env=env,
             observations=observations,
         )
+
+        return action_safe
 
     def _perform_env_steps(
         self, observations: dict[str, np.ndarray], env: gym.Env, eval_mode: bool
@@ -747,13 +755,45 @@ class Workspace:
         return metrics
 
     def shutdown(self):
-        if self.eval_env:
-            self.eval_env.close()
+        print("[shutdown] starting")
 
-        self.train_envs.close()
-        self.replay_buffer.shutdown()
-        if self.use_demo_replay:
-            self.demo_replay_buffer.shutdown()
+        try:
+            if self.eval_env is not None:
+                print("[shutdown] closing eval_env")
+                self.eval_env.close()
+        except Exception as e:
+            print(f"[shutdown] eval_env.close failed: {e}")
+
+        try:
+            if self.train_envs is not None:
+                print("[shutdown] closing train_envs")
+                self.train_envs.close()
+        except Exception as e:
+            print(f"[shutdown] train_envs.close failed: {e}")
+
+        try:
+            if self.replay_buffer is not None:
+                print("[shutdown] shutting down replay_buffer")
+                self.replay_buffer.shutdown()
+        except Exception as e:
+            print(f"[shutdown] replay_buffer.shutdown failed: {e}")
+
+        try:
+            if self.use_demo_replay and self.demo_replay_buffer is not None:
+                print("[shutdown] shutting down demo_replay_buffer")
+                self.demo_replay_buffer.shutdown()
+        except Exception as e:
+            print(f"[shutdown] demo_replay_buffer.shutdown failed: {e}")
+
+        try:
+            import wandb
+            if wandb.run is not None:
+                print("[shutdown] finishing wandb")
+                wandb.finish(exit_code=1)
+        except Exception as e:
+            print(f"[shutdown] wandb.finish failed: {e}")
+
+        print("[shutdown] done")
 
     def save_snapshot(self):
         snapshot = self.work_dir / "snapshots" / f"{self.global_env_steps}_snapshot.pt"

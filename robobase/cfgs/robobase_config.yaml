@@ -4,6 +4,7 @@ defaults:
   - method: null
   - intrinsic_reward_module: null
   - launch: null
+  - safety_filter: oscbf
   - override hydra/launcher: joblib
 
 # Universal settings
@@ -81,10 +82,6 @@ log_eval_video: true
 log_pretrain_every: 100
 save_csv: false
 
-# Safety filter settings
-safety_filter:
-  use: false
-  threshold: 0.5
 
 hydra:
   run:
