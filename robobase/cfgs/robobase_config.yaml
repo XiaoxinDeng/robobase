@@ -81,6 +81,11 @@ log_eval_video: true
 log_pretrain_every: 100
 save_csv: false
 
+# Safety filter settings
+safety_filter:
+  use: false
+  threshold: 0.5
+
 hydra:
   run:
     dir: ./exp_local/${now:%Y.%m.%d}/${now:%H%M%S}_${hydra.job.override_dirname}

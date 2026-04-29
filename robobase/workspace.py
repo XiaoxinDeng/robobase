@@ -17,7 +17,7 @@ from robobase.logger import Logger
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
-
+from robobase.safetyfilter.h1_state_bridge import extract_h1_state
 
 from pathlib import Path
 
@@ -120,6 +120,7 @@ class Workspace:
             else work_dir
         )
         print(f"workspace: {self.work_dir}")
+        self.safety_filter = None
 
         # Sanity checks
         if (
@@ -540,6 +541,33 @@ class Workspace:
             ) / execution_time_for_update
         return metrics
 
+    def _filter_action(self, action, env, observations, eval_mode: bool):
+        # action shape:
+        # train: (num_envs, T, act_dim)
+        # eval:  (T, act_dim) after squeezing batch dim
+
+        # Start with eval-only testing
+        if not eval_mode:
+            return action
+
+        # If no safety filter object is attached yet, just run bridge diagnostics
+        if self.safety_filter is None:
+            try:
+                h1_state = extract_h1_state(env)
+                print("[safetyfilter] q_full shape:", h1_state.q_full.shape)
+                print("[safetyfilter] q_ctrl shape:", h1_state.q_ctrl.shape)
+                print("[safetyfilter] action shape:", action.shape)
+            except Exception as e:
+                print("[safetyfilter] state bridge failed:", repr(e))
+            return action
+
+        # Later: real safety filter
+        return self.safety_filter.filter_action(
+            action=action,
+            env=env,
+            observations=observations,
+        )
+
     def _perform_env_steps(
         self, observations: dict[str, np.ndarray], env: gym.Env, eval_mode: bool
     ) -> tuple[np.ndarray, tuple, dict[str, Any]]:
@@ -571,7 +599,12 @@ class Workspace:
                 )
             if eval_mode:
                 action = action[0]  # we expect batch of 1 for eval
-
+            action = self._filter_action(
+                action=action,
+                env=env,
+                observations=observations,
+                eval_mode=eval_mode,
+            )
         if self.agent.logging:
             execution_time_for_act = time.time() - start_time
             metrics["agent_act_steps_per_second"] = (
