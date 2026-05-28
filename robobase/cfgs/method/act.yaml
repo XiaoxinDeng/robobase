@@ -32,6 +32,7 @@ method:
     state_dim: ???
     action_dim: ???
     use_lang_cond: ${method.use_lang_cond}
+    kl_weight: 10
 
   encoder_model:
     _target_: robobase.method.act.ImageEncoderACT

@@ -41,6 +41,10 @@ action_sequence: 1 # ActionSequenceWrapper
 execution_length: 1  # If execution_length < action_sequence, we use receding horizon control
 temporal_ensemble: true  # Temporal ensemling only applicable to action sequence > 1
 temporal_ensemble_gain: 0.01
+action_smoothing:
+  enabled: false  # Eval-only EMA smoothing in RecedingHorizonControl.
+  alpha: 0.0  # smooth = alpha * previous_action + (1 - alpha) * current_action.
+  ignore_last_dims: 0  # For BiGym H1, set to 2 to leave grippers unsmoothed.
 use_standardization: false  # Demo-based standardization for action space
 use_min_max_normalization: false  # Demo-based min-max normalization for action space
 min_max_margin: 0.0  # If set to > 0, introduce margin for demo-driven min-max normalization

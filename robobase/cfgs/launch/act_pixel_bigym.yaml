@@ -4,19 +4,19 @@ defaults:
   - ../env: null
   - ../method: act
 
-demos: 30
+demos: 40
 num_pretrain_steps: 200000
 num_pretrain_epochs: 10000
 num_train_frames: 0
 eval_every_steps: 2500
 num_eval_episodes: 25
-batch_size: 256
+batch_size: 128
 save_snapshot: true
 snapshot_every_n: 1000
 replay_size_before_train: 500
 
 pixels: true
-frame_stack: 1
+frame_stack: 4
 
 is_imitation_learning: true
 
@@ -33,6 +33,14 @@ update_every_steps: 1
 
 replay:
   nstep: 1
+  num_workers: 0
+
+method:
+  lr: 3e-5
+  lr_backbone: 3e-6
+  actor_grad_clip: 1.0
+  actor_model:
+    kl_weight: 20
 
 hydra:
   run:
