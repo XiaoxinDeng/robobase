@@ -451,8 +451,12 @@ class ActBCAgent(BC):
             )
             task_emb, _ = self.encode_clip_text(lang_tokens)
 
-        # If action contains all zeros, it is padded.
-        is_pad = actions.sum(axis=-1) == 0
+        # Prefer explicit replay masks; fall back to zero-action padding for
+        # older buffers/snapshots.
+        if "mask" in batch:
+            is_pad = ~batch["mask"].bool()
+        else:
+            is_pad = actions.sum(axis=-1) == 0
         loss_dict = self.actor(
             qpos, image, actions=actions, is_pad=is_pad, task_emb=task_emb
         )
@@ -491,6 +495,8 @@ class ActBCAgent(BC):
             metrics["actor_loss"] = loss_dict["loss"].item()
             metrics["actor_l1_loss"] = loss_dict["l1"].item()
             metrics["actor_kl_loss"] = loss_dict["kl"].item()
+            if "valid_action_fraction" in loss_dict:
+                metrics["actor_valid_action_fraction"] = loss_dict["valid_action_fraction"].item()
             metrics["batch_reward"] = reward.mean().item()
             if "mode_loss" in loss_dict:
                 metrics["mode_loss"] = loss_dict["mode_loss"].item()

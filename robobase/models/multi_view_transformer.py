@@ -319,9 +319,12 @@ class MultiViewTransformerEncoderDecoderACT(FusionModule):
         total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
         loss_dict = dict()
         all_l1 = F.l1_loss(actions, a_hat, reduction="none")
-        l1 = (all_l1 * ~is_pad.unsqueeze(-1)).mean()
+        valid_action_mask = (~is_pad).unsqueeze(-1).to(dtype=all_l1.dtype)
+        valid_action_scalars = valid_action_mask.expand_as(all_l1).sum().clamp_min(1.0)
+        l1 = (all_l1 * valid_action_mask).sum() / valid_action_scalars
 
         loss_dict["l1"] = l1
+        loss_dict["valid_action_fraction"] = valid_action_mask.mean()
         loss_dict["kl"] = total_kld[0]
         loss_dict["loss"] = loss_dict["l1"] + loss_dict["kl"] * self.kl_weight
 
