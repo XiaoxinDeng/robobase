@@ -37,3 +37,5 @@ eval_video/
 *.csv
 events.out.*
 .DS_Store
+
+eval_safety/*

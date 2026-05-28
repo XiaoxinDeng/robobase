@@ -593,30 +593,58 @@ class Workspace:
         return metrics
 
     def _filter_action(self, action, env, observations, eval_mode: bool):
-        # action shape:
-        # train: (num_envs, T, act_dim)
-        # eval:  (T, act_dim) after squeezing batch dim
+        """
+        Safety-filter eval action.
 
-        # Start with eval-only testing
+        Chunk-aware filters receive the full eval chunk before the first action is
+        selected by the action-sequence wrapper. Legacy single-step filters still
+        operate on the first executable action only.
+        """
+
         if not eval_mode:
             return action
 
-        # No filter object yet: just debug once and pass through
         if self.safety_filter is None:
-            try:
-                extract_h1_state(env, print_diagnostics=True)
-            except Exception as e:
-                print("[safetyfilter] state bridge failed:", repr(e))
             return action
-        
-        action_safe = self.safety_filter.filter_action(
-            action=action,
-            env=env,
-            observations=observations,
+        if not getattr(self.safety_filter, "enabled", True):
+            return action
+
+        # For now validate only single executable action.
+        # ACT eval action shape is usually (T, act_dim).
+        if action.ndim != 2:
+            raise ValueError(
+                f"Expected eval action shape (T, act_dim), got {action.shape}"
+            )
+
+        action_safe = action.copy()
+
+        # Extract robot state for OSCBF.
+        # This must return q_full and qd_full in the robot model frame/state convention.
+        q_full, qd_full = extract_h1_state(
+            env,
+            print_diagnostics=self.cfg.safety_filter.get("debug", False),
         )
 
-        return action_safe
+        if hasattr(self.safety_filter, "filter_chunk") and action.ndim == 2:
+            action_safe, _safety_info = self.safety_filter.filter_chunk(
+                observations,
+                action,
+                env=env,
+                q_full=q_full,
+                qd_full=qd_full,
+            )
+        else:
+            # Filter only the action that will be executed now.
+            action_safe[0] = self.safety_filter(
+                action=action[0],
+                env=env,
+                observations=observations,
+                q_full=q_full,
+                qd_full=qd_full,
+            )
 
+        return action_safe
+    
     def _perform_env_steps(
         self, observations: dict[str, np.ndarray], env: gym.Env, eval_mode: bool
     ) -> tuple[np.ndarray, tuple, dict[str, Any]]:
@@ -654,6 +682,23 @@ class Workspace:
                 observations=observations,
                 eval_mode=eval_mode,
             )
+            if self.safety_filter is not None:
+                safety_info = getattr(self.safety_filter, "last_info", None)
+                if isinstance(safety_info, dict):
+                    for key in (
+                        "safety_mode",
+                        "min_clearance",
+                        "first_violation",
+                        "unsafe_count",
+                        "progress_scale",
+                        "deadlock",
+                        "brake_stop_idx",
+                        "deformation_norm",
+                        "deform_safe",
+                        "deform_min_clearance",
+                    ):
+                        if key in safety_info:
+                            metrics[f"safety_filter/{key}"] = safety_info[key]
         if self.agent.logging:
             execution_time_for_act = time.time() - start_time
             metrics["agent_act_steps_per_second"] = (

@@ -306,9 +306,6 @@ class BiGymEnvFactory(EnvFactory):
         with open(manifest_path, "r", encoding="utf-8") as f:
             entries = json.load(f)
 
-        if amount is not None and amount > 0:
-            entries = entries[:amount]
-
         demos = []
         for entry in entries:
             # Filter unsuccessful tasks
@@ -316,6 +313,9 @@ class BiGymEnvFactory(EnvFactory):
                 demo_path = Path(entry["target_path"]).expanduser()
                 demo = Demo.from_safetensors(demo_path)   # replace with your actual demo loader
                 demos.append(demo)
+        
+        if amount is not None and amount > 0:
+            demos = demos[:amount]
 
         return demos
     

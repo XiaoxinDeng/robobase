@@ -1,12 +1,18 @@
 # @package _global_
 
 safety_filter:
-  enabled: true
+  enabled: false
   _target_: robobase.safetyfilter.oscbf.oscbffilter.OSCBFFilter
+
+  urdf_path: /home/xd1125/Workspace/safe_bigym_hoi/external/oscbf/oscbf/assets/h1/h1.urdf
+  debug: true
+  use_dummy_filter: true
+  dummy_scale: 0.5
+  runtime_joint_names: null
+  expected_motion_dim: 14
+  dt: 0.002
+  human_margin: 0.08
+  alpha_gain: 10.0
+  control_type: absolute
   filter_all_except_gripper: true
   max_action_delta: null
-  debug: true
-  
-  bridge:
-    _target_: robobase.safetyfilter.oscbf.oscbfbridge.OSCBFBridge
-    urdf_path: null

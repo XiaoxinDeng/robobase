@@ -1,0 +1,32 @@
+# @package _global_
+
+safety_filter:
+  enabled: true
+  _target_: robobase.safetyfilter.safechunk_deform_filter.SafeChunkDeformFilter
+  _recursive_: false
+
+  horizon: 16
+  dt: 0.05
+  action_dim: 16
+  expected_motion_dim: 14
+  control_type: absolute
+  debug: true
+
+  controlled_action_indices: [4, 5, 6, 7, 9, 10, 11, 12]
+  controlled_state_indices: [4, 5, 6, 7, 9, 10, 11, 12]
+
+  min_clearance: 0.08
+  brake_progress_threshold: 0.05
+  deadlock_window: 5
+  deformation_enabled: true
+
+  oscbf_operator:
+    _target_: robobase.safetyfilter.oscbf.oscbffilter.OSCBFFilter
+    urdf_path: null
+    debug: true
+    use_dummy_filter: false
+    expected_motion_dim: 14
+    dt: 0.05
+    human_margin: 0.08
+    alpha_gain: 10.0
+    control_type: absolute

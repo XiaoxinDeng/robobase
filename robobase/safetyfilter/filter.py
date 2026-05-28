@@ -1,5 +1,6 @@
 import numpy as np
 from typing import Optional
+from external.robobase.robobase.safetyfilter.oscbf.oscbf_eehumancapsule_velocity_config import OSCBFBridge
 
 class Filter:
     def __init__(
@@ -8,7 +9,7 @@ class Filter:
         filter_all_except_gripper: bool = True,
         max_action_delta: Optional[float] = None,
         debug: bool = True,
-        bridge=None,
+        bridge: OSCBFBridge = None,
     ):  
         self.enabled = enabled
         self.filter_all_except_gripper = filter_all_except_gripper
