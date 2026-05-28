@@ -76,6 +76,9 @@ class RecedingHorizonControl(ActionSequence):
         execution_length: int,
         temporal_ensemble: bool = True,
         gain: float = 0.01,
+        action_smoothing_enabled: bool = False,
+        action_smoothing_alpha: float = 0.0,
+        action_smoothing_ignore_last_dims: int = 0,
     ):
         """Init.
 
@@ -86,12 +89,29 @@ class RecedingHorizonControl(ActionSequence):
             execution_length: The execution length of the receding horizion control.
             temporal_ensemble: Whether to use temporal ensembling. Defaults to True.
             gain: Temporal ensembling gain. Defaults to 0.01.
+            action_smoothing_enabled: Whether to smooth executed actions with EMA.
+            action_smoothing_alpha: Previous-action EMA weight. 0 disables smoothing.
+            action_smoothing_ignore_last_dims: Number of final action dims to leave
+                unsmoothed, useful for gripper commands.
         """
         super().__init__(env, sequence_length)
+        if not 0.0 <= action_smoothing_alpha < 1.0:
+            raise ValueError(
+                "action_smoothing_alpha must be in [0, 1), got "
+                f"{action_smoothing_alpha}."
+            )
+        if action_smoothing_ignore_last_dims < 0:
+            raise ValueError(
+                "action_smoothing_ignore_last_dims must be non-negative, got "
+                f"{action_smoothing_ignore_last_dims}."
+            )
         self._time_limit = time_limit
         self._execution_length = execution_length
         self._temporal_ensemble = temporal_ensemble
         self._gain = gain
+        self._action_smoothing_enabled = action_smoothing_enabled
+        self._action_smoothing_alpha = action_smoothing_alpha
+        self._action_smoothing_ignore_last_dims = action_smoothing_ignore_last_dims
         self._init_action_history()
 
     def _init_action_history(self):
@@ -112,6 +132,35 @@ class RecedingHorizonControl(ActionSequence):
             dtype=self.action_space.dtype,
         )
         self._cur_step = 0
+        self._last_smoothed_action = None
+
+    def _smooth_action(self, sub_action):
+        if (
+            not self._action_smoothing_enabled
+            or self._action_smoothing_alpha <= 0.0
+        ):
+            return sub_action
+
+        current = np.asarray(sub_action, dtype=self.env.action_space.dtype)
+        if self._last_smoothed_action is None:
+            smoothed = current.copy()
+        else:
+            smoothed = (
+                self._action_smoothing_alpha * self._last_smoothed_action
+                + (1.0 - self._action_smoothing_alpha) * current
+            )
+
+        ignore_dims = min(self._action_smoothing_ignore_last_dims, smoothed.shape[-1])
+        if ignore_dims > 0:
+            smoothed[-ignore_dims:] = current[-ignore_dims:]
+
+        smoothed = np.clip(
+            smoothed,
+            self.env.action_space.low,
+            self.env.action_space.high,
+        ).astype(self.env.action_space.dtype)
+        self._last_smoothed_action = smoothed
+        return smoothed
 
     def reset(
         self, *, seed: int | None = None, options: Dict[str, Any] | None = None
@@ -144,6 +193,7 @@ class RecedingHorizonControl(ActionSequence):
                 exp_weights = (exp_weights / exp_weights.sum())[:, None]
                 sub_action = (cur_actions * exp_weights).sum(axis=0)
 
+            sub_action = self._smooth_action(sub_action)
             observation, reward, termination, truncation, info = self.env.step(
                 sub_action
             )
