@@ -694,6 +694,9 @@ class Workspace:
                         "deadlock",
                         "brake_stop_idx",
                         "deformation_norm",
+                        "deformation_source",
+                        "chunk_deform_scale",
+                        "chunk_deform_attempts",
                         "deform_safe",
                         "deform_min_clearance",
                     ):

@@ -39,39 +39,145 @@ def _render_single_env_if_vector(env: gym.vector.VectorEnv):
     return img
 
 
+def _mujoco_data_and_forward(env):
+    try:
+        from robobase.safetyfilter.h1_state_bridge import get_bigym_task
+
+        task = get_bigym_task(env)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    mojo = getattr(task, "_mojo", None) or getattr(task, "mojo", None)
+    if mojo is None:
+        return None, None
+
+    physics = getattr(mojo, "physics", None)
+    data = getattr(physics, "data", None) if physics is not None else None
+    if data is None:
+        data = getattr(mojo, "data", None)
+    if data is None:
+        return None, None
+
+    forward = getattr(physics, "forward", None) if physics is not None else None
+    if forward is None:
+        forward = getattr(mojo, "forward", None)
+    return data, forward
+
+
+def _snapshot_mujoco_state(env):
+    data, _forward = _mujoco_data_and_forward(env)
+    if data is None:
+        return None
+
+    state = {"time": float(getattr(data, "time", 0.0))}
+    for name in ("qpos", "qvel", "act", "ctrl", "mocap_pos", "mocap_quat"):
+        value = getattr(data, name, None)
+        if value is not None:
+            state[name] = np.asarray(value).copy()
+    return state
+
+
+def _restore_mujoco_state(env, state) -> bool:
+    if state is None:
+        return False
+
+    data, forward = _mujoco_data_and_forward(env)
+    if data is None:
+        return False
+
+    if "time" in state and hasattr(data, "time"):
+        data.time = float(state["time"])
+    for name, value in state.items():
+        if name == "time":
+            continue
+        target = getattr(data, name, None)
+        if target is not None and np.shape(target) == np.shape(value):
+            target[...] = value
+
+    if callable(forward):
+        forward()
+    return True
+
+
 class WallClockVideoRecorder:
-    def __init__(self, save_dir: Path, render_size=256, fps=20):
+    def __init__(self, save_dir: Path, render_size=256, fps=20, time_base="sim"):
         self.save_dir = save_dir
         if save_dir is not None:
-            self.save_dir.mkdir(exist_ok=True)
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+        if time_base not in {"sim", "wall"}:
+            raise ValueError(f"time_base must be sim or wall, got {time_base!r}")
         self.render_size = render_size
         self.fps = fps
+        self.time_base = time_base
         self.frames = []
+        self._states = []
         self.timestamps = []
+        self._deferred = True
+        self._env = None
 
     def init(self, env, enabled=True):
         self.frames = []
+        self._states = []
         self.timestamps = []
         self.enabled = self.save_dir is not None and enabled
+        self._deferred = True
+        self._env = env
         self.record(env)
 
     def record(self, env):
-        if self.enabled:
-            frame = _render_single_env_if_vector(env)
-            if frame is not None:
-                self.frames.append(frame)
-                self.timestamps.append(time.perf_counter())
+        if not self.enabled:
+            return
+
+        self._env = env
+        timestamp = time.perf_counter() if self.time_base == "wall" else None
+        state = _snapshot_mujoco_state(env)
+        if state is not None and self._deferred:
+            self._states.append(state)
+            if self.time_base == "wall":
+                self.timestamps.append(timestamp)
+            else:
+                self.timestamps.append((len(self._states) - 1) / float(self.fps))
+            return
+
+        self._deferred = False
+        frame = _render_single_env_if_vector(env)
+        if frame is None:
+            return
+        self.frames.append(frame)
+        if self.time_base == "wall":
+            self.timestamps.append(timestamp)
+        else:
+            self.timestamps.append((len(self.frames) - 1) / float(self.fps))
 
     def save(self, file_name):
-        if self.enabled and len(self.frames) > 0:
-            path = self.save_dir / file_name
-            frames = np.array(self.frames)
-            fps = self.fps
-            if len(self.timestamps) > 1:
-                duration = self.timestamps[-1] - self.timestamps[0]
-                if duration > 0:
-                    fps = len(self.frames) / duration
-            imageio.mimsave(str(path), frames, fps=fps)
+        if not self.enabled:
+            return
+
+        frames = self.frames
+        if self._deferred and self._states and self._env is not None:
+            current_state = _snapshot_mujoco_state(self._env)
+            rendered_frames = []
+            try:
+                for state in self._states:
+                    if _restore_mujoco_state(self._env, state):
+                        frame = _render_single_env_if_vector(self._env)
+                        if frame is not None:
+                            rendered_frames.append(frame)
+            finally:
+                _restore_mujoco_state(self._env, current_state)
+            frames = rendered_frames
+
+        if len(frames) == 0:
+            return
+
+        path = self.save_dir / file_name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fps = self.fps
+        if self.time_base == "wall" and len(self.timestamps) > 1:
+            duration = self.timestamps[-1] - self.timestamps[0]
+            if duration > 0:
+                fps = len(frames) / duration
+        imageio.mimsave(str(path), np.array(frames), fps=fps)
 
 
 def infer_env_action_shape(env, fallback=(16, 16)) -> tuple[int, ...]:
@@ -217,7 +323,26 @@ def make_eval_env(cfg):
 def make_workspace_and_load_snapshot(cfg, snapshot_path: Path) -> Workspace:
     run_dir = snapshot_path.parent.parent
     ws = Workspace(cfg, work_dir=run_dir)
-    ws.load_snapshot(snapshot_path)
+    try:
+        ws.load_snapshot(snapshot_path)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "size mismatch" in message:
+            frame_stack = cfg.get("frame_stack", "<unset>")
+            frame_stack_on_channel = cfg.get(
+                "frame_stack_on_channel", "<unset>"
+            )
+            raise RuntimeError(
+                "Snapshot architecture does not match the eval config. "
+                f"Current eval frame_stack={frame_stack}, "
+                f"frame_stack_on_channel={frame_stack_on_channel}. "
+                "For frame-stacked ACT checkpoints, pass the same Hydra "
+                "architecture overrides used during training, e.g. "
+                "--override frame_stack=4. Also make sure commented-out "
+                "override lines are not placed inside a backslash-continued "
+                "shell command, because bash can drop later overrides."
+            ) from exc
+        raise
     return ws
 
 
@@ -309,7 +434,121 @@ def compute_oscbf_h_monitor(
         return None, None, None
 
 
-def count_robot_human_contacts(env) -> Optional[int]:
+def _segment_segment_distance_sq(p1, q1, p2, q2) -> float:
+    p1 = np.asarray(p1, dtype=np.float32)
+    q1 = np.asarray(q1, dtype=np.float32)
+    p2 = np.asarray(p2, dtype=np.float32)
+    q2 = np.asarray(q2, dtype=np.float32)
+
+    d1 = q1 - p1
+    d2 = q2 - p2
+    r = p1 - p2
+    a = float(np.dot(d1, d1))
+    e = float(np.dot(d2, d2))
+    f = float(np.dot(d2, r))
+    eps = 1e-8
+
+    if a <= eps and e <= eps:
+        return float(np.dot(p1 - p2, p1 - p2))
+    if a <= eps:
+        s = 0.0
+        t = np.clip(f / max(e, eps), 0.0, 1.0)
+    else:
+        c = float(np.dot(d1, r))
+        if e <= eps:
+            t = 0.0
+            s = np.clip(-c / a, 0.0, 1.0)
+        else:
+            b = float(np.dot(d1, d2))
+            denom = a * e - b * b
+            s = np.clip((b * f - c * e) / denom, 0.0, 1.0) if denom > eps else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = np.clip(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = np.clip((b - c) / a, 0.0, 1.0)
+
+    c1 = p1 + s * d1
+    c2 = p2 + t * d2
+    return float(np.dot(c1 - c2, c1 - c2))
+
+
+def _robot_arm_capsules_urdf(filt: OSCBFFilter, q_urdf: np.ndarray):
+    robot = filt.robot_model
+    if robot is None:
+        return [], [], []
+
+    transforms = np.asarray(
+        robot.joint_to_world_transforms(jnp.asarray(q_urdf, dtype=jnp.float32)),
+        dtype=np.float32,
+    )
+    pos_by_name = {name: transforms[i, :3, 3] for i, name in enumerate(robot.joint_names)}
+    segments = [
+        ("left_shoulder_upper", "left_shoulder_pitch_joint", "left_shoulder_roll_joint"),
+        ("left_upperarm", "left_shoulder_roll_joint", "left_shoulder_yaw_joint"),
+        ("left_forearm", "left_shoulder_yaw_joint", "left_elbow_joint"),
+        ("right_shoulder_upper", "right_shoulder_pitch_joint", "right_shoulder_roll_joint"),
+        ("right_upperarm", "right_shoulder_roll_joint", "right_shoulder_yaw_joint"),
+        ("right_forearm", "right_shoulder_yaw_joint", "right_elbow_joint"),
+    ]
+
+    capsule_a = []
+    capsule_b = []
+    names = []
+    for label, a_name, b_name in segments:
+        if a_name in pos_by_name and b_name in pos_by_name:
+            capsule_a.append(pos_by_name[a_name])
+            capsule_b.append(pos_by_name[b_name])
+            names.append(label)
+    return capsule_a, capsule_b, names
+
+
+def compute_oscbf_full_arm_h_monitor(
+    filt: OSCBFFilter,
+    env,
+    obs,
+    q_full: np.ndarray,
+    qd_full: np.ndarray,
+    robot_radius: float = 0.06,
+):
+    if filt.oscbf_config is None or filt.robot_model is None:
+        return None, None, None, None
+
+    try:
+        q_urdf, _, _, _ = filt._build_urdf_surrogate_state_from_bigym(q_full, qd_full)
+        human_obstacles = filt._extract_human_obstacles(env, obs)
+
+        t_world_urdf = filt._get_world_T_urdf_from_bigym_state(q_full)
+        t_urdf_world = np.linalg.inv(t_world_urdf)
+
+        human_a = filt._transform_points(t_urdf_world, human_obstacles["capsule_a"])
+        human_b = filt._transform_points(t_urdf_world, human_obstacles["capsule_b"])
+        human_r = np.asarray(human_obstacles["capsule_radii"], dtype=np.float32)
+
+        robot_a, robot_b, robot_names = _robot_arm_capsules_urdf(filt, q_urdf)
+        h_values = []
+        labels = []
+        for r_idx, (ra, rb) in enumerate(zip(robot_a, robot_b)):
+            for h_idx, (ha, hb) in enumerate(zip(human_a, human_b)):
+                combined_radius = float(robot_radius + human_r[h_idx])
+                dist_sq = _segment_segment_distance_sq(ra, rb, ha, hb)
+                h_values.append(dist_sq - combined_radius * combined_radius)
+                labels.append(f"{robot_names[r_idx]}:human_capsule_{h_idx}")
+
+        if not h_values:
+            return None, None, None, None
+        h_arr = np.asarray(h_values, dtype=np.float32)
+        min_idx = int(np.argmin(h_arr))
+        min_h = float(h_arr[min_idx])
+        return min_h, h_arr.tolist(), bool(min_h < 0.0), labels[min_idx]
+
+    except AttributeError:
+        return None, None, None, None
+
+
+def robot_human_contact_pairs(env) -> Optional[list[str]]:
     try:
         from robobase.safetyfilter.h1_state_bridge import get_bigym_task
 
@@ -317,7 +556,7 @@ def count_robot_human_contacts(env) -> Optional[int]:
         model = task._mojo.model
         data = task._mojo.data
 
-        count = 0
+        pairs = []
         for i in range(data.ncon):
             contact = data.contact[i]
             g1 = int(contact.geom1)
@@ -332,16 +571,22 @@ def count_robot_human_contacts(env) -> Optional[int]:
             is_human_1 = "human" in n1 or "upperarm" in n1 or "forearm" in n1
             is_human_2 = "human" in n2 or "upperarm" in n2 or "forearm" in n2
 
-            is_robot_1 = "h1" in n1 or "shoulder" in n1 or "elbow" in n1 or "wrist" in n1
-            is_robot_2 = "h1" in n2 or "shoulder" in n2 or "elbow" in n2 or "wrist" in n2
+            robot_tokens = ("h1", "shoulder", "elbow", "wrist", "hand", "gripper", "finger", "robotiq")
+            is_robot_1 = any(token in n1 for token in robot_tokens)
+            is_robot_2 = any(token in n2 for token in robot_tokens)
 
             if (is_human_1 and is_robot_2) or (is_human_2 and is_robot_1):
-                count += 1
+                pairs.append(f"{name1}<->{name2}")
 
-        return count
+        return pairs
 
     except Exception:  # noqa: BLE001
         return None
+
+
+def count_robot_human_contacts(env) -> Optional[int]:
+    pairs = robot_human_contact_pairs(env)
+    return None if pairs is None else len(pairs)
 
 
 def extract_success(info: Any, reward: float, terminated: bool) -> bool:
@@ -399,6 +644,7 @@ def summarise_episode(metrics: list[StepMetrics]) -> dict:
     valid_h = [m.min_h for m in metrics if m.min_h is not None]
     valid_violations = [m.h_violation for m in metrics if m.h_violation is not None]
     valid_contacts = [m.contact_count for m in metrics if m.contact_count is not None]
+    valid_contact_steps = [count > 0 for count in valid_contacts]
 
     return {
         "condition": metrics[0].condition,
@@ -412,8 +658,10 @@ def summarise_episode(metrics: list[StepMetrics]) -> dict:
         "h_violation_count": int(np.sum(valid_violations)) if valid_violations else None,
         "h_violation_rate": float(np.mean(valid_violations)) if valid_violations else None,
 
-        "contact_count_total": int(np.sum(valid_contacts)) if valid_contacts else None,
-        "contact_episode": bool(np.sum(valid_contacts) > 0) if valid_contacts else None,
+        "contact_count_total": int(np.sum(valid_contact_steps)) if valid_contact_steps else None,
+        "contact_step_count": int(np.sum(valid_contact_steps)) if valid_contact_steps else None,
+        "contact_step_rate": float(np.mean(valid_contact_steps)) if valid_contact_steps else None,
+        "contact_episode": bool(np.sum(valid_contact_steps) > 0) if valid_contact_steps else None,
 
         "mean_arm_delta": float(np.mean(arm_delta)),
         "max_arm_delta": float(np.max(arm_delta)),
@@ -455,6 +703,8 @@ def summarise_all_episodes(episode_summaries: list[dict]) -> dict:
 
         "collision_episode_rate": mean_of("contact_episode"),
         "total_contacts": sum_of("contact_count_total"),
+        "total_contact_steps": sum_of("contact_step_count"),
+        "mean_contact_step_rate": mean_of("contact_step_rate"),
 
         "mean_arm_delta": mean_of("mean_arm_delta"),
         "max_arm_delta_over_episodes": max(

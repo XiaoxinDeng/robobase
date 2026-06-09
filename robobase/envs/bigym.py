@@ -14,7 +14,7 @@ from robobase.envs.wrappers import (
     ConcatDim,
     RecedingHorizonControl,
 )
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from bigym.utils.observation_config import ObservationConfig, CameraConfig
 from bigym.action_modes import PelvisDof
 import multiprocessing as mp
@@ -217,8 +217,32 @@ class BiGymEnvFactory(EnvFactory):
             ),
             control_frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
         )
-        if "arm_action_mode" in inspect.signature(bigym_class.__init__).parameters:
+        env_signature = inspect.signature(bigym_class.__init__).parameters
+        if "arm_action_mode" in env_signature:
             env_kwargs["arm_action_mode"] = cfg.env.get("arm_action_mode", "scripted")
+
+        temporary_blocker_keys = [
+            "enable_temporary_human_blocker",
+            "trigger_dist",
+            "enter_duration",
+            "hold_duration",
+            "exit_duration",
+            "natural_motion_scale",
+            "exit_after_y_peak",
+            "max_blocker_joint_speed",
+            "q_outside",
+            "q_block",
+            "q_exit",
+            "human_joint_names",
+            "ee_site_name",
+            "handle_site_name",
+        ]
+        for key in temporary_blocker_keys:
+            if key in env_signature and key in cfg.env:
+                value = cfg.env.get(key)
+                if OmegaConf.is_config(value):
+                    value = OmegaConf.to_container(value, resolve=True)
+                env_kwargs[key] = value
 
         return bigym_class(**env_kwargs)
 

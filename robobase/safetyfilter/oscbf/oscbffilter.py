@@ -4,11 +4,18 @@ from pathlib import Path
 from typing import Optional, Sequence
 import numpy as np
 import mujoco
+import os
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax.numpy as jnp
 from cbfpy import CBF
 from oscbf.core.treemanipulator import TreeManipulator
 from robobase.safetyfilter.h1_state_bridge import TREE_JOINT_NAMES, get_bigym_task
-from robobase.safetyfilter.oscbf.oscbf_eehumancapsule_velocity_config import OSCBFEEHumanCapsuleVelocityConfig
+from robobase.safetyfilter.oscbf.oscbf_eehumancapsule_velocity_config import (
+    OSCBFEEHumanCapsuleVelocityConfig,
+    OSCBFPelvisArmHumanCapsuleVelocityConfig,
+)
 import logging
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,11 @@ class OSCBFFilter:
         filter_all_except_gripper: bool = True,
         max_action_delta: Optional[float] = None,
         enabled: bool = True,
+        build_cbf_eagerly: bool = False,
+        enable_pelvis_cbf: bool = True,
+        pelvis_velocity_limits: Sequence[float] = (0.6, 0.6, 0.4, 1.5),
+        pelvis_cbf_weight: float = 0.5,
+        arm_cbf_weight: float = 1.0,
         **kwargs,
     ):
         if debug:
@@ -80,24 +92,39 @@ class OSCBFFilter:
         self.control_type = control_type
         self.filter_all_except_gripper = bool(filter_all_except_gripper)
         self.max_action_delta = max_action_delta
+        self.build_cbf_eagerly = bool(build_cbf_eagerly)
+        self.enable_pelvis_cbf = bool(enable_pelvis_cbf)
+        self.pelvis_velocity_limits = tuple(float(x) for x in pelvis_velocity_limits)
+        self.pelvis_cbf_weight = float(pelvis_cbf_weight)
+        self.arm_cbf_weight = float(arm_cbf_weight)
+        self._warned_pelvis_cbf_fallback = False
 
         self._printed_frame_debug = False
 
 
-        # Indices in the 16D BiGym / RoboBase action.
-        # Keep this if you have verified that these are the 8 controllable arm actions.
+        # Indices in the 16D BiGym / RoboBase action. The CBF model itself
+        # still controls the 8 arm joints; chunk-level deformation can also
+        # edit the floating pelvis so the whole kinematic chain can yield.
+        self.bigym_action_base_indices = np.asarray([0, 1, 2, 3], dtype=np.int64)
         self.bigym_action_arm_indices = np.asarray(
             [4, 5, 6, 7, 9, 10, 11, 12],
             dtype=np.int64,
         )
+        self.bigym_action_safety_indices = np.concatenate(
+            [self.bigym_action_base_indices, self.bigym_action_arm_indices]
+        )
 
         # Indices in the 14D BiGym / RoboBase robot state.
+        self.bigym_state_base_indices = np.asarray([0, 1, 2, 3], dtype=np.int64)
         self.bigym_state_arm_indices = np.asarray(
             [4, 5, 6, 7, 9, 10, 11, 12],
             dtype=np.int64,
         )
+        self.bigym_state_safety_indices = np.concatenate(
+            [self.bigym_state_base_indices, self.bigym_state_arm_indices]
+        )
 
-        # Backward-compatible aliases.
+        # Backward-compatible aliases for the true 8D OSCBF control model.
         self.oscbf_action_indices = self.bigym_action_arm_indices
         self.oscbf_state_indices = self.bigym_state_arm_indices
 
@@ -137,7 +164,9 @@ class OSCBFFilter:
         if (not self.enabled) or self.use_dummy_filter:
             self.robot_model = None
             self.oscbf_config = None
+            self.pelvis_oscbf_config = None
             self.cbf = None
+            self.pelvis_cbf = None
         else:
             self.robot_model = self._build_robot_model(self.urdf_path)
             self.oscbf_config = OSCBFEEHumanCapsuleVelocityConfig(
@@ -147,7 +176,23 @@ class OSCBFFilter:
                 capsule_radii_init=np.ones((2,), dtype=np.float32) * 0.1,
                 alpha_gain=self.alpha_gain,
             )
-            self.cbf = CBF.from_config(self.oscbf_config)
+            self.pelvis_oscbf_config = OSCBFPelvisArmHumanCapsuleVelocityConfig(
+                robot=self.robot_model,
+                capsule_a_init=np.zeros((2, 3), dtype=np.float32),
+                capsule_b_init=np.zeros((2, 3), dtype=np.float32),
+                capsule_radii_init=np.ones((2,), dtype=np.float32) * 0.1,
+                pelvis_to_urdf_transform=self.T_pelvis_urdf,
+                alpha_gain=self.alpha_gain,
+                pelvis_velocity_limits=self.pelvis_velocity_limits,
+                pelvis_obj_weight=self.pelvis_cbf_weight,
+                arm_obj_weight=self.arm_cbf_weight,
+            )
+            self.cbf = None
+            self.pelvis_cbf = None
+            if self.build_cbf_eagerly:
+                self._ensure_cbf()
+                if self.enable_pelvis_cbf:
+                    self._ensure_pelvis_cbf()
             
         logger.debug(
             f"\n[OSCBFFilter][INIT]" 
@@ -161,9 +206,26 @@ class OSCBFFilter:
             f"\n  human_margin: {self.human_margin}" 
             f"\n  alpha_gain: {self.alpha_gain}" 
             f"\n  control_type: {self.control_type}" 
+            f"\n  enable_pelvis_cbf: {self.enable_pelvis_cbf}" 
             f"\n  runtime_joint_names: {self.runtime_joint_names}" 
             f"\n  robot_model: {type(self.robot_model).__name__}"
         )
+
+    def _ensure_cbf(self):
+        if self.cbf is None:
+            if self.oscbf_config is None:
+                raise RuntimeError("Cannot build CBF without an OSCBF config.")
+            logger.info("[OSCBFFilter] building CBF safety filter lazily")
+            self.cbf = CBF.from_config(self.oscbf_config)
+        return self.cbf
+
+    def _ensure_pelvis_cbf(self):
+        if self.pelvis_cbf is None:
+            if self.pelvis_oscbf_config is None:
+                raise RuntimeError("Cannot build pelvis CBF without a config.")
+            logger.info("[OSCBFFilter] building pelvis+arm CBF safety filter lazily")
+            self.pelvis_cbf = CBF.from_config(self.pelvis_oscbf_config)
+        return self.pelvis_cbf
 
     def _build_robot_model(self, urdf_path: Path):
         robot_model = TreeManipulator.from_urdf(
@@ -223,11 +285,13 @@ class OSCBFFilter:
         logger.info(
             "[OSCBFFilter] robot_model loaded | "
             "num_joints=%d | num_controls=%d | "
-            "controlled_joint_indices=%s | bigym_action_arm_indices=%s | ee_joint_idx=%d",
+            "controlled_joint_indices=%s | bigym_action_arm_indices=%s | "
+            "bigym_action_safety_indices=%s | ee_joint_idx=%d",
             robot_model.num_joints,
             robot_model.num_controls,
             robot_model.controlled_joint_indices,
             self.bigym_action_arm_indices.tolist(),
+            self.bigym_action_safety_indices.tolist(),
             robot_model.ee_joint_idx,
         )
 
@@ -276,6 +340,27 @@ class OSCBFFilter:
         q_urdf, qd_urdf, q_arm_bigym, q_arm_urdf = (
             self._build_urdf_surrogate_state_from_bigym(q_bigym, qd_bigym)
         )
+
+        if self.enable_pelvis_cbf and self.pelvis_oscbf_config is not None:
+            try:
+                return self._filter_safety_action_with_pelvis_cbf(
+                    action=action,
+                    q_bigym=q_bigym,
+                    qd_bigym=qd_bigym,
+                    q_urdf=q_urdf,
+                    qd_urdf=qd_urdf,
+                    q_arm_bigym=q_arm_bigym,
+                    q_arm_urdf=q_arm_urdf,
+                    env=env,
+                    observations=observations,
+                ).astype(np.float32)
+            except Exception as exc:
+                if not self._warned_pelvis_cbf_fallback:
+                    logger.warning(
+                        "[OSCBFFilter] pelvis+arm CBF failed; falling back to arm-only CBF: %s",
+                        exc,
+                    )
+                    self._warned_pelvis_cbf_fallback = True
 
         a_arm_bigym_safe = self._filter_motion_action(
             q_bigym=q_bigym,
@@ -350,6 +435,99 @@ class OSCBFFilter:
                 f"Expected 8 state arm indices, got {len(self.bigym_state_arm_indices)}"
             )
         
+
+    def _filter_safety_action_with_pelvis_cbf(
+        self,
+        action: np.ndarray,
+        q_bigym: np.ndarray,
+        qd_bigym: np.ndarray,
+        q_urdf: np.ndarray,
+        qd_urdf: np.ndarray,
+        q_arm_bigym: np.ndarray,
+        q_arm_urdf: np.ndarray,
+        env=None,
+        observations=None,
+    ) -> np.ndarray:
+        human_obstacles = self._extract_human_obstacles(env, observations)
+        capsule_a_world = human_obstacles["capsule_a"]
+        capsule_b_world = human_obstacles["capsule_b"]
+        capsule_radii = human_obstacles["capsule_radii"]
+        self._validate_capsules(capsule_a_world, capsule_b_world, capsule_radii)
+
+        if capsule_a_world.shape[0] != 2:
+            raise ValueError(
+                f"Current pelvis OSCBF config was initialised for 2 human capsules, "
+                f"but extracted {capsule_a_world.shape[0]}."
+            )
+
+        self.pelvis_oscbf_config.set_human_capsules(
+            capsule_a_world,
+            capsule_b_world,
+            capsule_radii,
+        )
+
+        q_base_bigym = q_bigym[self.bigym_state_base_indices]
+        a_base_bigym_nom = action[self.bigym_action_base_indices]
+        a_arm_bigym_nom = action[self.bigym_action_arm_indices]
+
+        u_base_nom = self._bigym_base_action_to_velocity(
+            q_base_bigym=q_base_bigym,
+            a_base_bigym_nom=a_base_bigym_nom,
+        )
+        u_arm_urdf_nom = self._bigym_action_to_urdf_velocity(
+            q_arm_bigym=q_arm_bigym,
+            q_arm_urdf=q_arm_urdf,
+            a_arm_bigym_nom=a_arm_bigym_nom,
+        )
+        z_aug = np.concatenate([q_base_bigym, q_urdf], axis=0).astype(np.float32)
+        u_aug_nom = np.concatenate([u_base_nom, u_arm_urdf_nom], axis=0).astype(np.float32)
+
+        cbf = self._ensure_pelvis_cbf()
+        u_aug_safe = np.asarray(
+            cbf.safety_filter(
+                jnp.asarray(z_aug, dtype=jnp.float32),
+                jnp.asarray(u_aug_nom, dtype=jnp.float32),
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+
+        expected_dim = len(self.bigym_action_base_indices) + len(self.bigym_action_arm_indices)
+        if u_aug_safe.shape[0] != expected_dim:
+            raise ValueError(
+                f"Expected pelvis OSCBF output dim {expected_dim}, got {u_aug_safe.shape[0]}"
+            )
+
+        u_base_safe = u_aug_safe[: len(self.bigym_action_base_indices)]
+        u_arm_safe = u_aug_safe[len(self.bigym_action_base_indices) :]
+        a_base_bigym_safe = self._bigym_base_velocity_to_action(
+            q_base_bigym=q_base_bigym,
+            u_base_safe=u_base_safe,
+        )
+        a_arm_bigym_safe = self._urdf_velocity_to_bigym_action(
+            q_arm_bigym=q_arm_bigym,
+            q_arm_urdf=q_arm_urdf,
+            u_arm_urdf_safe=u_arm_safe,
+        )
+
+        safe_action = action.copy()
+        safe_action[self.bigym_action_base_indices] = a_base_bigym_safe
+        safe_action[self.bigym_action_arm_indices] = a_arm_bigym_safe
+
+        if self.max_action_delta is not None:
+            delta = safe_action[self.bigym_action_safety_indices] - action[self.bigym_action_safety_indices]
+            delta = np.clip(delta, -self.max_action_delta, self.max_action_delta)
+            safe_action[self.bigym_action_safety_indices] = action[self.bigym_action_safety_indices] + delta
+
+        if self.debug and not hasattr(self, "_printed_pelvis_cbf_debug"):
+            logger.debug("\n[OSCBFFilter][PELVIS+ARM OSCBF]")
+            logger.debug("  z_aug dim: %d", z_aug.shape[0])
+            logger.debug("  u_aug_nom dim: %d", u_aug_nom.shape[0])
+            logger.debug("  ||u_aug_safe-u_aug_nom||: %s", float(np.linalg.norm(u_aug_safe - u_aug_nom)))
+            logger.debug("  base action delta: %s", safe_action[self.bigym_action_base_indices] - action[self.bigym_action_base_indices])
+            logger.debug("  arm action delta norm: %s", float(np.linalg.norm(a_arm_bigym_safe - a_arm_bigym_nom)))
+            self._printed_pelvis_cbf_debug = True
+
+        return safe_action.astype(np.float32)
 
     def _filter_motion_action(
         self,
@@ -442,8 +620,9 @@ class OSCBFFilter:
         # OSCBF sees:
         #   state   = fixed-torso full URDF surrogate q
         #   control = 8D URDF arm velocity
+        cbf = self._ensure_cbf()
         u_arm_urdf_safe = np.asarray(
-            self.cbf.safety_filter(
+            cbf.safety_filter(
                 jnp.asarray(q_urdf, dtype=jnp.float32),
                 jnp.asarray(u_arm_urdf_nom, dtype=jnp.float32),
             ),
@@ -690,6 +869,32 @@ class OSCBFFilter:
         qd_urdf[self.urdf_arm_joint_indices] = qd_arm_urdf
 
         return q_urdf, qd_urdf, q_arm_bigym, q_arm_urdf
+
+    def _bigym_base_action_to_velocity(
+        self,
+        q_base_bigym: np.ndarray,
+        a_base_bigym_nom: np.ndarray,
+    ) -> np.ndarray:
+        if self.control_type == "absolute":
+            return (a_base_bigym_nom - q_base_bigym) / self.dt
+        if self.control_type == "delta":
+            return a_base_bigym_nom / self.dt
+        if self.control_type == "velocity":
+            return a_base_bigym_nom
+        raise RuntimeError(f"Unexpected control_type: {self.control_type}")
+
+    def _bigym_base_velocity_to_action(
+        self,
+        q_base_bigym: np.ndarray,
+        u_base_safe: np.ndarray,
+    ) -> np.ndarray:
+        if self.control_type == "velocity":
+            return u_base_safe
+        if self.control_type == "delta":
+            return u_base_safe * self.dt
+        if self.control_type == "absolute":
+            return q_base_bigym + u_base_safe * self.dt
+        raise RuntimeError(f"Unexpected control_type: {self.control_type}")
 
     def _bigym_action_to_urdf_velocity(
         self,
