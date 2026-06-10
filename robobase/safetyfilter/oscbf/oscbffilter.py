@@ -8,6 +8,7 @@ import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import jax
 import jax.numpy as jnp
 from cbfpy import CBF
 from oscbf.core.treemanipulator import TreeManipulator
@@ -100,6 +101,11 @@ class OSCBFFilter:
         self._warned_pelvis_cbf_fallback = False
 
         self._printed_frame_debug = False
+        self._human_capsule_kinematic_cache = None
+        self._human_capsule_fast_cache_hits = 0
+        self._human_capsule_fast_cache_misses = 0
+        self._human_capsule_fast_cache_failures = 0
+        self._live_h_fn = None
 
 
         # Indices in the 16D BiGym / RoboBase action. The CBF model itself
@@ -210,6 +216,35 @@ class OSCBFFilter:
             f"\n  runtime_joint_names: {self.runtime_joint_names}" 
             f"\n  robot_model: {type(self.robot_model).__name__}"
         )
+
+    def _ensure_live_h_fn(self):
+        if self.oscbf_config is None:
+            return None
+        if self._live_h_fn is None:
+            self._live_h_fn = jax.jit(
+                lambda q, capsule_a, capsule_b, capsule_radii: self.oscbf_config.h_1(
+                    q,
+                    capsule_a=capsule_a,
+                    capsule_b=capsule_b,
+                    capsule_radii=capsule_radii,
+                )
+            )
+        return self._live_h_fn
+
+    def compute_live_h_values(self, q_urdf, capsule_a_urdf, capsule_b_urdf, capsule_radii):
+        self._validate_capsules(capsule_a_urdf, capsule_b_urdf, capsule_radii)
+        h_fn = self._ensure_live_h_fn()
+        if h_fn is None:
+            return None
+        return np.asarray(
+            h_fn(
+                jnp.asarray(q_urdf, dtype=jnp.float32),
+                jnp.asarray(capsule_a_urdf, dtype=jnp.float32),
+                jnp.asarray(capsule_b_urdf, dtype=jnp.float32),
+                jnp.asarray(capsule_radii, dtype=jnp.float32),
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
 
     def _ensure_cbf(self):
         if self.cbf is None:
@@ -723,15 +758,119 @@ class OSCBFFilter:
         if "human_arm_qpos" not in obs or "human_arm_qvel" not in obs:
             obs = task._get_task_privileged_obs()
 
-        capsule_a, capsule_b, capsule_radii = self._extract_human_arm_capsules(task)
+        capsule_a, capsule_b, capsule_radii, capsule_source = (
+            self._extract_human_arm_capsules_from_qpos(task, obs)
+        )
 
         return {
             "human_arm_qpos": np.asarray(obs["human_arm_qpos"], dtype=np.float32).reshape(-1),
             "human_arm_qvel": np.asarray(obs["human_arm_qvel"], dtype=np.float32).reshape(-1),
+            "human_arm_carrier_qpos": np.asarray(
+                obs.get("human_arm_carrier_qpos", []),
+                dtype=np.float32,
+            ).reshape(-1),
+            "human_arm_carrier_qvel": np.asarray(
+                obs.get("human_arm_carrier_qvel", []),
+                dtype=np.float32,
+            ).reshape(-1),
             "capsule_a": capsule_a,
             "capsule_b": capsule_b,
             "capsule_radii": capsule_radii,
+            "capsule_source": capsule_source,
+            "capsule_fast_cache_hits": int(self._human_capsule_fast_cache_hits),
+            "capsule_fast_cache_misses": int(self._human_capsule_fast_cache_misses),
+            "capsule_fast_cache_failures": int(self._human_capsule_fast_cache_failures),
         }
+
+    def _extract_human_arm_capsules_from_qpos(self, task, obs):
+        try:
+            cache = self._get_or_build_human_capsule_kinematic_cache(task)
+            qpos = np.asarray(obs["human_arm_qpos"], dtype=np.float32).reshape(-1)
+            carrier_qpos = np.asarray(
+                obs.get("human_arm_carrier_qpos", []),
+                dtype=np.float32,
+            ).reshape(-1)
+
+            human_count = len(cache["carrier_base_pos"])
+            if qpos.size != human_count * 4:
+                raise RuntimeError(
+                    f"Expected {human_count * 4} human arm qpos values, got {qpos.size}"
+                )
+            if carrier_qpos.size != human_count * 2:
+                carrier_qpos = self._read_human_carrier_qpos_from_task(task)
+            if carrier_qpos.size != human_count * 2:
+                raise RuntimeError(
+                    f"Expected {human_count * 2} human carrier qpos values, got {carrier_qpos.size}"
+                )
+
+            qpos = qpos.reshape(human_count, 4)
+            carrier_qpos = carrier_qpos.reshape(human_count, 2)
+            capsule_a = []
+            capsule_b = []
+            z_upper = np.asarray([0.0, 0.0, -0.34], dtype=np.float32)
+            z_fore = np.asarray([0.0, 0.0, -0.30], dtype=np.float32)
+
+            for human_idx in range(human_count):
+                shoulder = cache["carrier_base_pos"][human_idx].copy()
+                shoulder[0:2] += carrier_qpos[human_idx]
+
+                q_base, q_yaw, q_pitch, q_elbow = qpos[human_idx]
+                r_shoulder = (
+                    self._rot_z(q_base)
+                    @ self._rot_z(q_yaw)
+                    @ self._rot_y(q_pitch)
+                )
+                elbow = shoulder + r_shoulder @ z_upper
+                r_forearm = r_shoulder @ self._rot_y(q_elbow)
+                wrist = elbow + r_forearm @ z_fore
+
+                capsule_a.append(elbow)
+                capsule_b.append(shoulder)
+                capsule_a.append(wrist)
+                capsule_b.append(elbow)
+
+            self._human_capsule_fast_cache_hits += 1
+            return (
+                np.asarray(capsule_a, dtype=np.float32),
+                np.asarray(capsule_b, dtype=np.float32),
+                cache["radii"].copy(),
+                "cached_qpos_fk",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._human_capsule_fast_cache_failures += 1
+            logger.debug(
+                "Qpos human capsule extraction failed; using MuJoCo body/geom fallback: %s",
+                exc,
+            )
+            return self._extract_human_arm_capsules_fast(task)
+
+    def _read_human_carrier_qpos_from_task(self, task):
+        try:
+            return np.concatenate(
+                [
+                    np.asarray(task._mojo.data.qpos[human._carrier_qpos_adr], dtype=np.float32)
+                    for human in task.humanarms
+                ],
+                dtype=np.float32,
+            )
+        except Exception:  # noqa: BLE001
+            return np.asarray([], dtype=np.float32)
+
+    @staticmethod
+    def _rot_z(theta: float):
+        c, s = np.cos(float(theta)), np.sin(float(theta))
+        return np.asarray(
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+
+    @staticmethod
+    def _rot_y(theta: float):
+        c, s = np.cos(float(theta)), np.sin(float(theta))
+        return np.asarray(
+            [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+            dtype=np.float32,
+        )
 
     def _extract_human_arm_capsules(self, task):
         if not hasattr(task, "humanarms"):
@@ -779,6 +918,122 @@ class OSCBFFilter:
             np.asarray(capsule_b, dtype=np.float32),
             np.asarray(capsule_radii, dtype=np.float32),
         )
+
+    def _extract_human_arm_capsules_fast(self, task):
+        try:
+            cache = self._get_or_build_human_capsule_kinematic_cache(task)
+            model = task._mojo.model
+            data = task._mojo.data
+            if cache["model_id"] != id(model):
+                raise RuntimeError("MuJoCo model changed since human capsule cache was built")
+
+            capsule_a = []
+            capsule_b = []
+            for body_id, local_a, local_b in zip(
+                cache["body_ids"],
+                cache["local_a"],
+                cache["local_b"],
+            ):
+                body_pos = np.asarray(data.xpos[int(body_id)], dtype=np.float32)
+                body_rot = np.asarray(data.xmat[int(body_id)], dtype=np.float32).reshape(3, 3)
+                capsule_a.append(body_pos + body_rot @ local_a)
+                capsule_b.append(body_pos + body_rot @ local_b)
+
+            self._human_capsule_fast_cache_hits += 1
+            return (
+                np.asarray(capsule_a, dtype=np.float32),
+                np.asarray(capsule_b, dtype=np.float32),
+                cache["radii"].copy(),
+                "cached_body_fk",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._human_capsule_fast_cache_failures += 1
+            logger.debug(
+                "Fast human capsule extraction failed; using geom_xpos fallback: %s",
+                exc,
+            )
+            capsule_a, capsule_b, capsule_radii = self._extract_human_arm_capsules(task)
+            return capsule_a, capsule_b, capsule_radii, "geom_xpos_fallback"
+
+    def _get_or_build_human_capsule_kinematic_cache(self, task):
+        if not hasattr(task, "humanarms"):
+            raise AttributeError(
+                f"{type(task).__name__} has no 'humanarms'; "
+                "cannot extract human-arm capsules"
+            )
+
+        model = task._mojo.model
+        data = task._mojo.data
+        cache_key = (
+            id(model),
+            tuple(id(human) for human in task.humanarms),
+            float(self.human_margin),
+        )
+        cache = self._human_capsule_kinematic_cache
+        if cache is not None and cache.get("cache_key") == cache_key:
+            return cache
+
+        geom_specs = [
+            ("upperarm_geom", 0.035, 0.34 / 2.0),
+            ("forearm_geom", 0.032, 0.30 / 2.0),
+        ]
+        body_ids = []
+        local_a = []
+        local_b = []
+        radii = []
+        carrier_base_pos = []
+
+        for human in task.humanarms:
+            carrier_body_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                human._pref("arm_carrier"),
+            )
+            if carrier_body_id < 0:
+                raise RuntimeError(f"Human arm carrier body not found: {human._pref('arm_carrier')}")
+            carrier_qpos = np.asarray(data.qpos[human._carrier_qpos_adr], dtype=np.float32)
+            carrier_pos = np.asarray(data.xpos[carrier_body_id], dtype=np.float32).copy()
+            carrier_pos[0:2] -= carrier_qpos
+            carrier_base_pos.append(carrier_pos)
+            for geom_name, radius_xml, half_length in geom_specs:
+                geom_id = mujoco.mj_name2id(
+                    model,
+                    mujoco.mjtObj.mjOBJ_GEOM,
+                    human._pref(geom_name),
+                )
+                if geom_id < 0:
+                    raise RuntimeError(
+                        f"Human arm geom not found: {human._pref(geom_name)}"
+                    )
+
+                body_id = int(model.geom_bodyid[geom_id])
+                geom_center = np.asarray(data.geom_xpos[geom_id], dtype=np.float32)
+                geom_rot = np.asarray(data.geom_xmat[geom_id], dtype=np.float32).reshape(3, 3)
+                local_z_world = geom_rot[:, 2].astype(np.float32)
+                endpoint_a_world = geom_center - half_length * local_z_world
+                endpoint_b_world = geom_center + half_length * local_z_world
+
+                body_pos = np.asarray(data.xpos[body_id], dtype=np.float32)
+                body_rot = np.asarray(data.xmat[body_id], dtype=np.float32).reshape(3, 3)
+                body_rot_t = body_rot.T
+                body_ids.append(body_id)
+                local_a.append(body_rot_t @ (endpoint_a_world - body_pos))
+                local_b.append(body_rot_t @ (endpoint_b_world - body_pos))
+                radii.append(radius_xml + self.human_margin)
+
+        cache = {
+            "cache_key": cache_key,
+            "model_id": id(model),
+            "carrier_base_pos": np.asarray(carrier_base_pos, dtype=np.float32),
+            "body_ids": np.asarray(body_ids, dtype=np.int32),
+            "local_a": np.asarray(local_a, dtype=np.float32),
+            "local_b": np.asarray(local_b, dtype=np.float32),
+            "radii": np.asarray(radii, dtype=np.float32),
+        }
+        self._validate_capsules(cache["local_a"], cache["local_b"], cache["radii"])
+        self._human_capsule_kinematic_cache = cache
+        self._human_capsule_fast_cache_misses += 1
+        return cache
 
     def _validate_capsules(self, capsule_a, capsule_b, capsule_radii):
         if capsule_a.ndim != 2 or capsule_a.shape[1] != 3:
@@ -875,9 +1130,8 @@ class OSCBFFilter:
         q_base_bigym: np.ndarray,
         a_base_bigym_nom: np.ndarray,
     ) -> np.ndarray:
-        if self.control_type == "absolute":
-            return (a_base_bigym_nom - q_base_bigym) / self.dt
-        if self.control_type == "delta":
+        del q_base_bigym
+        if self.control_type in {"absolute", "delta"}:
             return a_base_bigym_nom / self.dt
         if self.control_type == "velocity":
             return a_base_bigym_nom
@@ -888,12 +1142,11 @@ class OSCBFFilter:
         q_base_bigym: np.ndarray,
         u_base_safe: np.ndarray,
     ) -> np.ndarray:
+        del q_base_bigym
         if self.control_type == "velocity":
             return u_base_safe
-        if self.control_type == "delta":
+        if self.control_type in {"absolute", "delta"}:
             return u_base_safe * self.dt
-        if self.control_type == "absolute":
-            return q_base_bigym + u_base_safe * self.dt
         raise RuntimeError(f"Unexpected control_type: {self.control_type}")
 
     def _bigym_action_to_urdf_velocity(

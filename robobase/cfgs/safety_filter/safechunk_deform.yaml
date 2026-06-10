@@ -42,6 +42,9 @@ safety_filter:
     cache_nominal_ee: false
     ee_rejoin_in_inner_loop: false
     q_rejoin_threshold: 0.5
+    qd_rejoin_threshold: 5.0
+    require_qd_rejoin: false
+    qd_rejoin_hard_threshold: 20.0
     ee_rejoin_threshold: 0.08
     explicit_return: true
     acceptance_clearance_tol: 0.005
@@ -75,6 +78,37 @@ safety_filter:
     committed_state_error_threshold: 0.25
     committed_state_error_action: "replan"
     committed_state_mismatch_abort_requires_unsafe: false
+    replan_committed_suffix_on_state_mismatch: true
+    committed_suffix_replan_min_remaining: 1
+    opportunistic_act_resume: true
+    opportunistic_resume_q_threshold: null
+    opportunistic_resume_min_clearance: 0.08
+    max_recover_steps_before_act_resume: 8
+    max_suffix_replans_per_recovery: 3
+  safechunk_recover:
+    enabled: true
+    rejoin_nominal_weight: 5.0
+    task_progress_weight: 10.0
+    direction_alignment_weight: 5.0
+    min_direction_cosine: 0.05
+    ordered_pose_weight: 2.0
+    ordered_delta_weight: 1.0
+    ordered_pose_threshold: 0.02
+    ordered_delta_threshold: 0.005
+    require_ordered_path: true
+    retry_cooldown_steps: 4
+    max_attempts_per_unsafe_streak: 3
+    require_direction_alignment: true
+    direction_alignment_margin: 0.0
+    safety_weight: 100.0
+    action_deviation_weight: 0.2
+    smoothness_weight: 0.1
+    require_nominal_prefix_safe_for_rejoin: true
+    nominal_rejoin_prefix_min_clearance: 0.04
+    use_latest_nominal_for_rejoin: true
+    suppress_stale_nominal_rejoin: true
+    rejoin_weight_schedule: ramp
+    rejoin_ramp_steps: 5
   safechunk_recovery_corridor:
     enabled: true
     require_recover_path_safe: true
@@ -82,7 +116,7 @@ safety_filter:
     recover_immediate_hard_clearance: 0.02
     recover_prefix_min_clearance: 0.04
     enable_direct_rejoin: true
-    enable_detour_rejoin: true
+    enable_detour_rejoin: false
     enable_delayed_rejoin: true
     suppress_repeated_unsafe_recovery: true
     unsafe_recovery_cooldown_steps: 8

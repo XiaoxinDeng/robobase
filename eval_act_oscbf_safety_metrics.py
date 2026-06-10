@@ -78,6 +78,65 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
+
+
+@jax.jit
+def _jax_prepare_horizon_clearance_inputs(
+    q_bigym_flat,
+    capsule_a_world_flat,
+    capsule_b_world_flat,
+    bigym_state_arm_indices,
+    urdf_arm_joint_indices,
+    arm_sign,
+    arm_offset,
+    urdf_neutral_q,
+    t_pelvis_urdf,
+):
+    q_arm_bigym = q_bigym_flat[:, bigym_state_arm_indices]
+    q_arm_urdf = arm_sign[None, :] * q_arm_bigym + arm_offset[None, :]
+    q_urdf = jnp.broadcast_to(
+        urdf_neutral_q[None, :],
+        (q_bigym_flat.shape[0], urdf_neutral_q.shape[0]),
+    )
+    q_urdf = q_urdf.at[:, urdf_arm_joint_indices].set(q_arm_urdf)
+
+    xyz = q_bigym_flat[:, :3]
+    yaw = q_bigym_flat[:, 3]
+    cy = jnp.cos(yaw)
+    sy = jnp.sin(yaw)
+    zeros = jnp.zeros_like(cy)
+    ones = jnp.ones_like(cy)
+    r_world_pelvis = jnp.stack(
+        (
+            jnp.stack((cy, -sy, zeros), axis=-1),
+            jnp.stack((sy, cy, zeros), axis=-1),
+            jnp.stack((zeros, zeros, ones), axis=-1),
+        ),
+        axis=-2,
+    )
+    r_pelvis_urdf = t_pelvis_urdf[:3, :3]
+    t_pelvis_urdf_vec = t_pelvis_urdf[:3, 3]
+    r_world_urdf = jnp.einsum("nij,jk->nik", r_world_pelvis, r_pelvis_urdf)
+    t_world_urdf = xyz + jnp.einsum("nij,j->ni", r_world_pelvis, t_pelvis_urdf_vec)
+    bottom = jnp.broadcast_to(
+        jnp.asarray((0.0, 0.0, 0.0, 1.0), dtype=q_bigym_flat.dtype),
+        (q_bigym_flat.shape[0], 1, 4),
+    )
+    t_world_urdf_h = jnp.concatenate(
+        (jnp.concatenate((r_world_urdf, t_world_urdf[:, :, None]), axis=2), bottom),
+        axis=1,
+    )
+    t_urdf_world_h = jnp.linalg.inv(t_world_urdf_h)
+
+    ones_a = jnp.ones(capsule_a_world_flat.shape[:-1] + (1,), dtype=q_bigym_flat.dtype)
+    ones_b = jnp.ones(capsule_b_world_flat.shape[:-1] + (1,), dtype=q_bigym_flat.dtype)
+    capsule_a_world_h = jnp.concatenate((capsule_a_world_flat, ones_a), axis=-1)
+    capsule_b_world_h = jnp.concatenate((capsule_b_world_flat, ones_b), axis=-1)
+    capsule_a_urdf = jnp.einsum("nij,ncj->nci", t_urdf_world_h, capsule_a_world_h)[:, :, :3]
+    capsule_b_urdf = jnp.einsum("nij,ncj->nci", t_urdf_world_h, capsule_b_world_h)[:, :, :3]
+    return q_urdf, capsule_a_urdf, capsule_b_urdf
+
+
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -95,6 +154,7 @@ except ImportError:  # tqdm may not be installed in every environment
 
 from robobase.eval_utils import (
     WallClockVideoRecorder,
+    _render_single_env_if_vector,
     infer_env_action_shape,
     extract_first_action,
     replace_first_action,
@@ -118,6 +178,7 @@ from robobase.envs.bigym import BiGymEnvFactory
 from robobase.safetyfilter.h1_state_bridge import extract_h1_state, get_bigym_task
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
 from robobase.safetyfilter.safechunk_deform_filter import SafeChunkDeformFilter
+from robobase.safetyfilter.path_consistent_brake_filter import PathConsistentBrakeFilter
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -136,6 +197,129 @@ logging.getLogger().addFilter(_IgnoreBigymVersionMismatchFilter())
 REPO = Path("/home/xd1125/Workspace/safe_bigym_hoi")
 ROBOBASE_CFG = REPO / "external/robobase/robobase/cfgs"
 H1_URDF = REPO / "external/oscbf/oscbf/assets/h1/h1.urdf"
+
+
+PATH_CONSISTENT_BRAKE_FILTER_CONFIG = (
+    ROBOBASE_CFG / "safety_filter" / "path_consistent_brake.yaml"
+)
+PATH_CONSISTENT_BRAKE_CONFIG_KEYS = (
+    "waypoint_substeps",
+    "max_waypoint_delta",
+    "slowdown_enabled",
+    "slowdown_lookahead",
+    "slowdown_min_scale",
+    "certified_backup_enabled",
+    "trajectory_generation_enabled",
+    "trajectory_max_velocity",
+    "trajectory_max_acceleration",
+    "trajectory_max_jerk",
+    "trajectory_initial_speed",
+    "trajectory_backend",
+    "trajectory_min_position",
+    "trajectory_max_position",
+    "shield_substeps",
+    "inner_shield_verification_enabled",
+    "skip_inner_shield_when_rejected",
+    "reuse_operator_human_rollout_cache",
+    "reachability_certification_enabled",
+    "reachability_fail_closed",
+    "reachability_robot_radius",
+    "reachability_obstacle_radius",
+    "reachability_robot_points_source",
+    "reachability_inflation_enabled",
+    "reachability_tracking_error",
+    "reachability_measurement_error",
+    "reachability_object_speed",
+    "reachability_object_acceleration",
+    "reachability_sensor_delay",
+    "safety_constraint_type",
+    "pfl_energy_threshold",
+    "pfl_contact_margin",
+    "pfl_joint_inertia",
+    "pfl_energy_thresholds",
+    "pfl_active_threshold_key",
+)
+PATH_CONSISTENT_BRAKE_LIMIT_KEYS = (
+    "trajectory_max_velocity",
+    "trajectory_max_acceleration",
+    "trajectory_max_jerk",
+)
+
+
+def _resolve_path_consistent_brake_config_path(config_path: Optional[str]) -> Optional[Path]:
+    if config_path is None:
+        return None
+    raw_path = Path(config_path).expanduser()
+    if raw_path.is_absolute():
+        return raw_path
+    candidates = (
+        Path.cwd() / raw_path,
+        ROBOBASE_CFG / "safety_filter" / raw_path,
+        ROBOBASE_CFG / raw_path,
+        REPO / raw_path,
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _load_path_consistent_brake_filter_config(config_path: Optional[str] = None) -> dict[str, Any]:
+    cfg = OmegaConf.create({})
+    if PATH_CONSISTENT_BRAKE_FILTER_CONFIG.exists():
+        cfg = OmegaConf.merge(cfg, OmegaConf.load(PATH_CONSISTENT_BRAKE_FILTER_CONFIG))
+    else:
+        logger.warning("PathConsistentBrake base config missing: %s", PATH_CONSISTENT_BRAKE_FILTER_CONFIG)
+
+    overlay_path = _resolve_path_consistent_brake_config_path(config_path)
+    if overlay_path is not None:
+        if not overlay_path.exists():
+            raise FileNotFoundError(f"PathConsistentBrake config not found: {overlay_path}")
+        if not (
+            PATH_CONSISTENT_BRAKE_FILTER_CONFIG.exists()
+            and overlay_path.resolve() == PATH_CONSISTENT_BRAKE_FILTER_CONFIG.resolve()
+        ):
+            cfg = OmegaConf.merge(cfg, OmegaConf.load(overlay_path))
+
+    safety_cfg = cfg.get("safety_filter", cfg)
+    container = OmegaConf.to_container(safety_cfg, resolve=True)
+    return dict(container or {})
+
+
+def _positive_path_consistent_brake_limit_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.number)) and float(value) <= 0.0:
+        return None
+    return value
+
+
+def _path_consistent_brake_kwargs_from_config(
+    args,
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    if config is None:
+        config = _load_path_consistent_brake_filter_config(
+            getattr(args, "path_consistent_brake_config", None)
+        )
+    kwargs = {
+        key: config[key]
+        for key in PATH_CONSISTENT_BRAKE_CONFIG_KEYS
+        if key in config
+    }
+    for key in PATH_CONSISTENT_BRAKE_LIMIT_KEYS:
+        if key in kwargs:
+            kwargs[key] = _positive_path_consistent_brake_limit_or_none(kwargs[key])
+    return kwargs
+
+
+def _path_consistent_brake_eval_config(args) -> dict[str, Any]:
+    if getattr(args, "condition", None) != "path_consistent_brake":
+        return {}
+    return _load_path_consistent_brake_filter_config(
+        getattr(args, "path_consistent_brake_config", None)
+    )
+
 
 
 @dataclass
@@ -167,12 +351,28 @@ class StepMetrics:
     min_h: Optional[float]
     h_values: Optional[list[float]]
     h_violation: Optional[bool]
+    live_h_monitor_skipped: Optional[bool]
     chunk_min_clearance: Optional[float]
     chunk_first_violation: Optional[int]
     chunk_unsafe_count: Optional[int]
     horizon_risk_gap: Optional[float]
     horizon_risk_gap_active: Optional[bool]
     horizon_clearance_drop: Optional[float]
+    pacs_background_check_only: Optional[bool]
+    pacs_background_safety_mode: Optional[str]
+    pacs_background_deformation_source: Optional[str]
+    pacs_background_retiming_source: Optional[str]
+    pacs_background_brake_step: Optional[bool]
+    pacs_background_act_step: Optional[bool]
+    pacs_background_min_clearance: Optional[float]
+    pacs_background_first_violation: Optional[int]
+    pacs_background_unsafe_count: Optional[int]
+    pacs_background_arm_delta: Optional[float]
+    pacs_background_chunk_arm_delta: Optional[float]
+    pacs_background_chunk_modified_fraction: Optional[float]
+    pacs_background_retiming_arm_delta: Optional[float]
+    pacs_background_retiming_chunk_arm_delta: Optional[float]
+    pacs_background_retiming_changed_fraction: Optional[float]
 
     contact_count: Optional[int]
     contact_pairs: Optional[list[str]]
@@ -226,6 +426,8 @@ class StepMetrics:
     pause_reason: Optional[str]
     deformation_source: Optional[str]
     deformation_norm: Optional[float]
+    retiming_source: Optional[str]
+    retiming_norm: Optional[float]
     deform_safe: Optional[bool]
     deform_min_clearance: Optional[float]
     chunk_deform_scale: Optional[float]
@@ -376,6 +578,36 @@ class StepMetrics:
     committed_aborted_due_to_state_mismatch: Optional[bool]
     committed_replan_due_to_state_mismatch: Optional[bool]
     committed_rejected_missing_planned_q: Optional[bool]
+    committed_state_mismatch_detected: Optional[bool]
+    committed_state_mismatch_recovered: Optional[bool]
+    committed_suffix_replan_attempted: Optional[bool]
+    committed_suffix_replan_accepted: Optional[bool]
+    committed_suffix_replan_rejected: Optional[bool]
+    committed_suffix_replan_reject_reason: Optional[str]
+    committed_suffix_replan_from_index: Optional[int]
+    committed_suffix_replan_old_length: Optional[int]
+    committed_suffix_replan_new_length: Optional[int]
+    committed_suffix_replan_target_index: Optional[int]
+    committed_suffix_replan_seed_start_index: Optional[int]
+    committed_suffix_replan_min_clearance: Optional[float]
+    committed_suffix_replan_required_clearance: Optional[float]
+    committed_opportunistic_resume: Optional[bool]
+    committed_released_for_act_resume: Optional[bool]
+    committed_recovery_budget_exit: Optional[bool]
+    committed_replan_due_to_recovery_budget: Optional[bool]
+    committed_opportunistic_resume_available: Optional[bool]
+    committed_opportunistic_resume_reason: Optional[str]
+    committed_opportunistic_resume_q_dist: Optional[float]
+    committed_opportunistic_resume_q_threshold: Optional[float]
+    committed_opportunistic_resume_min_clearance: Optional[float]
+    committed_opportunistic_resume_required_clearance: Optional[float]
+    committed_opportunistic_resume_rejoin_index: Optional[int]
+    committed_recover_steps_since_act: Optional[int]
+    max_recover_steps_before_act_resume: Optional[int]
+    committed_suffix_replans_in_current_recovery: Optional[int]
+    max_suffix_replans_per_recovery: Optional[int]
+    planned_q_at_index_before_suffix_replan: Optional[list[float]]
+    actual_q_at_suffix_replan: Optional[list[float]]
     actual_q_at_replay: Optional[list[float]]
     diagnostic_step_mode: Optional[str]
     mode_transition: Optional[str]
@@ -390,6 +622,13 @@ class StepMetrics:
     brake_streak: Optional[int]
     recovery_failure_streak: Optional[int]
     recovery_failure_streak_max: Optional[int]
+    recovery_optimizer_cooldown_remaining: Optional[int]
+    recovery_retry_cooldown_steps: Optional[int]
+    recovery_attempts_in_unsafe_streak: Optional[int]
+    recovery_max_attempts_per_unsafe_streak: Optional[int]
+    recovery_optimization_skipped: Optional[bool]
+    recovery_optimization_skip_reason: Optional[str]
+    recovery_optimization_skipped_count: Optional[int]
     temporary_blocker_waiting: Optional[bool]
     deform_trigger_reason: Optional[str]
     nominal_became_safe_after_brake: Optional[bool]
@@ -454,6 +693,23 @@ class StepMetrics:
     safe_prefix_execution: Optional[bool]
     recover_projection_on_nominal: Optional[float]
     recover_cosine_to_nominal: Optional[float]
+    recover_direction_cosine: Optional[float]
+    recover_direction_cosine_threshold: Optional[float]
+    recover_direction_loss: Optional[float]
+    recover_direction_ok: Optional[bool]
+    recover_direction_alignment_available: Optional[bool]
+    recover_direction_alignment_weight: Optional[float]
+    recover_ordered_path_available: Optional[bool]
+    recover_ordered_target_index: Optional[int]
+    recover_ordered_horizon: Optional[int]
+    recover_ordered_pose_loss: Optional[float]
+    recover_ordered_delta_loss: Optional[float]
+    recover_ordered_loss: Optional[float]
+    recover_ordered_pose_weight: Optional[float]
+    recover_ordered_delta_weight: Optional[float]
+    recover_ordered_pose_threshold: Optional[float]
+    recover_ordered_delta_threshold: Optional[float]
+    recover_ordered_ok: Optional[bool]
     nominal_rejoin_score: Optional[float]
     nominal_rejoin_available: Optional[bool]
     nominal_rejoin_suppressed_reason: Optional[str]
@@ -463,6 +719,14 @@ class StepMetrics:
     recover_score_total: Optional[float]
     recover_rejoin_weight_effective: Optional[float]
     recover_step_since_deform: Optional[int]
+    cem_iterations_run: Optional[int]
+    cem_early_stopped: Optional[bool]
+    cem_max_iters: Optional[int]
+    cem_population: Optional[int]
+    yield_cem_iterations_run: Optional[int]
+    yield_cem_early_stopped: Optional[bool]
+    return_cem_iterations_run: Optional[int]
+    return_cem_early_stopped: Optional[bool]
     nominal_rejoin_available_count: Optional[int]
     nominal_rejoin_suppressed_count: Optional[int]
     stale_nominal_rejoin_suppressed_count: Optional[int]
@@ -471,7 +735,12 @@ class StepMetrics:
     recover_nonpositive_projection_count: Optional[int]
     mean_recover_projection_on_nominal: Optional[float]
     mean_recover_cosine_to_nominal: Optional[float]
+    mean_recover_direction_cosine: Optional[float]
+    mean_recover_direction_loss: Optional[float]
     mean_recover_task_progress_score: Optional[float]
+    mean_recover_ordered_pose_loss: Optional[float]
+    mean_recover_ordered_delta_loss: Optional[float]
+    mean_recover_ordered_loss: Optional[float]
     contact_during_hold: Optional[bool]
     contact_during_brake: Optional[bool]
     contact_during_deform: Optional[bool]
@@ -522,6 +791,10 @@ class StepMetrics:
 
     filter_time_ms: float
     monitor_time_ms: float
+    env_step_time_ms: float
+    policy_obs_adapt_time_ms: float
+    policy_action_time_ms: float
+    policy_obs_update_time_ms: float
 
 
 def parse_args():
@@ -529,11 +802,21 @@ def parse_args():
 
     parser.add_argument(
         "--condition",
-        choices=["act", "oscbf", "sequential", "sequential_oscbf", "chunk_deform"],
+        choices=["act", "oscbf", "sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"],
         required=True,
         help=("act = monitor only; oscbf = single-action OSCBF; "
               "sequential/sequential_oscbf = apply OSCBF across the ACT chunk; "
-              "chunk_deform = SafeChunk horizon deformation."),
+              "chunk_deform = SafeChunk horizon deformation; "
+              "path_consistent_brake = standalone path-consistent braking filter."),
+    )
+    parser.add_argument(
+        "--path-consistent-brake-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional YAML overlay for PathConsistentBrake parameters. Relative "
+            "names are resolved under robobase/cfgs/safety_filter."
+        ),
     )
 
     parser.add_argument(
@@ -969,6 +1252,23 @@ def parse_args():
         action="store_true",
         help="Disable video recording.",
     )
+    parser.add_argument(
+        "--save-frame-images",
+        action="store_true",
+        help="Save individual rendered PNG frames during eval.",
+    )
+    parser.add_argument(
+        "--frame-image-every",
+        type=int,
+        default=10,
+        help="Save one rendered frame every N env steps when --save-frame-images is set.",
+    )
+    parser.add_argument(
+        "--frame-image-dir",
+        type=str,
+        default=None,
+        help="Directory for rendered PNG frames. Defaults to <output-dir>/frames.",
+    )
     parser.add_argument("--video-dir", type=str, default=None)
     parser.add_argument(
         "--record-policy-video",
@@ -1023,9 +1323,8 @@ def parse_args():
         action="store_true",
         default=True,
         help=(
-            "Log 3D SafeChunk trajectory traces for intervention steps. Writes "
-            "chunk_trajectory_traces.jsonl and human_arm_trajectory.jsonl under "
-            "--output-dir."
+            "Log SafeChunk trajectory traces for intervention steps. Writes "
+            "JSONL traces plus interactive 3D HTML viewers under --output-dir."
         ),
     )
     parser.add_argument(
@@ -1058,13 +1357,13 @@ def parse_args():
         dest="plot_chunk_trajectories_3d",
         action="store_true",
         default=True,
-        help="Save per-episode 3D trajectory plots for chunk interventions.",
+        help="Save per-episode interactive 3D HTML trajectory viewers.",
     )
     parser.add_argument(
         "--no-plot-chunk-trajectories-3d",
         dest="plot_chunk_trajectories_3d",
         action="store_false",
-        help="Disable per-episode 3D trajectory plot images.",
+        help="Disable per-episode interactive 3D trajectory viewers.",
     )
     parser.add_argument(
         "--chunk-trajectory-plot-max-events",
@@ -1152,6 +1451,26 @@ def parse_args():
         type=float,
         default=0.0,
         help="Pause fallback threshold on OSCBF clearance h. Use 0 for collision/violation only.",
+    )
+    parser.add_argument(
+        "--live-h-monitor",
+        dest="live_h_monitor",
+        action="store_true",
+        default=True,
+        help=(
+            "Run the standalone per-step OSCBF h monitor before filtering. "
+            "This preserves legacy h_violation metrics but can be expensive."
+        ),
+    )
+    parser.add_argument(
+        "--no-live-h-monitor",
+        dest="live_h_monitor",
+        action="store_false",
+        help=(
+            "Skip the standalone per-step OSCBF h monitor. Chunk/OSCBF filtering "
+            "still performs its own safety checks. For chunk/PACS filters, "
+            "min_h/h_violation are filled from horizon clearance instead."
+        ),
     )
     parser.add_argument(
         "--no-pause-policy-step-on-brake",
@@ -1581,6 +1900,19 @@ def parse_args():
         default="replan",
     )
     parser.add_argument(
+        "--chunk-committed-state-mismatch-abort-requires-unsafe",
+        dest="chunk_committed_state_mismatch_abort_requires_unsafe",
+        action="store_true",
+        default=False,
+        help="Legacy ablation: keep replaying a state-mismatched committed chunk until it is also unsafe.",
+    )
+    parser.add_argument(
+        "--no-chunk-committed-state-mismatch-abort-requires-unsafe",
+        dest="chunk_committed_state_mismatch_abort_requires_unsafe",
+        action="store_false",
+        help="Replan immediately when committed replay state error exceeds the threshold.",
+    )
+    parser.add_argument(
         "--chunk-temporary-blocker-enabled",
         dest="chunk_temporary_blocker_enabled",
         action="store_true",
@@ -1696,6 +2028,8 @@ def parse_args():
     parser.add_argument("--no-chunk-recover-suppress-stale-nominal", dest="chunk_recover_suppress_stale_nominal", action="store_false")
     parser.add_argument("--chunk-recover-rejoin-weight-schedule", choices=("ramp", "constant", "none"), default="ramp")
     parser.add_argument("--chunk-recover-rejoin-ramp-steps", type=int, default=5)
+    parser.add_argument("--chunk-recover-retry-cooldown-steps", type=int, default=4)
+    parser.add_argument("--chunk-recover-max-attempts-per-unsafe-streak", type=int, default=3)
     parser.add_argument("--chunk-active-safety-enabled", dest="chunk_active_safety_enabled", action="store_true", default=True)
     parser.add_argument("--no-chunk-active-safety-enabled", dest="chunk_active_safety_enabled", action="store_false")
     parser.add_argument("--chunk-active-check-hold-horizon-safety", dest="chunk_active_check_hold_horizon_safety", action="store_true", default=True)
@@ -1729,7 +2063,7 @@ def parse_args():
     parser.add_argument("--chunk-recover-prefix-min-clearance", type=float, default=0.04)
     parser.add_argument("--chunk-enable-direct-rejoin", dest="chunk_enable_direct_rejoin", action="store_true", default=True)
     parser.add_argument("--no-chunk-enable-direct-rejoin", dest="chunk_enable_direct_rejoin", action="store_false")
-    parser.add_argument("--chunk-enable-detour-rejoin", dest="chunk_enable_detour_rejoin", action="store_true", default=True)
+    parser.add_argument("--chunk-enable-detour-rejoin", dest="chunk_enable_detour_rejoin", action="store_true", default=False)
     parser.add_argument("--no-chunk-enable-detour-rejoin", dest="chunk_enable_detour_rejoin", action="store_false")
     parser.add_argument("--chunk-enable-delayed-rejoin", dest="chunk_enable_delayed_rejoin", action="store_true", default=True)
     parser.add_argument("--no-chunk-enable-delayed-rejoin", dest="chunk_enable_delayed_rejoin", action="store_false")
@@ -1758,6 +2092,17 @@ def parse_args():
     parser.add_argument("--chunk-lambda-recover-rejoin", "--chunk-lambda-return-rejoin", dest="chunk_lambda_return_rejoin", type=float, default=5.0)
     parser.add_argument("--chunk-lambda-recover-smooth", "--chunk-lambda-return-smooth", dest="chunk_lambda_return_smooth", type=float, default=0.2)
     parser.add_argument("--chunk-lambda-recover-action", "--chunk-lambda-return-action", dest="chunk_lambda_return_action", type=float, default=0.1)
+    parser.add_argument("--chunk-recover-direction-alignment-weight", type=float, default=5.0)
+    parser.add_argument("--chunk-recover-min-direction-cosine", type=float, default=0.05)
+    parser.add_argument("--chunk-require-recover-direction-alignment", dest="chunk_require_recover_direction_alignment", action="store_true", default=True)
+    parser.add_argument("--no-chunk-require-recover-direction-alignment", dest="chunk_require_recover_direction_alignment", action="store_false")
+    parser.add_argument("--chunk-recover-direction-alignment-margin", type=float, default=0.0)
+    parser.add_argument("--chunk-recover-ordered-pose-weight", type=float, default=2.0)
+    parser.add_argument("--chunk-recover-ordered-delta-weight", type=float, default=1.0)
+    parser.add_argument("--chunk-recover-ordered-pose-threshold", type=float, default=0.02)
+    parser.add_argument("--chunk-recover-ordered-delta-threshold", type=float, default=0.005)
+    parser.add_argument("--chunk-require-recover-ordered-path", dest="chunk_require_recover_ordered_path", action="store_true", default=True)
+    parser.add_argument("--no-chunk-require-recover-ordered-path", dest="chunk_require_recover_ordered_path", action="store_false")
     parser.add_argument("--chunk-deform-horizon", "--chunk-yield-horizon", dest="chunk_yield_horizon", type=int, default=4)
     parser.add_argument("--chunk-recover-horizon", "--chunk-return-horizon", dest="chunk_return_horizon", type=int, default=8)
     parser.add_argument("--chunk-max-recover-retries", "--chunk-max-return-retries", dest="chunk_max_return_retries", type=int, default=3)
@@ -1894,6 +2239,8 @@ def parse_args():
 
     args = parser.parse_args()
     args.record_video = not args.no_record_video
+    if args.frame_image_every <= 0:
+        parser.error("--frame-image-every must be positive.")
     if args.save_actions is not None and args.replay_actions is not None:
         parser.error("Use either --save-actions or --replay-actions, not both.")
     if args.enable_human_arm_collisions and (
@@ -2240,7 +2587,11 @@ def _is_safety_intervention_mode(safety_info) -> bool:
     mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
     source = _safe_info_get(safety_info, "deformation_source")
     if mode in {
+        "horizon_brake",
         "path_consistent_brake",
+        "path_consistent_brake_intended_step",
+        "verified_failsafe",
+        "unverified_emergency_failsafe",
         "pause_on_unsafe",
         "stop",
         "horizon_deform",
@@ -2254,7 +2605,7 @@ def _is_safety_intervention_mode(safety_info) -> bool:
 
 def _should_hold_policy_step(safety_info, first_action, safe_first_action, arm_idx, eps) -> bool:
     mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
-    if mode not in {"path_consistent_brake", "pause_on_unsafe", "stop"}:
+    if mode not in {"horizon_brake", "path_consistent_brake", "pause_on_unsafe", "stop"}:
         return False
     if bool(_safe_info_get(safety_info, "brake_hold_current")):
         return True
@@ -3242,6 +3593,11 @@ class HorizonOSCBFOperator:
         self._capsule_b_velocity_world = None
         self._human_motion_prediction_available = False
         self._human_motion_prediction_speed = 0.0
+        self._human_obstacles_cache = None
+        self._human_rollout_cache = {}
+        self._human_obstacle_extract_time_ms = 0.0
+        self._human_obstacle_cache_hits = 0
+        self._human_obstacle_cache_misses = 0
         self._batched_h_fn = jax.jit(
             jax.vmap(
                 lambda q, capsule_a, capsule_b, capsule_radii: self.oscbf.oscbf_config.h_1(
@@ -3253,12 +3609,18 @@ class HorizonOSCBFOperator:
                 in_axes=(0, 0, 0, None),
             )
         )
+        self._chunk_filter_fns = {}
 
     def set_context(self, env, obs, q_full: np.ndarray, qd_full: np.ndarray):
         self.env = env
         self.obs = obs
         self.q_full = np.asarray(q_full, dtype=np.float32).reshape(-1)
         self.qd_full = np.asarray(qd_full, dtype=np.float32).reshape(-1)
+        self._human_obstacles_cache = None
+        self._human_rollout_cache = {}
+        self._human_obstacle_extract_time_ms = 0.0
+        self._human_obstacle_cache_hits = 0
+        self._human_obstacle_cache_misses = 0
         self._update_human_capsule_velocity()
 
     def reset_human_motion_prediction(self):
@@ -3269,6 +3631,11 @@ class HorizonOSCBFOperator:
         self._capsule_b_velocity_world = None
         self._human_motion_prediction_available = False
         self._human_motion_prediction_speed = 0.0
+        self._human_obstacles_cache = None
+        self._human_rollout_cache = {}
+        self._human_obstacle_extract_time_ms = 0.0
+        self._human_obstacle_cache_hits = 0
+        self._human_obstacle_cache_misses = 0
 
     def _limit_capsule_velocity(self, velocity):
         if self.human_prediction_max_speed is None:
@@ -3284,18 +3651,31 @@ class HorizonOSCBFOperator:
     def _update_human_capsule_velocity(self):
         self._human_motion_prediction_available = False
         self._human_motion_prediction_speed = 0.0
-        if not self.predict_human_motion or self.env is None:
+        if self.env is None:
             return
         try:
+            t0 = time.perf_counter()
             human_obstacles = self.oscbf._extract_human_obstacles(self.env, self.obs)
+            self._human_obstacle_extract_time_ms = 1000.0 * (time.perf_counter() - t0)
             capsule_a = np.asarray(human_obstacles["capsule_a"], dtype=np.float32)
             capsule_b = np.asarray(human_obstacles["capsule_b"], dtype=np.float32)
             capsule_radii = np.asarray(
                 human_obstacles["capsule_radii"],
                 dtype=np.float32,
             )
+            self._human_obstacles_cache = {
+                "capsule_a": capsule_a.copy(),
+                "capsule_b": capsule_b.copy(),
+                "capsule_radii": capsule_radii.copy(),
+            }
         except Exception as exc:  # noqa: BLE001
             logger.debug("Human capsule velocity update failed: %s", exc)
+            return
+
+        if not self.predict_human_motion:
+            self._prev_capsule_a_world = capsule_a.copy()
+            self._prev_capsule_b_world = capsule_b.copy()
+            self._prev_capsule_radii = capsule_radii.copy()
             return
 
         if (
@@ -3331,6 +3711,69 @@ class HorizonOSCBFOperator:
         self._prev_capsule_a_world = capsule_a.copy()
         self._prev_capsule_b_world = capsule_b.copy()
         self._prev_capsule_radii = capsule_radii.copy()
+
+    def _current_human_obstacles(self, obs=None):
+        if self._human_obstacles_cache is not None:
+            self._human_obstacle_cache_hits += 1
+            return self._human_obstacles_cache, True
+        self._human_obstacle_cache_misses += 1
+        t0 = time.perf_counter()
+        human_obstacles = self.oscbf._extract_human_obstacles(
+            self.env,
+            self.obs if obs is None else obs,
+        )
+        self._human_obstacle_extract_time_ms += 1000.0 * (time.perf_counter() - t0)
+        capsule_a = np.asarray(human_obstacles["capsule_a"], dtype=np.float32)
+        capsule_b = np.asarray(human_obstacles["capsule_b"], dtype=np.float32)
+        capsule_radii = np.asarray(human_obstacles["capsule_radii"], dtype=np.float32)
+        self._human_obstacles_cache = {
+            "capsule_a": capsule_a.copy(),
+            "capsule_b": capsule_b.copy(),
+            "capsule_radii": capsule_radii.copy(),
+        }
+        return self._human_obstacles_cache, False
+
+    def _human_capsule_rollout_cached(self, obs, horizon):
+        horizon = int(horizon)
+        cached = self._human_rollout_cache.get(horizon)
+        if cached is not None:
+            a_seq, b_seq, radii, info = cached
+            info = dict(info)
+            info.update(
+                {
+                    "human_obstacles_cached": True,
+                    "human_rollout_cached": True,
+                    "human_obstacle_cache_hits": int(self._human_obstacle_cache_hits),
+                    "human_obstacle_cache_misses": int(self._human_obstacle_cache_misses),
+                    "human_obstacle_extract_time_ms": float(self._human_obstacle_extract_time_ms),
+                }
+            )
+            return a_seq, b_seq, radii, info
+
+        human_obstacles, obstacle_cached = self._current_human_obstacles(obs)
+        a_seq, b_seq, radii, info = self._human_capsule_rollout(
+            human_obstacles["capsule_a"],
+            human_obstacles["capsule_b"],
+            human_obstacles["capsule_radii"],
+            horizon,
+        )
+        info = dict(info)
+        info.update(
+            {
+                "human_obstacles_cached": bool(obstacle_cached),
+                "human_rollout_cached": False,
+                "human_obstacle_cache_hits": int(self._human_obstacle_cache_hits),
+                "human_obstacle_cache_misses": int(self._human_obstacle_cache_misses),
+                "human_obstacle_extract_time_ms": float(self._human_obstacle_extract_time_ms),
+            }
+        )
+        self._human_rollout_cache[horizon] = (
+            np.asarray(a_seq, dtype=np.float32).copy(),
+            np.asarray(b_seq, dtype=np.float32).copy(),
+            np.asarray(radii, dtype=np.float32).copy(),
+            dict(info),
+        )
+        return a_seq, b_seq, radii, info
 
     def _human_capsule_rollout(self, capsule_a_world, capsule_b_world, capsule_radii, horizon):
         capsule_a_world = np.asarray(capsule_a_world, dtype=np.float32)
@@ -3398,26 +3841,291 @@ class HorizonOSCBFOperator:
             **kwargs,
         )
 
+    def _ensure_chunk_filter_fn(self, use_pelvis_cbf: bool):
+        key = "pelvis" if use_pelvis_cbf else "arm"
+        cached = self._chunk_filter_fns.get(key)
+        if cached is not None:
+            return cached
+
+        cbf = (
+            self.oscbf._ensure_pelvis_cbf()
+            if use_pelvis_cbf
+            else self.oscbf._ensure_cbf()
+        )
+
+        @jax.jit
+        def _filter_chunk(
+            action_chunk,
+            q0_bigym,
+            capsule_a_world_seq,
+            capsule_b_world_seq,
+            capsule_radii,
+            bigym_action_base_indices,
+            bigym_action_arm_indices,
+            bigym_action_clip_indices,
+            bigym_state_base_indices,
+            bigym_state_arm_indices,
+            urdf_arm_joint_indices,
+            rollout_state_indices,
+            rollout_action_indices,
+            rollout_mode_ids,
+            arm_sign,
+            arm_offset,
+            urdf_neutral_q,
+            t_pelvis_urdf,
+            dt,
+            control_mode_id,
+            max_action_delta,
+        ):
+            r_pelvis_urdf = t_pelvis_urdf[:3, :3]
+            t_pelvis_urdf_vec = t_pelvis_urdf[:3, 3]
+
+            def urdf_state_and_world_pose(q_bigym):
+                q_arm_bigym = q_bigym[bigym_state_arm_indices]
+                q_arm_urdf = arm_sign * q_arm_bigym + arm_offset
+                q_urdf = urdf_neutral_q.at[urdf_arm_joint_indices].set(q_arm_urdf)
+
+                yaw = q_bigym[3]
+                cy = jnp.cos(yaw)
+                sy = jnp.sin(yaw)
+                zeros = jnp.asarray(0.0, dtype=q_bigym.dtype)
+                one = jnp.asarray(1.0, dtype=q_bigym.dtype)
+                r_world_pelvis = jnp.stack(
+                    (
+                        jnp.stack((cy, -sy, zeros)),
+                        jnp.stack((sy, cy, zeros)),
+                        jnp.stack((zeros, zeros, one)),
+                    ),
+                    axis=0,
+                )
+                r_world_urdf = r_world_pelvis @ r_pelvis_urdf
+                t_world_urdf = q_bigym[:3] + r_world_pelvis @ t_pelvis_urdf_vec
+                return q_urdf, q_arm_bigym, q_arm_urdf, r_world_urdf, t_world_urdf
+
+            def arm_action_to_urdf_velocity(action, q_arm_urdf):
+                a_arm_bigym = action[bigym_action_arm_indices]
+                a_arm_urdf = arm_sign * a_arm_bigym + arm_offset
+                u_abs = (a_arm_urdf - q_arm_urdf) / dt
+                u_delta = arm_sign * a_arm_bigym / dt
+                u_velocity = arm_sign * a_arm_bigym
+                return jnp.where(
+                    control_mode_id == 0,
+                    u_abs,
+                    jnp.where(control_mode_id == 1, u_delta, u_velocity),
+                )
+
+            def urdf_velocity_to_arm_action(q_arm_urdf, u_arm_urdf):
+                a_abs = arm_sign * (q_arm_urdf + u_arm_urdf * dt - arm_offset)
+                a_delta = arm_sign * (u_arm_urdf * dt)
+                a_velocity = arm_sign * u_arm_urdf
+                return jnp.where(
+                    control_mode_id == 0,
+                    a_abs,
+                    jnp.where(control_mode_id == 1, a_delta, a_velocity),
+                )
+
+            def base_action_to_velocity(action):
+                a_base = action[bigym_action_base_indices]
+                u_delta = a_base / dt
+                return jnp.where(control_mode_id == 2, a_base, u_delta)
+
+            def base_velocity_to_action(u_base):
+                return jnp.where(control_mode_id == 2, u_base, u_base * dt)
+
+            def rollout_step(q_bigym, action):
+                selected = action[rollout_action_indices]
+                current = q_bigym[rollout_state_indices]
+                updated = jnp.where(
+                    rollout_mode_ids == 0,
+                    selected,
+                    jnp.where(
+                        rollout_mode_ids == 1,
+                        current + selected,
+                        current + dt * selected,
+                    ),
+                )
+                return q_bigym.at[rollout_state_indices].set(updated)
+
+            def step(q_bigym, step_inputs):
+                action, capsule_a_world, capsule_b_world = step_inputs
+                q_urdf, q_arm_bigym, q_arm_urdf, r_world_urdf, t_world_urdf = (
+                    urdf_state_and_world_pose(q_bigym)
+                )
+                del q_arm_bigym
+
+                if use_pelvis_cbf:
+                    z = jnp.concatenate((q_bigym[bigym_state_base_indices], q_urdf), axis=0)
+                    u_base_nom = base_action_to_velocity(action)
+                    u_arm_nom = arm_action_to_urdf_velocity(action, q_arm_urdf)
+                    u_aug_nom = jnp.concatenate((u_base_nom, u_arm_nom), axis=0)
+                    u_aug_safe = cbf.safety_filter(
+                        z,
+                        u_aug_nom,
+                        capsule_a_world,
+                        capsule_b_world,
+                        capsule_radii,
+                    )
+                    u_base_safe = u_aug_safe[: bigym_action_base_indices.shape[0]]
+                    u_arm_safe = u_aug_safe[bigym_action_base_indices.shape[0] :]
+                    safe_action = action
+                    safe_action = safe_action.at[bigym_action_base_indices].set(
+                        base_velocity_to_action(u_base_safe)
+                    )
+                    safe_action = safe_action.at[bigym_action_arm_indices].set(
+                        urdf_velocity_to_arm_action(q_arm_urdf, u_arm_safe)
+                    )
+                else:
+                    capsule_a_urdf = (capsule_a_world - t_world_urdf[None, :]) @ r_world_urdf
+                    capsule_b_urdf = (capsule_b_world - t_world_urdf[None, :]) @ r_world_urdf
+                    u_arm_nom = arm_action_to_urdf_velocity(action, q_arm_urdf)
+                    u_arm_safe = cbf.safety_filter(
+                        q_urdf,
+                        u_arm_nom,
+                        capsule_a_urdf,
+                        capsule_b_urdf,
+                        capsule_radii,
+                    )
+                    safe_action = action.at[bigym_action_arm_indices].set(
+                        urdf_velocity_to_arm_action(q_arm_urdf, u_arm_safe)
+                    )
+
+                delta = safe_action[bigym_action_clip_indices] - action[bigym_action_clip_indices]
+                clipped_delta = jnp.clip(delta, -max_action_delta, max_action_delta)
+                safe_action = safe_action.at[bigym_action_clip_indices].set(
+                    action[bigym_action_clip_indices] + clipped_delta
+                )
+                q_next = rollout_step(q_bigym, safe_action)
+                return q_next, safe_action
+
+            _, safe_actions = jax.lax.scan(
+                step,
+                q0_bigym,
+                (action_chunk, capsule_a_world_seq, capsule_b_world_seq),
+            )
+            return safe_actions
+
+        self._chunk_filter_fns[key] = _filter_chunk
+        return _filter_chunk
+
+    def _control_mode_id(self):
+        if self.oscbf.control_type == "absolute":
+            return 0
+        if self.oscbf.control_type == "delta":
+            return 1
+        return 2
+
+    def _chunk_rollout_mode_ids(self, state_indices):
+        state_indices = np.asarray(state_indices, dtype=np.int64).reshape(-1)
+        modes = np.full(state_indices.shape, self._control_mode_id(), dtype=np.int32)
+        modes[state_indices < 4] = 1
+        return modes
+
+    def filter_chunk(self, action_chunk=None, obs=None, observations=None, **kwargs):
+        if action_chunk is None:
+            action_chunk = kwargs.pop("chunk", None)
+        if action_chunk is None:
+            raise ValueError("action_chunk must be provided")
+        chunk = np.asarray(action_chunk, dtype=np.float32)
+        if chunk.ndim != 2:
+            raise ValueError(f"Expected action_chunk shape (H, A), got {chunk.shape}")
+        if not self.oscbf.enabled:
+            return chunk.copy(), {"jax_sequential_oscbf_used": False, "sequential_oscbf_passthrough": True}
+        if self.oscbf.use_dummy_filter:
+            raise RuntimeError("JAX chunk OSCBF is not used for dummy OSCBF filters")
+
+        obs_eval = observations if observations is not None else (obs if obs is not None else self.obs)
+        q_full = np.asarray(kwargs.pop("q_full", self.q_full), dtype=np.float32).reshape(-1)
+        _ = np.asarray(kwargs.pop("qd_full", self.qd_full), dtype=np.float32).reshape(-1)
+        if q_full.shape[0] != self.oscbf.expected_motion_dim:
+            raise ValueError(
+                f"Expected q_full dim {self.oscbf.expected_motion_dim}, got {q_full.shape[0]}"
+            )
+
+        use_pelvis_cbf = bool(
+            getattr(self.oscbf, "enable_pelvis_cbf", False)
+            and getattr(self.oscbf, "pelvis_oscbf_config", None) is not None
+        )
+        if use_pelvis_cbf:
+            self.oscbf._ensure_pelvis_cbf()
+            clip_indices = self.oscbf.bigym_action_safety_indices
+        else:
+            self.oscbf._ensure_cbf()
+            clip_indices = self.oscbf.bigym_action_arm_indices
+
+        (
+            capsule_a_world_seq,
+            capsule_b_world_seq,
+            capsule_radii_eval,
+            prediction_info,
+        ) = self._human_capsule_rollout_cached(obs_eval, chunk.shape[0])
+
+        valid = (
+            (self.oscbf.bigym_state_safety_indices < q_full.shape[0])
+            & (self.oscbf.bigym_action_safety_indices < chunk.shape[1])
+        )
+        rollout_state_indices = self.oscbf.bigym_state_safety_indices[valid].astype(np.int32)
+        rollout_action_indices = self.oscbf.bigym_action_safety_indices[valid].astype(np.int32)
+        if rollout_state_indices.size == 0:
+            raise ValueError("No valid state/action indices for sequential OSCBF rollout")
+
+        max_action_delta = (
+            np.inf
+            if self.oscbf.max_action_delta is None
+            else float(self.oscbf.max_action_delta)
+        )
+        filter_fn = self._ensure_chunk_filter_fn(use_pelvis_cbf)
+        t0 = time.perf_counter()
+        safe_chunk = np.asarray(
+            filter_fn(
+                jnp.asarray(chunk, dtype=jnp.float32),
+                jnp.asarray(q_full, dtype=jnp.float32),
+                jnp.asarray(capsule_a_world_seq, dtype=jnp.float32),
+                jnp.asarray(capsule_b_world_seq, dtype=jnp.float32),
+                jnp.asarray(capsule_radii_eval, dtype=jnp.float32),
+                jnp.asarray(self.oscbf.bigym_action_base_indices, dtype=jnp.int32),
+                jnp.asarray(self.oscbf.bigym_action_arm_indices, dtype=jnp.int32),
+                jnp.asarray(clip_indices, dtype=jnp.int32),
+                jnp.asarray(self.oscbf.bigym_state_base_indices, dtype=jnp.int32),
+                jnp.asarray(self.oscbf.bigym_state_arm_indices, dtype=jnp.int32),
+                jnp.asarray(self.oscbf.urdf_arm_joint_indices, dtype=jnp.int32),
+                jnp.asarray(rollout_state_indices, dtype=jnp.int32),
+                jnp.asarray(rollout_action_indices, dtype=jnp.int32),
+                jnp.asarray(
+                    self._chunk_rollout_mode_ids(rollout_state_indices),
+                    dtype=jnp.int32,
+                ),
+                jnp.asarray(self.oscbf.arm_sign, dtype=jnp.float32),
+                jnp.asarray(self.oscbf.arm_offset, dtype=jnp.float32),
+                jnp.asarray(self.oscbf.urdf_neutral_q, dtype=jnp.float32),
+                jnp.asarray(self.oscbf.T_pelvis_urdf, dtype=jnp.float32),
+                jnp.asarray(float(self.oscbf.dt), dtype=jnp.float32),
+                jnp.asarray(self._control_mode_id(), dtype=jnp.int32),
+                jnp.asarray(max_action_delta, dtype=jnp.float32),
+            ),
+            dtype=np.float32,
+        )
+        elapsed_ms = 1000.0 * (time.perf_counter() - t0)
+        info = dict(prediction_info)
+        info.update(
+            {
+                "jax_sequential_oscbf_used": True,
+                "jax_sequential_oscbf_use_pelvis_cbf": bool(use_pelvis_cbf),
+                "jax_sequential_oscbf_time_ms": float(elapsed_ms),
+            }
+        )
+        return safe_chunk, info
+
     def evaluate_safety(self, obs, q_seq):
         if self.oscbf.oscbf_config is None or self.env is None:
             return self._unavailable(q_seq)
         q_seq = np.asarray(q_seq, dtype=np.float32)
         try:
-            human_obstacles = self.oscbf._extract_human_obstacles(self.env, obs)
-            capsule_a_world = human_obstacles["capsule_a"]
-            capsule_b_world = human_obstacles["capsule_b"]
-            capsule_radii = human_obstacles["capsule_radii"]
             (
                 capsule_a_world_seq,
                 capsule_b_world_seq,
                 capsule_radii_eval,
                 prediction_info,
-            ) = self._human_capsule_rollout(
-                capsule_a_world,
-                capsule_b_world,
-                capsule_radii,
-                q_seq.shape[0],
-            )
+            ) = self._human_capsule_rollout_cached(obs, q_seq.shape[0])
             qd_seq = np.zeros_like(q_seq, dtype=np.float32)
             q_urdf_seq = []
             capsule_a_urdf_seq = []
@@ -3481,51 +4189,76 @@ class HorizonOSCBFOperator:
             return self._unavailable_batch(q_seq_batch)
         batch, horizon = q_seq_batch.shape[:2]
         try:
-            human_obstacles = self.oscbf._extract_human_obstacles(self.env, obs)
-            capsule_a_world = human_obstacles["capsule_a"]
-            capsule_b_world = human_obstacles["capsule_b"]
-            capsule_radii = human_obstacles["capsule_radii"]
             (
                 capsule_a_world_seq,
                 capsule_b_world_seq,
                 capsule_radii_eval,
                 prediction_info,
-            ) = self._human_capsule_rollout(
-                capsule_a_world,
-                capsule_b_world,
-                capsule_radii,
-                horizon,
-            )
+            ) = self._human_capsule_rollout_cached(obs, horizon)
 
-            q_urdf_seq = []
-            capsule_a_urdf_seq = []
-            capsule_b_urdf_seq = []
-            qd_zero = np.zeros(q_seq_batch.shape[-1], dtype=np.float32)
-            for candidate_q_seq in q_seq_batch:
-                for k, q_bigym in enumerate(candidate_q_seq):
-                    q_urdf, _, _, _ = self.oscbf._build_urdf_surrogate_state_from_bigym(
-                        q_bigym,
-                        qd_zero,
-                    )
-                    t_world_urdf = self.oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
-                    t_urdf_world = np.linalg.inv(t_world_urdf)
-                    capsule_a_urdf = self.oscbf._transform_points(
-                        t_urdf_world,
-                        capsule_a_world_seq[k],
-                    )
-                    capsule_b_urdf = self.oscbf._transform_points(
-                        t_urdf_world,
-                        capsule_b_world_seq[k],
-                    )
-                    self.oscbf._validate_capsules(
-                        capsule_a_urdf,
-                        capsule_b_urdf,
-                        capsule_radii_eval,
-                    )
-                    q_urdf_seq.append(q_urdf)
-                    capsule_a_urdf_seq.append(capsule_a_urdf)
-                    capsule_b_urdf_seq.append(capsule_b_urdf)
+            q_bigym_flat = q_seq_batch.reshape(batch * horizon, q_seq_batch.shape[-1])
+            capsule_a_world_flat = np.broadcast_to(
+                capsule_a_world_seq[None, :, :, :],
+                (batch,) + capsule_a_world_seq.shape,
+            ).reshape(batch * horizon, capsule_a_world_seq.shape[1], 3)
+            capsule_b_world_flat = np.broadcast_to(
+                capsule_b_world_seq[None, :, :, :],
+                (batch,) + capsule_b_world_seq.shape,
+            ).reshape(batch * horizon, capsule_b_world_seq.shape[1], 3)
 
+            jax_prep_used = False
+            prep_t0 = time.perf_counter()
+            try:
+                q_urdf_seq, capsule_a_urdf_seq, capsule_b_urdf_seq = (
+                    _jax_prepare_horizon_clearance_inputs(
+                        jnp.asarray(q_bigym_flat, dtype=jnp.float32),
+                        jnp.asarray(capsule_a_world_flat, dtype=jnp.float32),
+                        jnp.asarray(capsule_b_world_flat, dtype=jnp.float32),
+                        jnp.asarray(self.oscbf.bigym_state_arm_indices, dtype=jnp.int32),
+                        jnp.asarray(self.oscbf.urdf_arm_joint_indices, dtype=jnp.int32),
+                        jnp.asarray(self.oscbf.arm_sign, dtype=jnp.float32),
+                        jnp.asarray(self.oscbf.arm_offset, dtype=jnp.float32),
+                        jnp.asarray(self.oscbf.urdf_neutral_q, dtype=jnp.float32),
+                        jnp.asarray(self.oscbf.T_pelvis_urdf, dtype=jnp.float32),
+                    )
+                )
+                jax_prep_used = True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "JAX horizon clearance input preparation failed; using Python preparation: %s",
+                    exc,
+                )
+                q_urdf_seq = []
+                capsule_a_urdf_seq = []
+                capsule_b_urdf_seq = []
+                qd_zero = np.zeros(q_seq_batch.shape[-1], dtype=np.float32)
+                for candidate_q_seq in q_seq_batch:
+                    for k, q_bigym in enumerate(candidate_q_seq):
+                        q_urdf, _, _, _ = self.oscbf._build_urdf_surrogate_state_from_bigym(
+                            q_bigym,
+                            qd_zero,
+                        )
+                        t_world_urdf = self.oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
+                        t_urdf_world = np.linalg.inv(t_world_urdf)
+                        capsule_a_urdf = self.oscbf._transform_points(
+                            t_urdf_world,
+                            capsule_a_world_seq[k],
+                        )
+                        capsule_b_urdf = self.oscbf._transform_points(
+                            t_urdf_world,
+                            capsule_b_world_seq[k],
+                        )
+                        self.oscbf._validate_capsules(
+                            capsule_a_urdf,
+                            capsule_b_urdf,
+                            capsule_radii_eval,
+                        )
+                        q_urdf_seq.append(q_urdf)
+                        capsule_a_urdf_seq.append(capsule_a_urdf)
+                        capsule_b_urdf_seq.append(capsule_b_urdf)
+            prep_time_ms = 1000.0 * (time.perf_counter() - prep_t0)
+
+            h_t0 = time.perf_counter()
             h_values = np.asarray(
                 self._batched_h_fn(
                     jnp.asarray(q_urdf_seq, dtype=jnp.float32),
@@ -3535,6 +4268,7 @@ class HorizonOSCBFOperator:
                 ),
                 dtype=np.float32,
             ).reshape(batch, horizon, -1)
+            h_eval_time_ms = 1000.0 * (time.perf_counter() - h_t0)
             min_clearances = np.min(h_values, axis=2).astype(np.float32)
             unsafe = min_clearances < self.min_clearance
             unsafe_any = np.any(unsafe, axis=1)
@@ -3548,6 +4282,9 @@ class HorizonOSCBFOperator:
                 "first_violation": first_violation,
                 "unsafe_count": np.count_nonzero(unsafe, axis=1).astype(np.int32),
                 "safety_eval_available": True,
+                "jax_clearance_prep_used": bool(jax_prep_used),
+                "jax_clearance_prep_time_ms": float(prep_time_ms),
+                "jax_h_eval_time_ms": float(h_eval_time_ms),
             }
             info.update(prediction_info)
             return info
@@ -3618,7 +4355,28 @@ def make_safechunk_filter(
         controlled_action_indices = getattr(oscbf, "bigym_action_safety_indices", None)
         controlled_state_indices = getattr(oscbf, "bigym_state_safety_indices", None)
 
-    return SafeChunkDeformFilter(
+    filter_cls = (
+        PathConsistentBrakeFilter
+        if args.condition == "path_consistent_brake"
+        else SafeChunkDeformFilter
+    )
+    path_consistent_brake_config = {}
+    path_consistent_brake_kwargs = {}
+    if args.condition == "path_consistent_brake":
+        path_consistent_brake_config = _load_path_consistent_brake_filter_config(
+            getattr(args, "path_consistent_brake_config", None)
+        )
+        path_consistent_brake_kwargs = _path_consistent_brake_kwargs_from_config(
+            args,
+            path_consistent_brake_config,
+        )
+    min_clearance = (
+        path_consistent_brake_config.get("min_clearance", args.chunk_min_clearance)
+        if args.condition == "path_consistent_brake"
+        else args.chunk_min_clearance
+    )
+
+    return filter_cls(
         oscbf_operator=operator,
         horizon=args.horizon,
         dt=0.05,
@@ -3627,14 +4385,22 @@ def make_safechunk_filter(
         control_type="absolute",
         controlled_action_indices=controlled_action_indices,
         controlled_state_indices=controlled_state_indices,
-        min_clearance=args.chunk_min_clearance,
+        min_clearance=min_clearance,
         brake_progress_threshold=args.brake_progress_threshold,
         deadlock_window=args.deadlock_window,
-        deformation_enabled=args.chunk_deformation_enabled,
+        deformation_enabled=(
+            False
+            if args.condition == "path_consistent_brake"
+            else args.chunk_deformation_enabled
+        ),
         mode=args.chunk_deform_mode,
         chunk_deformation_scales=args.chunk_deformation_scales,
         chunk_deformation_smoothing=args.chunk_deformation_smoothing,
-        sequential_oscbf_fallback=args.sequential_oscbf_fallback,
+        sequential_oscbf_fallback=(
+            False
+            if args.condition == "path_consistent_brake"
+            else args.sequential_oscbf_fallback
+        ),
         deform_after_deadlock_window=not args.deform_immediately_on_deadlock,
         unsafe_deformation_fallback=args.unsafe_deformation_fallback,
         opt_iters=args.chunk_opt_iters,
@@ -3689,6 +4455,7 @@ def make_safechunk_filter(
             "committed_execution_margin": args.chunk_committed_execution_margin,
             "committed_state_error_threshold": args.chunk_committed_state_error_threshold,
             "committed_state_error_action": args.chunk_committed_state_error_action,
+            "committed_state_mismatch_abort_requires_unsafe": args.chunk_committed_state_mismatch_abort_requires_unsafe,
         },
         temporary_blocker={
             "enabled": args.chunk_temporary_blocker_enabled,
@@ -3730,6 +4497,15 @@ def make_safechunk_filter(
             "enabled": args.chunk_safechunk_recover_enabled,
             "rejoin_nominal_weight": args.chunk_recover_rejoin_nominal_weight,
             "task_progress_weight": args.chunk_recover_task_progress_weight,
+            "direction_alignment_weight": args.chunk_recover_direction_alignment_weight,
+            "min_direction_cosine": args.chunk_recover_min_direction_cosine,
+            "require_direction_alignment": args.chunk_require_recover_direction_alignment,
+            "direction_alignment_margin": args.chunk_recover_direction_alignment_margin,
+            "ordered_pose_weight": args.chunk_recover_ordered_pose_weight,
+            "ordered_delta_weight": args.chunk_recover_ordered_delta_weight,
+            "ordered_pose_threshold": args.chunk_recover_ordered_pose_threshold,
+            "ordered_delta_threshold": args.chunk_recover_ordered_delta_threshold,
+            "require_ordered_path": args.chunk_require_recover_ordered_path,
             "safety_weight": args.chunk_recover_safety_weight,
             "action_deviation_weight": args.chunk_recover_action_deviation_weight,
             "smoothness_weight": args.chunk_recover_smoothness_weight,
@@ -3739,6 +4515,8 @@ def make_safechunk_filter(
             "suppress_stale_nominal_rejoin": args.chunk_recover_suppress_stale_nominal,
             "rejoin_weight_schedule": args.chunk_recover_rejoin_weight_schedule,
             "rejoin_ramp_steps": args.chunk_recover_rejoin_ramp_steps,
+            "retry_cooldown_steps": args.chunk_recover_retry_cooldown_steps,
+            "max_attempts_per_unsafe_streak": args.chunk_recover_max_attempts_per_unsafe_streak,
         },
         safechunk_active_safety={
             "enabled": args.chunk_active_safety_enabled,
@@ -3787,23 +4565,35 @@ def make_safechunk_filter(
         opt_elite_frac=args.chunk_opt_elite_frac,
         opt_seed=args.chunk_opt_seed,
         max_action_delta=args.max_action_delta,
+        **path_consistent_brake_kwargs,
         debug=args.debug,
     )
 
 
 
-def _pause_arm_at_current_q(action, q_full, action_indices, state_indices):
-    safe = np.asarray(action, dtype=np.float32).copy()
+def _controlled_pause_anchor(q_full, action_indices, state_indices, dtype=np.float32):
     q = np.asarray(q_full, dtype=np.float32).reshape(-1)
     action_idx = np.asarray(action_indices, dtype=np.int64)
     state_idx = np.asarray(state_indices, dtype=np.int64)
     valid = state_idx < q.shape[0]
     action_idx = action_idx[valid]
     state_idx = state_idx[valid]
+    anchor = np.zeros(action_idx.shape, dtype=dtype)
+    absolute = state_idx >= 4
+    if np.any(absolute):
+        anchor[absolute] = q[state_idx[absolute]].astype(dtype, copy=False)
+    return action_idx, anchor
+
+
+def _pause_arm_at_current_q(action, q_full, action_indices, state_indices):
+    safe = np.asarray(action, dtype=np.float32).copy()
+    action_idx, anchor = _controlled_pause_anchor(
+        q_full, action_indices, state_indices, dtype=safe.dtype
+    )
     if safe.ndim == 1:
-        safe[action_idx] = q[state_idx]
+        safe[action_idx] = anchor
     elif safe.ndim == 2:
-        safe[:, action_idx] = q[state_idx][None, :]
+        safe[:, action_idx] = anchor[None, :]
     else:
         raise ValueError(f"Unsupported action shape for pause fallback: {safe.shape}")
     return safe
@@ -3816,15 +4606,11 @@ def _scale_controlled_motion_from_current_q(
     if scale <= 0.0:
         return _pause_arm_at_current_q(action, q_full, action_indices, state_indices)
     safe = np.asarray(action, dtype=np.float32).copy()
-    q = np.asarray(q_full, dtype=np.float32).reshape(-1)
-    action_idx = np.asarray(action_indices, dtype=np.int64)
-    state_idx = np.asarray(state_indices, dtype=np.int64)
-    valid = state_idx < q.shape[0]
-    action_idx = action_idx[valid]
-    state_idx = state_idx[valid]
-    if not np.any(valid):
+    action_idx, anchor = _controlled_pause_anchor(
+        q_full, action_indices, state_indices, dtype=safe.dtype
+    )
+    if action_idx.size == 0:
         return safe
-    anchor = q[state_idx].astype(safe.dtype, copy=False)
     if safe.ndim == 1:
         safe[action_idx] = anchor + scale * (safe[action_idx] - anchor)
     elif safe.ndim == 2:
@@ -3882,6 +4668,203 @@ def _mujoco_site_position(model, data, names: Sequence[str]):
             return np.asarray(data.site_xpos[site_id], dtype=np.float64).reshape(3)
     return None
 
+
+def _box_edge_segments_world(center, size, xmat=None):
+    center = np.asarray(center, dtype=np.float64).reshape(3)
+    size = np.asarray(size, dtype=np.float64).reshape(3)
+    rot = np.eye(3, dtype=np.float64) if xmat is None else np.asarray(xmat, dtype=np.float64).reshape(3, 3)
+    corners = []
+    labels = []
+    for dx in (-1.0, 1.0):
+        for dy in (-1.0, 1.0):
+            for dz in (-1.0, 1.0):
+                local = np.asarray([dx * size[0], dy * size[1], dz * size[2]], dtype=np.float64)
+                corners.append((center + rot @ local).astype(float).tolist())
+                labels.append((int(dx), int(dy), int(dz)))
+    idx = {label: i for i, label in enumerate(labels)}
+    pairs = []
+    for dx in (-1, 1):
+        for dy in (-1, 1):
+            pairs.append((idx[(dx, dy, -1)], idx[(dx, dy, 1)]))
+        for dz in (-1, 1):
+            pairs.append((idx[(dx, -1, dz)], idx[(dx, 1, dz)]))
+    for dy in (-1, 1):
+        for dz in (-1, 1):
+            pairs.append((idx[(-1, dy, dz)], idx[(1, dy, dz)]))
+    return [[corners[a], corners[b]] for a, b in pairs]
+
+
+def _mujoco_find_body_id(model, names: Sequence[str]):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return -1
+    for name in names:
+        try:
+            body_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name))
+        except Exception:  # noqa: BLE001
+            body_id = -1
+        if body_id >= 0:
+            return body_id
+    suffixes = tuple(f"/{name}" for name in names)
+    for body_id in range(int(model.nbody)):
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if body_name in names or body_name.endswith(suffixes):
+            return int(body_id)
+    return -1
+
+
+def _mujoco_body_is_descendant(model, body_id: int, ancestor_id: int) -> bool:
+    if ancestor_id < 0 or body_id < 0:
+        return False
+    body_id = int(body_id)
+    ancestor_id = int(ancestor_id)
+    while body_id >= 0:
+        if body_id == ancestor_id:
+            return True
+        parent = int(model.body_parentid[body_id])
+        if parent == body_id:
+            break
+        body_id = parent
+    return False
+
+
+def _mujoco_body_name(model, body_id: int) -> str:
+    try:
+        import mujoco
+        return mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(body_id)) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _drawer_scene_geometry(model, data):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return None
+
+    cabinet_body_id = _mujoco_find_body_id(model, ("base_cabinet_600",))
+    drawer_body_id = _mujoco_find_body_id(
+        model,
+        ("base_cabinet_600/drawer_small_4", "drawer_small_4"),
+    )
+
+    cabinet_segments = []
+    drawer_segments = []
+    cabinet_geoms = []
+    drawer_geoms = []
+    for geom_id in range(int(model.ngeom)):
+        try:
+            if int(model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_BOX):
+                continue
+            body_id = int(model.geom_bodyid[geom_id])
+            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+            body_name = _mujoco_body_name(model, body_id)
+            in_cabinet = (
+                _mujoco_body_is_descendant(model, body_id, cabinet_body_id)
+                or geom_name.startswith("base_cabinet_600")
+                or body_name.startswith("base_cabinet_600")
+                or "/base_cabinet_600" in body_name
+            )
+            if not in_cabinet:
+                continue
+            segments = _box_edge_segments_world(
+                data.geom_xpos[geom_id],
+                model.geom_size[geom_id],
+                data.geom_xmat[geom_id],
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        entry = {
+            "name": geom_name or body_name or f"geom_{geom_id}",
+            "body": body_name,
+            "center": np.asarray(data.geom_xpos[geom_id], dtype=np.float64).astype(float).tolist(),
+            "size": np.asarray(model.geom_size[geom_id], dtype=np.float64).astype(float).tolist(),
+            "segments": segments,
+        }
+        is_drawer_geom = (
+            _mujoco_body_is_descendant(model, body_id, drawer_body_id)
+            or "/drawer_small_4" in body_name
+            or body_name.endswith("drawer_small_4")
+            or "/drawer_small_4" in geom_name
+            or geom_name.endswith("drawer_small_4")
+        )
+        if is_drawer_geom:
+            drawer_segments.extend(segments)
+            drawer_geoms.append(entry)
+        else:
+            cabinet_segments.extend(segments)
+            cabinet_geoms.append(entry)
+
+    if not cabinet_segments and not drawer_segments:
+        return None
+    return {
+        "absolute": True,
+        "cabinet": cabinet_segments,
+        "drawer": drawer_segments,
+        "cabinet_geoms": cabinet_geoms,
+        "drawer_geoms": drawer_geoms,
+        "source": "mujoco_geoms",
+    }
+
+
+def _drawer_scene_geometry_from_cabinet_xml(handle_pos, open_distance=None, open_fraction=None):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        handle = np.asarray(handle_pos, dtype=np.float64).reshape(3)
+    except Exception:  # noqa: BLE001
+        return None
+    if not np.isfinite(handle).all():
+        return None
+
+    xml_path = REPO / "external/bigym/bigym/envs/xmls/props/kitchen/base_cabinet_600.xml"
+    if not xml_path.is_file():
+        return None
+    try:
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        data = mujoco.MjData(model)
+        distance = 0.0 if open_distance is None or not np.isfinite(float(open_distance)) else float(open_distance)
+        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "drawer_small_4")
+        if joint_id >= 0:
+            qpos_adr = int(model.jnt_qposadr[joint_id])
+            data.qpos[qpos_adr] = distance
+        mujoco.mj_forward(model, data)
+        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "drawer_small_4")
+        if site_id < 0:
+            return None
+        offset = handle - np.asarray(data.site_xpos[site_id], dtype=np.float64).reshape(3)
+        geometry = _drawer_scene_geometry(model, data)
+        if geometry is None:
+            return None
+        for key in ("cabinet_geoms", "drawer_geoms"):
+            for geom in geometry.get(key, []):
+                geom["center"] = (np.asarray(geom["center"], dtype=np.float64) + offset).astype(float).tolist()
+                geom["segments"] = [
+                    (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
+                    for seg in geom.get("segments", [])
+                ]
+        geometry["cabinet"] = [
+            (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
+            for seg in geometry.get("cabinet", [])
+        ]
+        geometry["drawer"] = [
+            (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
+            for seg in geometry.get("drawer", [])
+        ]
+        geometry["handle"] = _box_edge_segments_world(handle, [0.025, 0.025, 0.025])
+        geometry["handle_pos"] = handle.astype(float).tolist()
+        geometry["origin"] = [0.0, 0.0, 0.0]
+        geometry["open_axis"] = [0.0, 0.0, 0.0]
+        geometry["default_open"] = 0.0
+        geometry["open_fraction"] = None if open_fraction is None else float(open_fraction)
+        geometry["source"] = "base_cabinet_600_xml"
+        return geometry
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to build XML drawer geometry fallback: %s", exc)
+        return None
 
 def _drawer_open_distance_and_fraction(task, model, data):
     distance = None
@@ -3941,9 +4924,11 @@ def _diagnostic_task_state(env) -> dict[str, Any]:
     drawer_fraction = None
     handle_pos = None
     ee_pos = None
+    drawer_scene_geometry = None
     ee_object_distance = None
     if model is not None and data is not None:
         drawer_distance, drawer_fraction = _drawer_open_distance_and_fraction(task, model, data)
+        drawer_scene_geometry = _drawer_scene_geometry(model, data)
         handle_pos = _mujoco_site_position(
             model,
             data,
@@ -3969,6 +4954,8 @@ def _diagnostic_task_state(env) -> dict[str, Any]:
         object_state["handle_pos"] = np.asarray(handle_pos, dtype=np.float64).astype(float).tolist()
     if ee_pos is not None:
         object_state["ee_pos"] = np.asarray(ee_pos, dtype=np.float64).astype(float).tolist()
+    if drawer_scene_geometry is not None:
+        object_state["drawer_scene_geometry"] = drawer_scene_geometry
     return {
         "drawer_open_distance": None if drawer_distance is None else float(drawer_distance),
         "drawer_open_fraction": None if drawer_fraction is None else float(drawer_fraction),
@@ -4048,9 +5035,19 @@ def _diagnostic_mode_flags(safety_info: dict, arm_delta: float, eps: float) -> d
     fallback_step = bool(_safe_info_get(safety_info, "fallback_used"))
     committed_active = bool(_safe_info_get(safety_info, "committed_chunk_active"))
     committed_mode = _safe_info_get(safety_info, "committed_chunk_mode")
+    horizon_brake_intended_step = mode == "horizon_brake_intended_step"
+    path_consistent_brake_intended_step = mode == "path_consistent_brake_intended_step"
+    horizon_brake_failsafe_step = mode in {
+        "horizon_brake",
+        "path_consistent_brake",
+        "verified_failsafe",
+        "unverified_emergency_failsafe",
+    }
     brake_step = bool(
-        mode in {"path_consistent_brake", "pause_on_unsafe", "pause_and_restart", "stop"}
-        or source == "path_consistent_brake"
+        horizon_brake_failsafe_step
+        or mode in {"pause_on_unsafe", "pause_and_restart", "stop"}
+        or (source == "horizon_brake" and not horizon_brake_intended_step)
+        or (source == "path_consistent_brake" and not path_consistent_brake_intended_step)
         or _safe_info_get(safety_info, "pause_reason") is not None
     )
     optimized_attempt_step = _safe_info_get(safety_info, "optimized_accepted") is not None
@@ -4074,11 +5071,15 @@ def _diagnostic_mode_flags(safety_info: dict, arm_delta: float, eps: float) -> d
         )
     )
     act_step = bool(
-        not deform_step
-        and not recover_step
-        and not brake_step
-        and not fallback_step
-        and arm_delta <= float(eps)
+        horizon_brake_intended_step
+        or path_consistent_brake_intended_step
+        or (
+            not deform_step
+            and not recover_step
+            and not brake_step
+            and not fallback_step
+            and arm_delta <= float(eps)
+        )
     )
     if fallback_step:
         step_mode = "fallback"
@@ -4380,7 +5381,7 @@ def _chunk_filter_advantage_metrics(
 
 
 
-def _path_consistency_metrics(safechunk, obs, nominal_chunk, safe_chunk) -> dict[str, Optional[float]]:
+def _path_deviation_metrics(safechunk, obs, nominal_chunk, safe_chunk) -> dict[str, Optional[float]]:
     try:
         nominal_q = np.asarray(
             safechunk.rollout_nominal_chunk(obs, nominal_chunk),
@@ -4412,7 +5413,7 @@ def _path_consistency_metrics(safechunk, obs, nominal_chunk, safe_chunk) -> dict
             "path_final_deviation": float(step_deviation[-1]) if step_deviation.size else 0.0,
         }
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Path consistency metric failed: %s", exc)
+        logger.debug("Path deviation metric failed: %s", exc)
         return {
             "path_mean_deviation": None,
             "path_max_deviation": None,
@@ -4523,6 +5524,7 @@ def _state_trace_payload(
         "state_shape": list(q_arr.shape),
         "action_shape": None if action_arr is None else list(action_arr.shape),
         "ee_xyz": _ee_xyz_from_q_seq(horizon_operator, q_arr),
+        "frame": "safety_model_fk_world_estimate",
         "min_clearance": (
             None
             if not isinstance(safety_eval, dict) or safety_eval.get("min_clearance") is None
@@ -4538,6 +5540,64 @@ def _state_trace_payload(
     if include_q_states:
         payload["q_seq"] = q_arr.astype(float).tolist()
     return payload
+
+
+def _data_position(data, idx: int, *field_names):
+    for field_name in field_names:
+        values = getattr(data, field_name, None)
+        if values is None:
+            continue
+        try:
+            return np.asarray(values[int(idx)], dtype=np.float64).reshape(3)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _mujoco_named_position(model, data, obj_type, names: Sequence[str], *field_names):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    for name in names:
+        obj_id = mujoco.mj_name2id(model, obj_type, name)
+        if obj_id < 0:
+            continue
+        pos = _data_position(data, int(obj_id), *field_names)
+        if pos is not None and np.isfinite(pos).all():
+            return pos, name
+    return None, None
+
+
+def _human_arm_wrist_position(model, data):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    pos, name = _mujoco_named_position(
+        model,
+        data,
+        mujoco.mjtObj.mjOBJ_BODY,
+        ("cylinder_arm/wrist", "wrist"),
+        "xpos",
+        "body_xpos",
+    )
+    if pos is not None:
+        return pos, name
+
+    pos, name = _mujoco_named_position(
+        model,
+        data,
+        mujoco.mjtObj.mjOBJ_GEOM,
+        ("cylinder_arm/vis_wrist", "vis_wrist"),
+        "geom_xpos",
+    )
+    if pos is not None:
+        return pos, name
+
+    return None, None
 
 
 def _human_arm_trajectory_sample(env, episode: int, step: int):
@@ -4575,16 +5635,155 @@ def _human_arm_trajectory_sample(env, episode: int, step: int):
             continue
         geoms.append({"name": name, "pos": pos.astype(float).tolist()})
 
-    if not geoms:
+    wrist_pos, wrist_name = _human_arm_wrist_position(model, data)
+    if not geoms and wrist_pos is None:
         return None
-    centers = np.asarray([g["pos"] for g in geoms], dtype=np.float64)
+
     sample = {
         "episode": int(episode),
         "step": int(step),
         "time": float(getattr(data, "time", np.nan)),
-        "center": np.mean(centers, axis=0).astype(float).tolist(),
         "geoms": geoms,
     }
+    if geoms:
+        centers = np.asarray([g["pos"] for g in geoms], dtype=np.float64)
+        sample["center"] = np.mean(centers, axis=0).astype(float).tolist()
+    if wrist_pos is not None:
+        sample["wrist_name"] = str(wrist_name)
+        sample["wrist_pos"] = np.asarray(wrist_pos, dtype=np.float64).astype(float).tolist()
+    return sample
+
+
+def _robot_ee_position(model, data):
+    try:
+        import mujoco
+    except Exception:  # noqa: BLE001
+        return None, None
+
+    pos, name = _mujoco_named_position(
+        model,
+        data,
+        mujoco.mjtObj.mjOBJ_SITE,
+        (
+            "right_wrist",
+            "h1/right_wrist",
+            "right_wrist_yaw",
+            "h1/right_wrist_yaw",
+            "wrist",
+            "h1/wrist",
+            "right_end_effector",
+            "h1/right_end_effector",
+            "right_gripper",
+            "h1/right_gripper",
+        ),
+        "site_xpos",
+    )
+    if pos is not None:
+        return pos, f"site:{name}"
+
+    priority_patterns = (
+        ("right_wrist",),
+        ("robotiq_2f85_right", "driver"),
+        ("robotiq_2f85_right",),
+        ("robotiq_2f85_right", "finger"),
+        ("robotiq_2f85_right", "pad"),
+    )
+    exclude_patterns = ("visual", "camera", "left")
+    for patterns in priority_patterns:
+        points = []
+        names = []
+        for geom_id in range(model.ngeom):
+            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
+            lower = geom_name.lower()
+            if not lower or any(excluded in lower for excluded in exclude_patterns):
+                continue
+            if all(pattern in lower for pattern in patterns):
+                pos = _data_position(data, geom_id, "geom_xpos")
+                if pos is not None and np.isfinite(pos).all():
+                    points.append(pos)
+                    names.append(geom_name)
+        if points:
+            return np.mean(np.stack(points, axis=0), axis=0), "geom_average:" + ",".join(names[:4])
+    return None, None
+
+
+def _robot_ee_trajectory_sample(
+    env,
+    episode: int,
+    step: int,
+    task_state=None,
+    horizon_operator=None,
+    q_full=None,
+):
+    pos = None
+    source = None
+    data = None
+
+    if horizon_operator is not None and q_full is not None:
+        try:
+            candidate = horizon_operator.ee_pose(np.asarray(q_full, dtype=np.float32))
+            if candidate is not None:
+                candidate = np.asarray(candidate, dtype=np.float64).reshape(-1)
+                if candidate.size >= 3 and np.isfinite(candidate[:3]).all():
+                    pos = candidate[:3]
+                    source = "safety_model_ee"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Safety-model executed EE extraction failed: %s", exc)
+
+    try:
+        task = get_bigym_task(env)
+        model, data = _mujoco_model_data(task)
+        if pos is None and model is not None and data is not None:
+            pos, source = _robot_ee_position(model, data)
+    except Exception:  # noqa: BLE001
+        if pos is None:
+            source = None
+
+    if pos is None and isinstance(task_state, dict):
+        object_state = task_state.get("object_state")
+        if isinstance(object_state, dict) and object_state.get("ee_pos") is not None:
+            try:
+                candidate = np.asarray(object_state.get("ee_pos"), dtype=np.float64).reshape(3)
+                if np.isfinite(candidate).all():
+                    pos = candidate
+                    source = "diagnostic_task_state.ee_pos"
+            except Exception:  # noqa: BLE001
+                pos = None
+
+    if pos is None:
+        return None
+
+    sample = {
+        "episode": int(episode),
+        "step": int(step),
+        "time": float(getattr(data, "time", np.nan)) if data is not None else None,
+        "ee_pos": np.asarray(pos, dtype=np.float64).astype(float).tolist(),
+        "source": source,
+    }
+    if isinstance(task_state, dict):
+        for key in ("drawer_open_distance", "drawer_open_fraction", "drawer_joint_position"):
+            value = task_state.get(key)
+            if value is not None:
+                try:
+                    sample[key] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        object_state = task_state.get("object_state")
+        if isinstance(object_state, dict):
+            copied_state = {}
+            for key in ("handle_pos", "drawer_open_distance", "drawer_open_fraction", "drawer_scene_geometry"):
+                value = object_state.get(key)
+                if value is not None:
+                    copied_state[key] = _jsonable_trace_value(value)
+            if copied_state:
+                sample["object_state"] = copied_state
+            if object_state.get("handle_pos") is not None:
+                try:
+                    handle_pos = np.asarray(object_state.get("handle_pos"), dtype=np.float64).reshape(3)
+                    if np.isfinite(handle_pos).all():
+                        sample["handle_pos"] = handle_pos.astype(float).tolist()
+                except Exception:  # noqa: BLE001
+                    pass
     return sample
 
 
@@ -4642,7 +5841,11 @@ def _should_log_chunk_trajectory_trace(
         or optimized_known
         or chunk_delta > float(eps)
         or mode in {
+            "horizon_brake",
             "path_consistent_brake",
+            "path_consistent_brake_slowdown",
+            "path_consistent_brake_intended_step",
+            "unverified_emergency_failsafe",
             "pause_on_unsafe",
             "pause_and_restart",
             "horizon_deform",
@@ -4657,7 +5860,10 @@ def _should_log_chunk_trajectory_trace(
             "explicit_recover_deform",
             "explicit_return_deform",
             "committed_explicit_recovery",
+            "horizon_brake",
             "path_consistent_brake",
+            "path_consistent_brake_slowdown",
+            "unverified_emergency_failsafe",
             "sequential_oscbf_fallback",
         }
     )
@@ -4687,21 +5893,65 @@ def _collect_chunk_trajectory_trace(
     generated_chunk,
     safety_info: dict,
     human_sample=None,
+    policy_anchor_sample=None,
 ):
     try:
         nominal, _ = _as_chunk(nominal_chunk)
         generated, _ = _as_chunk(generated_chunk)
         nominal_q = safechunk.rollout_nominal_chunk(obs, nominal)
         nominal_eval = safechunk.evaluate_horizon_safety(obs, nominal_q)
-        braked_chunk, brake_info = safechunk.path_consistent_brake(
-            obs,
-            nominal,
-            nominal_eval,
-        )
-        braked_q = safechunk.rollout_nominal_chunk(obs, braked_chunk)
-        brake_eval = safechunk.evaluate_horizon_safety(obs, braked_q)
         generated_q = safechunk.rollout_nominal_chunk(obs, generated)
         generated_eval = safechunk.evaluate_horizon_safety(obs, generated_q)
+
+        # The controller executes only the first row of each ACT chunk before
+        # replanning. Keep trajectory trace payloads aligned with that
+        # receding-horizon execution contract; full-horizon rollouts are used
+        # only internally for safety evaluation above.
+        nominal_exec = nominal[:1].copy()
+        generated_exec = generated[:1].copy()
+        nominal_exec_q = safechunk.rollout_nominal_chunk(obs, nominal_exec)
+        generated_exec_q = safechunk.rollout_nominal_chunk(obs, generated_exec)
+        nominal_exec_eval = _sliced_safety_eval(nominal_eval, 0, 1)
+        generated_exec_eval = _sliced_safety_eval(generated_eval, 0, 1)
+
+        retiming_source = (
+            _safe_info_get(safety_info, "retiming_source")
+            or _safe_info_get(safety_info, "deformation_source")
+            or _safe_info_get(safety_info, "safety_mode")
+            or _safe_info_get(safety_info, "mode")
+        )
+        if retiming_source in {
+            "path_consistent_brake",
+            "path_consistent_brake_slowdown",
+            "unverified_emergency_failsafe",
+        }:
+            braked_chunk = generated.copy()
+            braked_q = generated_q
+            braked_exec = generated_exec.copy()
+            braked_exec_q = generated_exec_q
+            brake_eval = generated_eval
+            brake_exec_eval = generated_exec_eval
+            brake_info = {
+                "brake_trace_source": "generated_safe_chunk",
+                "brake_trace_reason": str(retiming_source),
+                "brake_safe": bool(generated_eval.get("horizon_safe", False))
+                if isinstance(generated_eval, dict)
+                else None,
+                "brake_min_clearance": generated_eval.get("min_clearance")
+                if isinstance(generated_eval, dict)
+                else None,
+            }
+        else:
+            braked_chunk, brake_info = safechunk.horizon_brake(
+                obs,
+                nominal,
+                nominal_eval,
+            )
+            braked_q = safechunk.rollout_nominal_chunk(obs, braked_chunk)
+            brake_eval = safechunk.evaluate_horizon_safety(obs, braked_q)
+            braked_exec = braked_chunk[:1].copy()
+            braked_exec_q = safechunk.rollout_nominal_chunk(obs, braked_exec)
+            brake_exec_eval = _sliced_safety_eval(brake_eval, 0, 1)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Chunk trajectory trace collection failed: %s", exc)
         return None
@@ -4710,31 +5960,50 @@ def _collect_chunk_trajectory_trace(
     traces = {
         "nominal": _state_trace_payload(
             "nominal",
-            nominal_q,
-            nominal,
+            nominal_exec_q,
+            nominal_exec,
             horizon_operator,
             include_q,
-            nominal_eval,
+            nominal_exec_eval,
         ),
         "braking": _state_trace_payload(
             "braking",
-            braked_q,
-            braked_chunk,
+            braked_exec_q,
+            braked_exec,
             horizon_operator,
             include_q,
-            brake_eval,
+            brake_exec_eval,
         ),
         "generated": _state_trace_payload(
             "generated",
-            generated_q,
-            generated,
+            generated_exec_q,
+            generated_exec,
             horizon_operator,
             include_q,
-            generated_eval,
+            generated_exec_eval,
         ),
     }
 
-    total = int(generated.shape[0]) if generated.ndim == 2 else 0
+    executed_policy_sample = None
+    generated_payload = traces.get("generated", {})
+    generated_ee = generated_payload.get("ee_xyz") if isinstance(generated_payload, dict) else None
+    if generated_ee:
+        executed_policy_sample = {
+            "episode": int(episode),
+            "step": int(step + 1),
+            "planning_step": int(step),
+            "horizon_index": 0,
+            "source": "transformed_safe_action_sequence",
+            "ee_pos": _jsonable_trace_value(generated_ee[0]),
+            "action": _jsonable_trace_value(generated_exec[0]) if generated_exec.shape[0] else None,
+        }
+        if include_q and isinstance(generated_payload, dict):
+            q_seq_payload = generated_payload.get("q_seq")
+            if q_seq_payload:
+                executed_policy_sample["q"] = _jsonable_trace_value(q_seq_payload[0])
+
+    planned_total = int(generated.shape[0]) if generated.ndim == 2 else 0
+    total = int(generated_exec.shape[0]) if generated_exec.ndim == 2 else 0
     deform_len = _segment_len_from_info(
         safety_info,
         "deform_chunk_length",
@@ -4769,26 +6038,26 @@ def _collect_chunk_trajectory_trace(
     if deform_len > 0:
         traces["deformed"] = _state_trace_payload(
             "deformed",
-            np.asarray(generated_q, dtype=np.float32)[:deform_len],
-            generated[:deform_len],
+            np.asarray(generated_exec_q, dtype=np.float32)[:deform_len],
+            generated_exec[:deform_len],
             horizon_operator,
             include_q,
-            _sliced_safety_eval(generated_eval, 0, deform_len),
+            _sliced_safety_eval(generated_exec_eval, 0, deform_len),
         )
     if recover_len > 0:
         end = recover_start + recover_len
         traces["recovery"] = _state_trace_payload(
             "recovery",
-            np.asarray(generated_q, dtype=np.float32)[recover_start:end],
-            generated[recover_start:end],
+            np.asarray(generated_exec_q, dtype=np.float32)[recover_start:end],
+            generated_exec[recover_start:end],
             horizon_operator,
             include_q,
-            _sliced_safety_eval(generated_eval, recover_start, end),
+            _sliced_safety_eval(generated_exec_eval, recover_start, end),
         )
 
     horizon = max(
-        int(np.asarray(nominal_q).shape[0]),
-        int(np.asarray(generated_q).shape[0]),
+        int(np.asarray(nominal_exec_q).shape[0]),
+        int(np.asarray(generated_exec_q).shape[0]),
     )
     record = {
         "episode": int(episode),
@@ -4809,7 +6078,10 @@ def _collect_chunk_trajectory_trace(
             "recover": int(recover_len),
             "recover_start": int(recover_start),
             "total": int(total),
+            "planned_total": int(planned_total),
         },
+        "executed_action_horizon": int(total),
+        "planned_action_horizon": int(planned_total),
         "controlled_state_indices": _jsonable_trace_value(
             getattr(safechunk, "controlled_state_indices", None)
         ),
@@ -4818,6 +6090,8 @@ def _collect_chunk_trajectory_trace(
         ),
         "traces": traces,
         "human_arm_sample": _jsonable_trace_value(human_sample),
+        "policy_anchor_sample": _jsonable_trace_value(policy_anchor_sample),
+        "executed_policy_sample": _jsonable_trace_value(executed_policy_sample),
         "human_capsule_prediction": _horizon_human_capsule_trace(
             horizon_operator,
             obs,
@@ -5004,6 +6278,855 @@ def _save_chunk_trajectory_plot(
     plt.close(fig)
     return str(path)
 
+
+def _record_uses_receding_first_action(record: dict, trace_payload=None) -> bool:
+    horizon = record.get("executed_action_horizon")
+    if horizon is not None:
+        try:
+            return int(horizon) == 1
+        except Exception:  # noqa: BLE001
+            return False
+    if isinstance(trace_payload, dict):
+        shape = trace_payload.get("action_shape")
+        if isinstance(shape, list) and shape:
+            try:
+                return int(shape[0]) > 1
+            except Exception:  # noqa: BLE001
+                return False
+    return False
+
+
+def _trace_first_xyz(trace_payload):
+    arr = _trace_xyz_array(trace_payload)
+    if arr is None or arr.shape[0] < 1:
+        return None
+    first = np.asarray(arr[0], dtype=np.float64).reshape(3)
+    if not np.isfinite(first).all():
+        return None
+    return first
+
+
+def _trajectory_sample_segments(samples: list[dict], point_key: str, label_prefix: str):
+    grouped: dict[int, list[tuple[int, list[float]]]] = {}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        point = sample.get(point_key)
+        if point is None:
+            continue
+        try:
+            arr = np.asarray(point, dtype=np.float64).reshape(3)
+        except Exception:  # noqa: BLE001
+            continue
+        if not np.isfinite(arr).all():
+            continue
+        episode = int(sample.get("episode", 0))
+        step = int(sample.get("step", 0))
+        grouped.setdefault(episode, []).append((step, arr.astype(float).tolist()))
+
+    segments = []
+    for episode, items in sorted(grouped.items()):
+        items = sorted(items, key=lambda item: item[0])
+        if not items:
+            continue
+        segments.append({"label": f"{label_prefix} episode {episode:03d}", "points": [point for _step, point in items], "steps": [int(step) for step, _point in items]})
+    return segments
+
+
+def _trajectory_trace_segments(trace_records: list[dict], trace_name: str, label_prefix: str, max_events: int):
+    selected = trace_records
+    if max_events > 0 and len(selected) > max_events:
+        selected = selected[-max_events:]
+
+    segments = []
+    receding_points: dict[int, list[tuple[int, list[float]]]] = {}
+    for record in selected:
+        if not isinstance(record, dict):
+            continue
+        traces = record.get("traces", {})
+        if not isinstance(traces, dict):
+            continue
+        arr = _trace_xyz_array(traces.get(trace_name))
+        if arr is None or arr.shape[0] < 1:
+            continue
+        episode = int(record.get("episode", 0))
+        step = int(record.get("step", 0))
+        if _record_uses_receding_first_action(record, traces.get(trace_name)):
+            receding_points.setdefault(episode, []).append((step + 1, arr[0].astype(float).tolist()))
+            continue
+        segments.append(
+            {
+                "label": f"{label_prefix} e{episode:03d} step {step}",
+                "points": arr.astype(float).tolist(),
+                "episode": episode,
+                "step": step,
+                "steps": [int(step + offset) for offset in range(arr.shape[0])],
+                "horizon_steps": [int(offset) for offset in range(arr.shape[0])],
+            }
+        )
+    for episode, items in sorted(receding_points.items()):
+        items = sorted(items, key=lambda item: item[0])
+        if not items:
+            continue
+        segments.append(
+            {
+                "label": f"{label_prefix} executed first-action episode {episode:03d}",
+                "points": [point for _step, point in items],
+                "episode": episode,
+                "step": int(items[0][0]),
+                "steps": [int(step) for step, _point in items],
+                "horizon_steps": [0 for _step, _point in items],
+                "trace_source": "executed_first_action",
+            }
+        )
+    return segments
+
+
+def _braking_trajectory_segments(trace_records: list[dict], max_events: int):
+    selected = trace_records
+    if max_events > 0 and len(selected) > max_events:
+        selected = selected[-max_events:]
+
+    segments = []
+    receding_points: dict[tuple[int, str], list[tuple[int, list[float]]]] = {}
+    for record in selected:
+        if not isinstance(record, dict):
+            continue
+        traces = record.get("traces", {})
+        if not isinstance(traces, dict):
+            continue
+        source = (
+            record.get("deformation_source")
+            or record.get("retiming_source")
+            or record.get("safety_mode")
+            or record.get("mode")
+        )
+        trace = traces.get("braking")
+        trace_source = "braking"
+        if (
+            source in {
+                "path_consistent_brake",
+                "path_consistent_brake_slowdown",
+                "unverified_emergency_failsafe",
+            }
+            and isinstance(traces.get("generated"), dict)
+        ):
+            trace = traces.get("generated")
+            trace_source = "generated_safe_first_action"
+        arr = _trace_xyz_array(trace)
+        if arr is None or arr.shape[0] < 1:
+            continue
+        episode = int(record.get("episode", 0))
+        step = int(record.get("step", 0))
+        if _record_uses_receding_first_action(record, trace):
+            receding_points.setdefault((episode, trace_source), []).append((step + 1, arr[0].astype(float).tolist()))
+            continue
+        segments.append(
+            {
+                "label": f"braking e{episode:03d} step {step}",
+                "points": arr.astype(float).tolist(),
+                "episode": episode,
+                "step": step,
+                "steps": [int(step + offset) for offset in range(arr.shape[0])],
+                "horizon_steps": [int(offset) for offset in range(arr.shape[0])],
+                "trace_source": trace_source,
+            }
+        )
+    for (episode, trace_source), items in sorted(receding_points.items()):
+        items = sorted(items, key=lambda item: item[0])
+        if not items:
+            continue
+        segments.append(
+            {
+                "label": f"braking executed first-action episode {episode:03d}",
+                "points": [point for _step, point in items],
+                "episode": episode,
+                "step": int(items[0][0]),
+                "steps": [int(step) for step, _point in items],
+                "horizon_steps": [0 for _step, _point in items],
+                "trace_source": trace_source,
+            }
+        )
+    return segments
+
+
+def _segment_timestep_labels(segment: dict, count: int):
+    raw_steps = segment.get("steps")
+    steps = raw_steps if isinstance(raw_steps, list) else []
+    raw_horizon_steps = segment.get("horizon_steps")
+    horizon_steps = raw_horizon_steps if isinstance(raw_horizon_steps, list) else []
+    labels = []
+    for idx in range(count):
+        parts = []
+        if idx < len(steps):
+            parts.append(f"timestep {steps[idx]}")
+        elif segment.get("step") is not None:
+            parts.append(f"timestep {int(segment['step']) + idx}")
+        else:
+            parts.append(f"timestep {idx}")
+        if idx < len(horizon_steps):
+            parts.append(f"horizon {horizon_steps[idx]}")
+        labels.append(", ".join(parts))
+    return labels
+
+
+def _execution_mode_from_safety_info(safety_info: dict) -> str:
+    mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
+    source = _safe_info_get(safety_info, "deformation_source")
+    if mode in {None, "pass_through", "path_consistent_brake_intended_step"}:
+        return "policy"
+    if mode in {"horizon_brake", "unverified_emergency_failsafe", "pause_on_unsafe", "pause_and_restart", "stop"}:
+        return "braking"
+    if source in {"horizon_brake", "path_consistent_brake", "path_consistent_brake_slowdown"}:
+        return "braking"
+    if mode in {"horizon_deform", "chunk_deform", "deform_safe_prefix", "emergency_deform_away"} or source in {"chunk_deform", "explicit_recover_deform", "explicit_return_deform"}:
+        return "deform"
+    if mode in {"recover", "recover_safe_prefix", "committed_explicit_recovery"} or source == "committed_explicit_recovery":
+        return "recover"
+    if mode in {"phase_reanchor", "sequential_oscbf"}:
+        return str(mode)
+    return "intervention"
+
+
+def _execution_group_from_mode(mode: str) -> str:
+    return "policy" if str(mode) in {"policy", "pass_through", "initial"} else "intervention"
+
+
+def _annotate_executed_trajectory_sample(sample: dict, safety_info: dict | None, *, initial: bool = False):
+    if sample is None:
+        return None
+    info = safety_info if isinstance(safety_info, dict) else {}
+    mode = "policy" if initial else _execution_mode_from_safety_info(info)
+    sample.update(
+        {
+            "execution_mode": mode,
+            "execution_group": _execution_group_from_mode(mode),
+            "safety_mode": "initial" if initial else _safe_info_get(info, "safety_mode"),
+            "deformation_source": None if initial else _safe_info_get(info, "deformation_source"),
+            "intervention_active": False if initial else _is_safety_intervention_mode(info),
+            "brake_step": False if initial else mode == "braking",
+            "deform_step": False if initial else mode == "deform",
+            "recover_step": False if initial else mode == "recover",
+        }
+    )
+    return sample
+
+
+def _execution_sample_mode(sample: dict) -> str:
+    mode = sample.get("execution_mode") or sample.get("diagnostic_step_mode") or sample.get("safety_mode")
+    if mode in {None, "act", "pass_through", "path_consistent_brake_intended_step"}:
+        return "policy"
+    if bool(sample.get("brake_step")):
+        return "braking"
+    if bool(sample.get("deform_step")):
+        return "deform"
+    if bool(sample.get("recover_step")):
+        return "recover"
+    if bool(sample.get("intervention_active")):
+        return str(mode) if str(mode) not in {"act", "pass_through"} else "intervention"
+    return str(mode) if str(mode) not in {"act", "pass_through"} else "policy"
+
+
+def _execution_sample_point(sample: dict):
+    point = sample.get("ee_pos")
+    if point is None:
+        return None
+    try:
+        arr = np.asarray(point, dtype=np.float64).reshape(3)
+    except Exception:  # noqa: BLE001
+        return None
+    if not np.isfinite(arr).all():
+        return None
+    return arr
+
+
+def _group_execution_samples_by_episode(executed_samples: list[dict]):
+    grouped: dict[int, list[dict]] = {}
+    for sample in executed_samples:
+        if not isinstance(sample, dict):
+            continue
+        point = _execution_sample_point(sample)
+        if point is None:
+            continue
+        item = dict(sample)
+        item["_point"] = point
+        item["_mode"] = _execution_sample_mode(sample)
+        item["_group"] = sample.get("execution_group") or _execution_group_from_mode(item["_mode"])
+        grouped.setdefault(int(sample.get("episode", 0)), []).append(item)
+    for episode in list(grouped):
+        grouped[episode] = sorted(grouped[episode], key=lambda sample: int(sample.get("step", 0)))
+    return grouped
+
+
+def _execution_marker_segments(executed_samples: list[dict], group: str, label: str):
+    segments = []
+    for episode, items in sorted(_group_execution_samples_by_episode(executed_samples).items()):
+        selected = [item for item in items if item.get("_group") == group]
+        if not selected:
+            continue
+        segments.append(
+            {
+                "label": f"{label} episode {episode:03d}",
+                "points": [item["_point"].astype(float).tolist() for item in selected],
+                "steps": [int(item.get("step", 0)) for item in selected],
+                "execution_modes": [str(item.get("_mode")) for item in selected],
+            }
+        )
+    return segments
+
+
+def _execution_pair_segments(executed_samples: list[dict], segment_class: str):
+    segments = []
+    for episode, items in sorted(_group_execution_samples_by_episode(executed_samples).items()):
+        for prev, curr in zip(items, items[1:]):
+            prev_group = str(prev.get("_group"))
+            curr_group = str(curr.get("_group"))
+            prev_mode = str(prev.get("_mode"))
+            curr_mode = str(curr.get("_mode"))
+            is_policy = prev_group == curr_group == "policy"
+            is_intervention = prev_group == curr_group == "intervention" and prev_mode == curr_mode
+            is_transition = prev_group != curr_group or (prev_group == curr_group == "intervention" and prev_mode != curr_mode)
+            if segment_class == "policy" and not is_policy:
+                continue
+            if segment_class == "intervention" and not is_intervention:
+                continue
+            if segment_class == "transition" and not is_transition:
+                continue
+            segments.append(
+                {
+                    "label": (
+                        f"actual execution {prev_mode}->{curr_mode} e{episode:03d} "
+                        f"steps {int(prev.get('step', 0))}-{int(curr.get('step', 0))}"
+                    ),
+                    "points": [prev["_point"].astype(float).tolist(), curr["_point"].astype(float).tolist()],
+                    "episode": episode,
+                    "step": int(prev.get("step", 0)),
+                    "steps": [int(prev.get("step", 0)), int(curr.get("step", 0))],
+                    "execution_modes": [prev_mode, curr_mode],
+                }
+            )
+    return segments
+
+
+def _drawer_reference_from_samples(executed_samples: list[dict]):
+    handle_pos = None
+    open_distance = None
+    open_fraction = None
+    scene_geometry = None
+
+    def _point_or_none(value):
+        if value is None:
+            return None
+        try:
+            arr = np.asarray(value, dtype=np.float64).reshape(3)
+        except Exception:  # noqa: BLE001
+            return None
+        return arr if np.isfinite(arr).all() else None
+
+    for sample in executed_samples:
+        if not isinstance(sample, dict):
+            continue
+        candidate = sample.get("handle_pos")
+        object_state = sample.get("object_state")
+        if candidate is None and isinstance(object_state, dict):
+            candidate = object_state.get("handle_pos")
+        if candidate is not None and handle_pos is None:
+            arr = _point_or_none(candidate)
+            if arr is not None:
+                handle_pos = arr
+
+        if scene_geometry is None:
+            value = sample.get("drawer_scene_geometry")
+            if value is None and isinstance(object_state, dict):
+                value = object_state.get("drawer_scene_geometry")
+            if isinstance(value, dict) and (value.get("cabinet") or value.get("drawer") or value.get("handle")):
+                scene_geometry = value
+
+        if open_distance is None:
+            value = sample.get("drawer_open_distance")
+            if value is None and isinstance(object_state, dict):
+                value = object_state.get("drawer_open_distance")
+            if value is not None:
+                try:
+                    open_distance = float(value)
+                except (TypeError, ValueError):
+                    pass
+        if open_fraction is None:
+            value = sample.get("drawer_open_fraction")
+            if value is None and isinstance(object_state, dict):
+                value = object_state.get("drawer_open_fraction")
+            if value is not None:
+                try:
+                    open_fraction = float(value)
+                except (TypeError, ValueError):
+                    pass
+        if scene_geometry is not None and handle_pos is not None and open_distance is not None and open_fraction is not None:
+            break
+
+    if scene_geometry is not None:
+        handle_segments = scene_geometry.get("handle") or []
+        if not handle_segments and handle_pos is not None:
+            handle_segments = _box_edge_segments_world(handle_pos, [0.025, 0.025, 0.025])
+        return {
+            "absolute": True,
+            "origin": [0.0, 0.0, 0.0],
+            "handle_pos": None if handle_pos is None else handle_pos.astype(float).tolist(),
+            "open_axis": [0.0, 0.0, 0.0],
+            "default_open": 0.0,
+            "open_fraction": None if open_fraction is None else float(open_fraction),
+            "cabinet": scene_geometry.get("cabinet") or [],
+            "drawer": scene_geometry.get("drawer") or [],
+            "handle": handle_segments,
+            "source": scene_geometry.get("source") or "mujoco_geoms",
+        }
+
+    if handle_pos is None:
+        return None
+
+    open_distance = 0.0 if open_distance is None or not np.isfinite(open_distance) else float(open_distance)
+    xml_geometry = _drawer_scene_geometry_from_cabinet_xml(handle_pos, open_distance, open_fraction)
+    if xml_geometry is not None:
+        return xml_geometry
+
+    open_axis = np.asarray([0.0, -1.0, 0.0], dtype=np.float64)
+    origin = handle_pos - open_axis * open_distance
+
+    def edges(center, size):
+        cx, cy, cz = [float(v) for v in center]
+        sx, sy, sz = [0.5 * float(v) for v in size]
+        corners = [
+            [cx + dx * sx, cy + dy * sy, cz + dz * sz]
+            for dx in (-1, 1)
+            for dy in (-1, 1)
+            for dz in (-1, 1)
+        ]
+        idx = {(dx, dy, dz): i for i, (dx, dy, dz) in enumerate((
+            (dx, dy, dz) for dx in (-1, 1) for dy in (-1, 1) for dz in (-1, 1)
+        ))}
+        pairs = []
+        for dx in (-1, 1):
+            for dy in (-1, 1):
+                pairs.append((idx[(dx, dy, -1)], idx[(dx, dy, 1)]))
+            for dz in (-1, 1):
+                pairs.append((idx[(dx, -1, dz)], idx[(dx, 1, dz)]))
+        for dy in (-1, 1):
+            for dz in (-1, 1):
+                pairs.append((idx[(-1, dy, dz)], idx[(1, dy, dz)]))
+        return [[corners[a], corners[b]] for a, b in pairs]
+
+    cabinet_segments = edges([0.0, 0.20, -0.07], [0.82, 0.48, 0.72])
+    drawer_segments = edges([0.0, 0.12, 0.0], [0.58, 0.30, 0.18])
+    front_segments = edges([0.0, 0.0, 0.0], [0.64, 0.025, 0.24])
+    handle_segments = [[[-0.16, -0.035, 0.0], [0.16, -0.035, 0.0]]]
+    return {
+        "absolute": False,
+        "origin": origin.astype(float).tolist(),
+        "handle_pos": handle_pos.astype(float).tolist(),
+        "open_axis": open_axis.astype(float).tolist(),
+        "default_open": float(open_distance),
+        "open_fraction": None if open_fraction is None else float(open_fraction),
+        "cabinet": cabinet_segments,
+        "drawer": drawer_segments + front_segments,
+        "handle": handle_segments,
+        "source": "handle_fallback",
+    }
+
+def _executed_policy_points_by_episode(executed_samples: list[dict]):
+    grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
+    for sample in executed_samples:
+        if not isinstance(sample, dict):
+            continue
+        point = sample.get("ee_pos")
+        if point is None:
+            continue
+        try:
+            arr = np.asarray(point, dtype=np.float64).reshape(3)
+        except Exception:  # noqa: BLE001
+            continue
+        if not np.isfinite(arr).all():
+            continue
+        grouped.setdefault(int(sample.get("episode", 0)), []).append(
+            (int(sample.get("step", 0)), arr)
+        )
+    return {episode: sorted(items, key=lambda item: item[0]) for episode, items in grouped.items()}
+
+
+def _record_policy_anchor_point(record: dict, executed_by_episode: dict[int, list[tuple[int, np.ndarray]]]):
+    anchor_sample = record.get("policy_anchor_sample")
+    if isinstance(anchor_sample, dict):
+        point = anchor_sample.get("ee_pos")
+        if point is not None:
+            try:
+                arr = np.asarray(point, dtype=np.float64).reshape(3)
+                if np.isfinite(arr).all():
+                    return int(anchor_sample.get("step", record.get("step", 0))), arr
+            except Exception:  # noqa: BLE001
+                pass
+
+    episode = int(record.get("episode", 0))
+    step = int(record.get("step", 0))
+    candidates = executed_by_episode.get(episode, [])
+    if not candidates:
+        return None, None
+    return min(candidates, key=lambda item: abs(item[0] - step))
+
+
+def _policy_intervention_connector_segments(trace_records: list[dict], executed_samples: list[dict], max_events: int):
+    del executed_samples
+    selected = trace_records
+    if max_events > 0 and len(selected) > max_events:
+        selected = selected[-max_events:]
+    segments = []
+    for record in selected:
+        if not isinstance(record, dict):
+            continue
+        traces = record.get("traces", {})
+        if not isinstance(traces, dict):
+            continue
+        nominal = _trace_first_xyz(traces.get("nominal"))
+        if nominal is None:
+            continue
+        episode = int(record.get("episode", 0))
+        record_step = int(record.get("step", 0))
+        objective_step = record_step + 1
+        source = (
+            record.get("deformation_source")
+            or record.get("retiming_source")
+            or record.get("safety_mode")
+            or record.get("mode")
+        )
+        for trace_name, label_prefix in (
+            ("braking", "braking"),
+            ("deformed", "deformed"),
+            ("recovery", "recovered"),
+        ):
+            trace_payload = traces.get(trace_name)
+            if (
+                trace_name == "braking"
+                and source in {
+                    "path_consistent_brake",
+                    "path_consistent_brake_slowdown",
+                    "unverified_emergency_failsafe",
+                }
+                and isinstance(traces.get("generated"), dict)
+            ):
+                trace_payload = traces.get("generated")
+            intervention = _trace_first_xyz(trace_payload)
+            if intervention is None:
+                continue
+            distance = float(np.linalg.norm(intervention - nominal))
+            segments.append(
+                {
+                    "label": (
+                        f"policy step {objective_step} to {label_prefix} e{episode:03d} "
+                        f"step {record_step} ({distance:.3f} m)"
+                    ),
+                    "points": [nominal.astype(float).tolist(), intervention.astype(float).tolist()],
+                    "episode": episode,
+                    "step": record_step,
+                    "steps": [int(objective_step), int(objective_step)],
+                    "horizon_steps": [0, 0],
+                    "connector_distance": distance,
+                    "trace_name": trace_name,
+                    "trace_source": "nominal_policy_to_intervention",
+                }
+            )
+    return segments
+
+
+def _add_plotly_segments(fig, go, segments, *, name: str, color: str, width: int, dash=None, line: bool = True, markers: bool = True):
+    first = True
+    for segment in segments:
+        points = np.asarray(segment.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if points.size == 0:
+            continue
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+        if points.size == 0:
+            continue
+        labels = _segment_timestep_labels(segment, points.shape[0])
+        line_style = {"color": color, "width": width}
+        if dash:
+            line_style["dash"] = "dash"
+        if line:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=points[:, 0],
+                    y=points[:, 1],
+                    z=points[:, 2],
+                    mode="lines",
+                    name=name if first else segment.get("label", name),
+                    legendgroup=name,
+                    showlegend=first,
+                    line=line_style,
+                    text=[segment.get("label", name)] * points.shape[0],
+                    customdata=labels,
+                    hovertemplate="%{text}<br>%{customdata}<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
+                )
+            )
+        if markers:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=points[:, 0],
+                    y=points[:, 1],
+                    z=points[:, 2],
+                    mode="markers",
+                    name=f"{name} timestep dots" if first else f"{segment.get('label', name)} timestep dots",
+                    legendgroup=f"{name} timestep dots",
+                    showlegend=first,
+                    marker={"color": color, "size": max(2, width + 1)},
+                    text=[segment.get("label", name)] * points.shape[0],
+                    customdata=labels,
+                    hovertemplate="%{text}<br>%{customdata}<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
+                )
+            )
+        first = False
+
+
+
+def _executed_policy_segments_from_traces(trace_records: list[dict], executed_samples: list[dict], max_events: int):
+    segments = _trajectory_sample_segments(executed_samples, "ee_pos", "executed policy")
+    if segments:
+        return segments
+    return _braking_trajectory_segments(trace_records, max_events)
+
+
+def _first_trace_point(trace_payload):
+    arr = _trace_xyz_array(trace_payload)
+    if arr is None or arr.shape[0] == 0:
+        return None
+    return np.asarray(arr[0], dtype=np.float64).reshape(3)
+
+
+def _trajectory_frame_diagnostics(trace_records: list[dict], executed_samples: list[dict]):
+    executed_by_step = {}
+    for sample in executed_samples:
+        if not isinstance(sample, dict):
+            continue
+        point = _execution_sample_point(sample)
+        if point is None:
+            continue
+        executed_by_step[(int(sample.get("episode", 0)), int(sample.get("step", 0)))] = point
+
+    comparisons = []
+    for record in trace_records:
+        if not isinstance(record, dict):
+            continue
+        episode = int(record.get("episode", 0))
+        step = int(record.get("step", 0))
+        anchor = record.get("policy_anchor_sample")
+        if isinstance(anchor, dict) and anchor.get("ee_pos") is not None:
+            try:
+                src = np.asarray(anchor.get("ee_pos"), dtype=np.float64).reshape(3)
+                ref = executed_by_step.get((episode, int(anchor.get("step", step))))
+                if ref is not None and np.isfinite(src).all():
+                    diff = ref - src
+                    comparisons.append({
+                        "label": "policy anchor vs MuJoCo executed same timestep",
+                        "source": str(anchor.get("source")),
+                        "episode": episode,
+                        "step": int(anchor.get("step", step)),
+                        "norm": float(np.linalg.norm(diff)),
+                        "diff": diff.astype(float).tolist(),
+                    })
+            except Exception:  # noqa: BLE001
+                pass
+        traces = record.get("traces")
+        if not isinstance(traces, dict):
+            continue
+        for name in ("generated", "braking", "deformed", "recovery"):
+            point = _first_trace_point(traces.get(name))
+            ref = executed_by_step.get((episode, step + 1))
+            if point is None or ref is None:
+                continue
+            diff = ref - point
+            comparisons.append({
+                "label": f"{name} first-action FK vs MuJoCo executed next timestep",
+                "source": str((traces.get(name) or {}).get("frame", "unknown")),
+                "episode": episode,
+                "step": int(step + 1),
+                "norm": float(np.linalg.norm(diff)),
+                "diff": diff.astype(float).tolist(),
+            })
+
+    if not comparisons:
+        return {"count": 0, "note": "No comparable safety-model FK and MuJoCo execution samples were available."}
+    norms = np.asarray([c["norm"] for c in comparisons], dtype=np.float64)
+    worst = comparisons[int(np.argmax(norms))]
+    return {
+        "count": int(len(comparisons)),
+        "mean_norm": float(np.mean(norms)),
+        "max_norm": float(np.max(norms)),
+        "worst": worst,
+        "note": "Actual execution/human/drawer layers are MuJoCo world-frame samples. Planned objective layers are safety-model FK world estimates and may not align with MuJoCo.",
+    }
+
+
+def _chunk_trajectory_viewer_layers(trace_records, human_samples, executed_samples, max_events):
+    return [
+        {"name": "actual policy pass-through segments", "color": "#111827", "width": 4, "markers": False, "segments": _execution_pair_segments(executed_samples, "policy")},
+        {"name": "actual intervention segments", "color": "#f59e0b", "width": 4, "markers": False, "segments": _execution_pair_segments(executed_samples, "intervention")},
+        {"name": "actual mode transition segments", "color": "#a855f7", "width": 3, "markers": False, "segments": _execution_pair_segments(executed_samples, "transition")},
+        {"name": "actual policy pass-through poses", "color": "#111827", "width": 5, "line": False, "segments": _execution_marker_segments(executed_samples, "policy", "actual policy pose")},
+        {"name": "actual intervention poses", "color": "#f59e0b", "width": 5, "line": False, "segments": _execution_marker_segments(executed_samples, "intervention", "actual intervention pose")},
+        {"name": "human arm wrist joint trajectory", "color": "#d62728", "width": 4, "segments": _trajectory_sample_segments(human_samples, "wrist_pos", "human wrist")},
+        {"name": "planned braking first-action objective (safety-model FK)", "color": "#fbbf24", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _braking_trajectory_segments(trace_records, max_events)},
+        {"name": "planned deformed first-action objective (safety-model FK)", "color": "#2563eb", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _trajectory_trace_segments(trace_records, "deformed", "deformed", max_events)},
+        {"name": "planned recovered first-action objective (safety-model FK)", "color": "#16a34a", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _trajectory_trace_segments(trace_records, "recovery", "recovered", max_events)},
+    ]
+
+
+def _save_chunk_trajectory_canvas_viewer(path: Path, title: str, trace_records: list[dict], human_samples: list[dict], executed_samples: list[dict], max_events: int):
+    layers = _chunk_trajectory_viewer_layers(trace_records, human_samples, executed_samples, max_events)
+    if not any(segment.get("points") for layer in layers for segment in layer.get("segments", [])):
+        return None
+    payload = {
+        "title": title,
+        "layers": layers,
+        "drawerReference": _drawer_reference_from_samples(executed_samples),
+        "frameDiagnostics": _trajectory_frame_diagnostics(trace_records, executed_samples),
+    }
+    payload_json = json.dumps(_jsonable_trace_value(payload), separators=(",", ":"))
+    template = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SafeChunk 3D Trajectory Viewer</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;font-family:Arial,sans-serif;background:transparent;color:#151515}
+canvas{position:fixed;inset:0;width:100vw;height:100vh;background:transparent}
+.panel{position:fixed;left:14px;top:14px;width:min(430px,calc(100vw - 28px));max-height:calc(100vh - 28px);overflow:auto;background:rgba(255,255,255,.92);border:1px solid #d6d2c8;border-radius:8px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.14)}
+.panel[hidden]{display:none}.panel-tab{position:fixed;left:14px;top:14px;z-index:2}
+.legend{position:fixed;right:14px;bottom:14px;max-width:min(340px,calc(100vw - 28px));background:rgba(255,255,255,.84);border:1px solid #d6d2c8;border-radius:8px;padding:8px 10px;font-size:12px;color:#1f2937;box-shadow:0 8px 24px rgba(0,0,0,.12);pointer-events:none}
+.legend[hidden]{display:none}.legend-title{font-weight:600;margin-bottom:5px}.legend-row{display:grid;grid-template-columns:24px 1fr auto;gap:7px;align-items:center;margin:3px 0}.legend-line{height:0;border-top:2px solid currentColor}.legend-count{color:#666}
+h1{font-size:16px;margin:0 0 8px}.hint{font-size:12px;color:#555;line-height:1.35;margin-bottom:8px}
+.dot-toggle{display:flex;align-items:center;gap:8px;border-top:1px solid #ebe7dd;margin-top:2px;padding:8px 0 4px;font-size:13px}
+.layer{border-top:1px solid #ebe7dd;padding:7px 0;font-size:13px}.layer-main{display:grid;grid-template-columns:18px 18px 1fr auto;gap:8px;align-items:center}.layer-style{display:grid;grid-template-columns:52px 1fr 42px;gap:8px;align-items:center;margin:6px 0 0 44px}.layer-style input[type=color]{width:100%;height:24px;padding:0;border:1px solid #c8c3b8;background:white}.layer-style input[type=range]{width:100%}
+.sw{width:14px;height:14px;border-radius:50%;border:1px solid rgba(0,0,0,.24)}
+button{border:1px solid #c8c3b8;background:white;border-radius:6px;padding:6px 9px;margin:2px 4px 8px 0;cursor:pointer}.count{font-size:12px;color:#666}
+.drawer-controls{border-top:1px solid #ebe7dd;margin-top:4px;padding:8px 0;font-size:13px}.drawer-controls h2{font-size:13px;margin:0 0 6px}.drawer-control{display:grid;grid-template-columns:58px 1fr 48px;gap:8px;align-items:center;margin:5px 0}.drawer-control input{width:100%}
+.frame-diagnostics{border-top:1px solid #ebe7dd;margin-top:4px;padding:8px 0;font-size:12px;color:#374151;line-height:1.35}.frame-diagnostics strong{color:#111827}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<button id="showPanel" class="panel-tab" hidden>Show panel</button>
+<div id="legend" class="legend" hidden></div>
+<section id="panel" class="panel">
+<h1 id="title"></h1>
+<div class="hint">Choose Orbit or Pan, then left-drag. Mouse wheel zooms. Arrow keys pan; A/D and W/S orbit. Controls are remembered in this browser tab even if VS Code reloads the HTML.</div>
+<button id="reset">Reset view</button><button id="shot">Download screenshot</button><button id="hidePanel">Hide panel</button><button id="clearSettings">Reset controls</button>
+<label class="dot-toggle"><input id="dots" type="checkbox" checked> Timestep dots</label>
+<label class="dot-toggle"><input id="pauseRedraw" type="checkbox"> Pause redraw while editing</label>
+<label class="dot-toggle">Drag mode <select id="dragMode"><option value="orbit">Orbit</option><option value="pan">Pan</option></select></label>
+<div id="frameDiagnostics" class="frame-diagnostics" hidden></div>
+<div id="drawerControls" class="drawer-controls"></div>
+<div id="layers"></div>
+</section>
+<script>
+const DATA=__DATA__;
+const canvas=document.getElementById("view"),ctx=canvas.getContext("2d"),vis=new Map(),styles=new Map(),drawerRef=DATA.drawerReference||null;
+const STORE_KEY="safechunk_trajectory_viewer:"+location.pathname;
+let savedState={};try{savedState=JSON.parse(localStorage.getItem(STORE_KEY)||"{}")}catch(_e){savedState={}}
+let showDots=savedState.showDots!==undefined?!!savedState.showDots:true,drawDrawer=savedState.drawDrawer!==undefined?!!savedState.drawDrawer:!!drawerRef,drawerOffset=Array.isArray(savedState.drawerOffset)?savedState.drawerOffset.slice(0,3):[0,0,0],drawerOpen=savedState.drawerOpen!==undefined?Number(savedState.drawerOpen):(drawerRef?drawerRef.default_open:0),dragMode=savedState.dragMode||"orbit",panelHidden=!!savedState.panelHidden,pauseRedraw=false,yaw=-.85,pitch=.48,dist=1,target=[0,0,0],drag=false,pan=false,lx=0,ly=0;
+while(drawerOffset.length<3)drawerOffset.push(0);
+function add(a,b){return[a[0]+b[0],a[1]+b[1],a[2]+b[2]]}function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]]}function mul(a,s){return[a[0]*s,a[1]*s,a[2]*s]}function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]}function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}function len(a){return Math.sqrt(Math.max(1e-18,dot(a,a)))}function norm(a){return mul(a,1/len(a))}
+function serialize(){const layerVis={},layerStyles={};for(const [k,v] of vis.entries())layerVis[k]=v;for(const [k,v] of styles.entries())layerStyles[k]=v;return{showDots,drawDrawer,drawerOffset,drawerOpen,dragMode,panelHidden,layerVis,layerStyles}}
+function saveSettings(){try{localStorage.setItem(STORE_KEY,JSON.stringify(serialize()))}catch(_e){}}
+function maybeDraw(){saveSettings();if(!pauseRedraw)draw()}
+function allPts(){const out=[];for(const l of DATA.layers)for(const s of l.segments)for(const p of s.points)out.push(p);if(drawerRef){for(const k of ["cabinet","drawer","handle"])for(const seg of drawerRef[k]||[])for(const p of seg)out.push(drawerPointRaw(p,k!=="cabinet"))}return out}
+function bounds(){const pts=allPts();if(!pts.length)return{c:[0,0,0],r:1};const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];for(const p of pts)for(let i=0;i<3;i++){mn[i]=Math.min(mn[i],p[i]);mx[i]=Math.max(mx[i],p[i])}return{c:[(mn[0]+mx[0])/2,(mn[1]+mx[1])/2,(mn[2]+mx[2])/2],r:Math.max(.05,Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])/2)}}
+let box;
+function reset(){box=bounds();target=box.c.slice();dist=Math.max(.25,box.r*3.2);yaw=-.85;pitch=.48;draw()}
+function cam(){const cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw),pos=[target[0]+dist*cp*cy,target[1]+dist*cp*sy,target[2]+dist*sp],f=norm(sub(target,pos));let r=cross(f,[0,0,1]);r=len(r)<1e-5?[1,0,0]:norm(r);return{pos:pos,f:f,r:r,u:norm(cross(r,f))}}
+function proj(p,c){const rel=sub(p,c.pos),z=dot(rel,c.f);if(z<=1e-5)return null;const q=Math.min(canvas.width,canvas.height)*.82;return{x:canvas.width/2+dot(rel,c.r)*q/z,y:canvas.height/2-dot(rel,c.u)*q/z}}
+function line(points,color,w,c,dash){ctx.save();ctx.strokeStyle=color;ctx.lineWidth=w;ctx.lineJoin="round";ctx.lineCap="round";if(dash)ctx.setLineDash(dash.map(v=>v*(window.devicePixelRatio||1)));let on=false;for(const p of points){const q=proj(p,c);if(!q){on=false;continue}if(!on){ctx.beginPath();ctx.moveTo(q.x,q.y);on=true}else ctx.lineTo(q.x,q.y)}if(on)ctx.stroke();ctx.restore()}
+function point(p,color,r,c){const q=proj(p,c);if(!q)return;ctx.fillStyle=color;ctx.beginPath();ctx.arc(q.x,q.y,r,0,Math.PI*2);ctx.fill()}
+function defaultLayerStyle(layer){return{color:layer.color,width:.5,pointSize:1}}
+function layerStyle(layer){return styles.get(layer.name)||defaultLayerStyle(layer)}
+function drawerPointRaw(p,move){if(!drawerRef)return p;if(drawerRef.absolute)return[p[0]+drawerOffset[0],p[1]+drawerOffset[1],p[2]+drawerOffset[2]];const o=drawerRef.origin,a=drawerRef.open_axis,m=move?drawerOpen:0;return[o[0]+drawerOffset[0]+p[0]+a[0]*m,o[1]+drawerOffset[1]+p[1]+a[1]*m,o[2]+drawerOffset[2]+p[2]+a[2]*m]}
+function drawerPoint(p,move){return drawerPointRaw(p,move)}function drawerSegs(segs,color,w,c,move){for(const seg of segs)line(seg.map(p=>drawerPoint(p,move)),color,w,c)}
+function drawDrawerRef(c){if(!drawerRef||!drawDrawer)return;const dpr=window.devicePixelRatio||1;drawerSegs(drawerRef.cabinet||[],styles.get("__drawer_cabinet").color,styles.get("__drawer_cabinet").width*dpr,c,false);drawerSegs(drawerRef.drawer||[],styles.get("__drawer_box").color,styles.get("__drawer_box").width*dpr,c,true);drawerSegs(drawerRef.handle||[],styles.get("__drawer_handle").color,styles.get("__drawer_handle").width*dpr,c,true);const hp=drawerRef.absolute?drawerRef.handle_pos:[0,0,0];if(hp)point(drawerPoint(hp,!drawerRef.absolute),styles.get("__drawer_handle").color,styles.get("__drawer_handle").pointSize*dpr,c)}
+function draw(){const dpr=window.devicePixelRatio||1,w=Math.max(1,Math.floor(innerWidth*dpr)),h=Math.max(1,Math.floor(innerHeight*dpr));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}ctx.clearRect(0,0,w,h);const c=cam();for(const layer of DATA.layers){if(!vis.get(layer.name))continue;const st=layerStyle(layer);for(const seg of layer.segments){if(layer.line!==false)line(seg.points,st.color,st.width*dpr,c,layer.dash);if(showDots&&layer.markers!==false)for(const p of seg.points)point(p,st.color,st.pointSize*dpr,c)}}drawDrawerRef(c);updateLegend()}
+function styleRow(label,value,min,max,step,onInput){const row=document.createElement("label");row.className="layer-style";const name=document.createElement("span");name.textContent=label;const input=document.createElement("input");input.type="range";input.min=min;input.max=max;input.step=step;input.value=value;const val=document.createElement("span");val.textContent=(+value).toFixed(1);input.oninput=()=>{val.textContent=(+input.value).toFixed(1);onInput(+input.value);maybeDraw()};row.append(name,input,val);return row}
+function colorRow(value,onInput){const row=document.createElement("label");row.className="layer-style";const name=document.createElement("span");name.textContent="Color";const input=document.createElement("input");input.type="color";input.value=value;const val=document.createElement("span");val.textContent="";input.oninput=()=>{onInput(input.value);maybeDraw()};row.append(name,input,val);return row}
+function updateLegend(){const root=document.getElementById("legend");if(!root)return;const rows=[];for(const layer of DATA.layers){if(!vis.get(layer.name)||!layer.segments.length)continue;const st=layerStyle(layer);rows.push({name:layer.name,color:st.color,count:layer.segments.length})}if(drawerRef&&drawDrawer)rows.push({name:"drawer reference",color:styles.get("__drawer_box")?styles.get("__drawer_box").color:"#0f766e",count:(drawerRef.drawer||[]).length+(drawerRef.cabinet||[]).length});if(!rows.length){root.hidden=true;return}root.hidden=false;root.innerHTML="<div class=\"legend-title\">Legend</div>"+rows.map(r=>"<div class=\"legend-row\"><span class=\"legend-line\" style=\"color:"+r.color+"\"></span><span>"+r.name+"</span><span class=\"legend-count\">"+r.count+"</span></div>").join("")}
+function setupLayerControls(){const root=document.getElementById("layers");for(const layer of DATA.layers){const st={...defaultLayerStyle(layer),...((savedState.layerStyles||{})[layer.name]||{})};styles.set(layer.name,st);const defaultVisible=layer.visible!==false&&!layer.name.toLowerCase().includes("objective");const visible=(savedState.layerVis&&savedState.layerVis[layer.name]!==undefined)?!!savedState.layerVis[layer.name]:defaultVisible;vis.set(layer.name,visible);const row=document.createElement("div");row.className="layer";const main=document.createElement("label");main.className="layer-main";const cb=document.createElement("input");cb.type="checkbox";cb.checked=visible;cb.onchange=()=>{vis.set(layer.name,cb.checked);maybeDraw()};const sw=document.createElement("span");sw.className="sw";sw.style.background=st.color;const nm=document.createElement("span");nm.textContent=layer.name;const ct=document.createElement("span");ct.className="count";ct.textContent=layer.segments.length+" seg";main.append(cb,sw,nm,ct);row.appendChild(main);row.appendChild(colorRow(st.color,v=>{st.color=v;sw.style.background=v}));row.appendChild(styleRow("Line",st.width,.1,12,.1,v=>st.width=v));row.appendChild(styleRow("Dots",st.pointSize,.5,14,.5,v=>st.pointSize=v));root.appendChild(row)}}
+function setupFrameDiagnostics(){const root=document.getElementById("frameDiagnostics"),d=DATA.frameDiagnostics;if(!root||!d)return;if(!d.count){root.textContent=d.note||"No frame diagnostics available.";root.hidden=false;return}const w=d.worst||{};root.innerHTML="<strong>Frame check</strong><br>MuJoCo world execution vs safety-model FK: mean "+Number(d.mean_norm||0).toFixed(4)+" m, max "+Number(d.max_norm||0).toFixed(4)+" m over "+d.count+" comparisons.<br>Worst: "+(w.label||"unknown")+" at timestep "+(w.step??"?")+", diff ["+((w.diff||[]).map(v=>Number(v).toFixed(4)).join(", "))+"] m.<br>"+(d.note||"");root.hidden=false}
+function setupDrawerControls(){const saved=savedState.layerStyles||{};styles.set("__drawer_cabinet",{color:"#64748b",width:.5,pointSize:1,...(saved.__drawer_cabinet||{})});styles.set("__drawer_box",{color:"#0f766e",width:.5,pointSize:1,...(saved.__drawer_box||{})});styles.set("__drawer_handle",{color:"#111827",width:.5,pointSize:1,...(saved.__drawer_handle||{})});const root=document.getElementById("drawerControls");if(!root)return;if(!drawerRef){root.hidden=true;return}root.innerHTML="<h2>Drawer reference</h2>";const visible=document.createElement("label");visible.className="dot-toggle";visible.innerHTML="<input type='checkbox'> Show drawer";visible.querySelector("input").checked=drawDrawer;visible.querySelector("input").onchange=e=>{drawDrawer=e.target.checked;maybeDraw()};root.appendChild(visible);for(const key of [["__drawer_cabinet","Cabinet"],["__drawer_box","Drawer"],["__drawer_handle","Handle"]]){const st=styles.get(key[0]);root.appendChild(colorRow(st.color,v=>st.color=v));root.lastChild.firstChild.textContent=key[1];root.appendChild(styleRow("Line",st.width,.1,12,.1,v=>st.width=v))}const defs=drawerRef.absolute?[["x","X",-0.35,0.35,drawerOffset[0]],["y","Y",-0.35,0.35,drawerOffset[1]],["z","Z",-0.25,0.25,drawerOffset[2]]]:[["open","Open",-0.05,0.55,drawerOpen],["x","X",-0.35,0.35,drawerOffset[0]],["y","Y",-0.35,0.35,drawerOffset[1]],["z","Z",-0.25,0.25,drawerOffset[2]]];for(const d of defs){const row=document.createElement("label");row.className="drawer-control";const name=document.createElement("span");name.textContent=d[1];const slider=document.createElement("input");slider.type="range";slider.min=d[2];slider.max=d[3];slider.step=.005;slider.value=d[4];const val=document.createElement("span");val.textContent=(+slider.value).toFixed(3);slider.oninput=()=>{const v=+slider.value;val.textContent=v.toFixed(3);if(d[0]==="open")drawerOpen=v;else drawerOffset[{x:0,y:1,z:2}[d[0]]]=v;maybeDraw()};row.append(name,slider,val);root.appendChild(row)}}
+function setPanelHidden(hidden){panelHidden=!!hidden;document.getElementById("panel").hidden=panelHidden;document.getElementById("showPanel").hidden=!panelHidden;saveSettings()}
+function setup(){document.getElementById("title").textContent=DATA.title||"SafeChunk 3D trajectories";const dots=document.getElementById("dots");dots.checked=showDots;dots.onchange=e=>{showDots=e.target.checked;maybeDraw()};const mode=document.getElementById("dragMode");mode.value=dragMode;mode.onchange=e=>{dragMode=e.target.value;saveSettings()};document.getElementById("pauseRedraw").onchange=e=>{pauseRedraw=e.target.checked;if(!pauseRedraw)draw()};document.getElementById("clearSettings").onclick=()=>{localStorage.removeItem(STORE_KEY);location.reload()};setupFrameDiagnostics();setupDrawerControls();setupLayerControls();setPanelHidden(panelHidden);document.getElementById("hidePanel").onclick=()=>setPanelHidden(true);document.getElementById("showPanel").onclick=()=>setPanelHidden(false)}
+canvas.onmousedown=e=>{drag=true;pan=dragMode==="pan"||e.shiftKey||e.button===2;lx=e.clientX;ly=e.clientY};canvas.oncontextmenu=e=>e.preventDefault();window.onmouseup=()=>drag=false;window.onmousemove=e=>{if(!drag)return;const dx=e.clientX-lx,dy=e.clientY-ly;lx=e.clientX;ly=e.clientY;if(pan){const c=cam(),f=dist/Math.max(300,Math.min(canvas.width,canvas.height));target=add(target,add(mul(c.r,-dx*f),mul(c.u,dy*f)))}else{yaw+=dx*.006;pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*.006))}draw()};window.onkeydown=e=>{if(["INPUT","SELECT","TEXTAREA"].includes(document.activeElement&&document.activeElement.tagName))return;const c=cam(),step=dist*.045;let used=true;if(e.key==="ArrowLeft")target=add(target,mul(c.r,-step));else if(e.key==="ArrowRight")target=add(target,mul(c.r,step));else if(e.key==="ArrowUp")target=add(target,mul(c.u,step));else if(e.key==="ArrowDown")target=add(target,mul(c.u,-step));else if(e.key==="a"||e.key==="A")yaw-=.08;else if(e.key==="d"||e.key==="D")yaw+=.08;else if(e.key==="w"||e.key==="W")pitch=Math.max(-1.45,Math.min(1.45,pitch+.08));else if(e.key==="s"||e.key==="S")pitch=Math.max(-1.45,Math.min(1.45,pitch-.08));else used=false;if(used){e.preventDefault();draw()}};canvas.onwheel=e=>{e.preventDefault();dist=Math.max(.03,dist*Math.exp(e.deltaY*.001));draw()};window.onresize=()=>{if(!pauseRedraw)draw()};document.getElementById("reset").onclick=reset;document.getElementById("shot").onclick=()=>{const a=document.createElement("a");a.download=(DATA.title||"safechunk_trajectory").replace(/[^a-z0-9]+/gi,"_").toLowerCase()+".png";a.href=canvas.toDataURL("image/png");a.click()};setup();reset();
+</script>
+</body>
+</html>"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(template.replace("__DATA__", payload_json))
+    return str(path)
+
+def _save_chunk_trajectory_viewer(path: Path, title: str, trace_records: list[dict], human_samples: list[dict], executed_samples: list[dict], max_events: int):
+    return _save_chunk_trajectory_canvas_viewer(
+        path,
+        title,
+        trace_records,
+        human_samples,
+        executed_samples,
+        max_events,
+    )
+
+    try:
+        import plotly.graph_objects as go
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not import plotly for interactive trajectory viewer; "
+            "writing canvas fallback: %s",
+            exc,
+        )
+        return _save_chunk_trajectory_canvas_viewer(
+            path,
+            title,
+            trace_records,
+            human_samples,
+            executed_samples,
+            max_events,
+        )
+
+    layers = _chunk_trajectory_viewer_layers(
+        trace_records,
+        human_samples,
+        executed_samples,
+        max_events,
+    )
+    if not any(segment.get("points") for layer in layers for segment in layer.get("segments", [])):
+        return None
+
+    fig = go.Figure()
+    for layer in layers:
+        _add_plotly_segments(
+            fig,
+            go,
+            layer.get("segments", []),
+            name=layer.get("name", "trajectory"),
+            color=layer.get("color", "#111827"),
+            width=int(layer.get("width", 3)),
+            dash=layer.get("dash"),
+            line=bool(layer.get("line", True)),
+            markers=bool(layer.get("markers", True)),
+        )
+
+    fig.update_layout(
+        title=title,
+        scene={"xaxis_title": "x world", "yaxis_title": "y world", "zaxis_title": "z world", "aspectmode": "data"},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "groupclick": "togglegroup"},
+        margin={"l": 0, "r": 0, "t": 70, "b": 0},
+        template="plotly_white",
+    )
+    config = {"displaylogo": False, "toImageButtonOptions": {"format": "png", "filename": Path(path).stem, "height": 1000, "width": 1400, "scale": 2}}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(path, include_plotlyjs=True, full_html=True, config=config)
+    return str(path)
+
 def _horizon_risk_gap(current_h, horizon_min_clearance, eps: float = 1e-9):
     if current_h is None or horizon_min_clearance is None:
         return None, None, None
@@ -5016,6 +7139,51 @@ def _horizon_risk_gap(current_h, horizon_min_clearance, eps: float = 1e-9):
     return float(risk_gap), bool(risk_gap > eps), float(clearance_drop)
 
 
+def _chunk_horizon_h_monitor_fallback(safety_info: dict, violation_threshold: float):
+    """Map chunk/PACS horizon clearance onto the legacy h-monitor fields."""
+    min_clearance = _safe_info_get(safety_info, "min_clearance")
+    if min_clearance is None:
+        return None, None, None
+    try:
+        min_h = float(min_clearance)
+    except (TypeError, ValueError):
+        return None, None, None
+    if not np.isfinite(min_h):
+        return None, None, None
+
+    h_values = None
+    min_clearances = _safe_info_get(safety_info, "min_clearances")
+    if min_clearances is not None:
+        try:
+            values = np.asarray(min_clearances, dtype=np.float32).reshape(-1)
+            values = values[np.isfinite(values)]
+            if values.size:
+                h_values = values.astype(float).tolist()
+        except Exception:  # noqa: BLE001
+            h_values = None
+    if h_values is None:
+        h_values = [min_h]
+
+    threshold = float(violation_threshold)
+    unsafe_count = _safe_info_get(safety_info, "unsafe_count")
+    try:
+        unsafe_count = int(unsafe_count) if unsafe_count is not None else None
+    except (TypeError, ValueError):
+        unsafe_count = None
+    first_violation = _safe_info_get(safety_info, "first_violation")
+    try:
+        first_violation = int(first_violation) if first_violation is not None else None
+    except (TypeError, ValueError):
+        first_violation = None
+
+    h_violation = bool(
+        (unsafe_count is not None and unsafe_count > 0)
+        or (first_violation is not None and first_violation >= 0)
+        or min_h < threshold
+    )
+    return min_h, h_values, h_violation
+
+
 def _metric_safety_violation(metric: StepMetrics) -> bool:
     if metric.h_violation is not None:
         return bool(metric.h_violation)
@@ -5025,9 +7193,18 @@ def _metric_safety_violation(metric: StepMetrics) -> bool:
 def _metric_is_brake_step(metric: StepMetrics) -> bool:
     mode = metric.safety_mode
     source = metric.deformation_source
-    if mode in {"path_consistent_brake", "pause_on_unsafe", "pause_and_restart", "stop"}:
+    if mode in {
+        "horizon_brake",
+        "verified_failsafe",
+        "unverified_emergency_failsafe",
+        "pause_on_unsafe",
+        "pause_and_restart",
+        "stop",
+    }:
         return True
-    if source == "path_consistent_brake":
+    if source == "horizon_brake" and mode != "horizon_brake_intended_step":
+        return True
+    if source == "path_consistent_brake" and mode != "path_consistent_brake_intended_step":
         return True
     return metric.pause_reason is not None
 
@@ -5109,6 +7286,10 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
         for m in metrics
         if m.recover_reject_reason is not None
     ]
+
+    def _count_strings(values):
+        items = [str(value) for value in values if value is not None]
+        return {item: items.count(item) for item in sorted(set(items))}
     direct_rejoin_attempted_steps = int(
         np.sum([bool(m.direct_rejoin_attempted) for m in metrics])
     )
@@ -5170,8 +7351,24 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     actual_vs_planned_post_q_error = finite_metric("actual_vs_planned_post_q_error")
     recover_projection_on_nominal = finite_metric("recover_projection_on_nominal")
     recover_cosine_to_nominal = finite_metric("recover_cosine_to_nominal")
+    recover_direction_cosine = finite_metric("recover_direction_cosine")
+    recover_direction_loss = finite_metric("recover_direction_loss")
+    recover_ordered_pose_loss = finite_metric("recover_ordered_pose_loss")
+    recover_ordered_delta_loss = finite_metric("recover_ordered_delta_loss")
+    recover_ordered_loss = finite_metric("recover_ordered_loss")
     recover_task_progress_score = finite_metric("recover_task_progress_score")
+    cem_iterations_run = finite_metric("cem_iterations_run")
+    yield_cem_iterations_run = finite_metric("yield_cem_iterations_run")
+    return_cem_iterations_run = finite_metric("return_cem_iterations_run")
     hold_horizon_min_clearance = finite_metric("hold_horizon_min_clearance")
+    pacs_background_min_clearance = finite_metric("pacs_background_min_clearance")
+    pacs_background_arm_delta = finite_metric("pacs_background_arm_delta")
+    pacs_background_chunk_arm_delta = finite_metric("pacs_background_chunk_arm_delta")
+    pacs_background_chunk_modified_fraction = finite_metric("pacs_background_chunk_modified_fraction")
+    pacs_background_retiming_arm_delta = finite_metric("pacs_background_retiming_arm_delta")
+    pacs_background_retiming_chunk_arm_delta = finite_metric("pacs_background_retiming_chunk_arm_delta")
+    pacs_background_retiming_changed_fraction = finite_metric("pacs_background_retiming_changed_fraction")
+    retiming_norm = finite_metric("retiming_norm")
     task_progress = finite_metric("task_progress")
     task_progress_delta = finite_metric("task_progress_delta")
     total_steps = len(metrics)
@@ -5187,6 +7384,9 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     deform_after_persistent_block_count = int(np.sum([bool(m.deform_after_persistent_block) for m in metrics]))
     deform_suppressed_by_temporary_wait_count = int(
         np.sum([bool(m.deform_suppressed_by_temporary_wait) for m in metrics])
+    )
+    recovery_optimization_skipped_steps = int(
+        np.sum([bool(m.recovery_optimization_skipped) for m in metrics])
     )
     recovery_failure_streak_vals = [
         int(m.recovery_failure_streak_max)
@@ -5210,6 +7410,9 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     deform_replan_count = max_int_metric("deform_replan_count")
     recover_replan_count = max_int_metric("recover_replan_count")
     recovery_replan_count = max_int_metric("recovery_replan_count")
+    recovery_optimization_skipped_count = max_int_metric(
+        "recovery_optimization_skipped_count"
+    )
     stale_recovery_suppressed_count = max_int_metric("stale_recovery_suppressed_count")
     recovery_target_infeasible_count = max_int_metric("recovery_target_infeasible_count")
     emergency_brake_steps = max_int_metric("emergency_brake_steps")
@@ -5273,6 +7476,15 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     recover_steps = int(np.sum(recover_step_flags))
     brake_step_count = int(np.sum(brake_step_flags))
     fallback_step_count = int(np.sum(fallback_step_flags))
+    pacs_background_check_only_steps = int(
+        np.sum([bool(m.pacs_background_check_only) for m in metrics])
+    )
+    pacs_background_brake_steps = int(
+        np.sum([bool(m.pacs_background_brake_step) for m in metrics])
+    )
+    pacs_background_act_steps = int(
+        np.sum([bool(m.pacs_background_act_step) for m in metrics])
+    )
     optimized_attempt_steps = int(np.sum(optimized_attempt_step_flags))
     optimized_accepted_steps = int(np.sum(optimized_accepted_step_flags))
     committed_chunk_started_count = int(
@@ -5283,6 +7495,33 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     )
     committed_state_mismatch_abort_count = int(
         np.sum([bool(m.committed_aborted_due_to_state_mismatch) for m in metrics])
+    )
+    committed_state_mismatch_recovered_count = int(
+        np.sum([bool(m.committed_state_mismatch_recovered) for m in metrics])
+    )
+    committed_suffix_replan_attempt_count = int(
+        np.sum([bool(m.committed_suffix_replan_attempted) for m in metrics])
+    )
+    committed_suffix_replan_accepted_count = int(
+        np.sum([bool(m.committed_suffix_replan_accepted) for m in metrics])
+    )
+    committed_suffix_replan_rejected_count = int(
+        np.sum([bool(m.committed_suffix_replan_rejected) for m in metrics])
+    )
+    committed_suffix_replan_reject_reason_counts = _count_strings(
+        [m.committed_suffix_replan_reject_reason for m in metrics]
+    )
+    committed_opportunistic_resume_count = int(
+        np.sum([bool(m.committed_opportunistic_resume) for m in metrics])
+    )
+    committed_released_for_act_resume_count = int(
+        np.sum([bool(m.committed_released_for_act_resume) for m in metrics])
+    )
+    committed_recovery_budget_exit_count = int(
+        np.sum([bool(m.committed_recovery_budget_exit) for m in metrics])
+    )
+    committed_replan_due_to_recovery_budget_count = int(
+        np.sum([bool(m.committed_replan_due_to_recovery_budget) for m in metrics])
     )
     committed_chunk_abort_count = int(
         np.sum(
@@ -5355,13 +7594,18 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     ):
         likely_failure_cause = "progress_lost_after_intervention"
     elif mean_chunk_arm_delta_for_failure > large_arm_delta_threshold:
-        likely_failure_cause = "large_deformation_ood"
+        likely_failure_cause = (
+            "large_retiming_delta_ood"
+            if metrics[0].condition == "path_consistent_brake"
+            else "large_deformation_ood"
+        )
     elif fallback_ratio is not None and fallback_ratio > high_fallback_ratio_threshold:
         likely_failure_cause = "fallback_braking_timeout"
     else:
         likely_failure_cause = "unknown"
 
     modes = [m.safety_mode for m in metrics]
+    pacs_background_modes = [m.pacs_background_safety_mode for m in metrics]
     pause_reasons = [m.pause_reason for m in metrics]
     sources = [m.deformation_source for m in metrics]
     robot_human_distances = [m.min_robot_human_distance for m in metrics if m.min_robot_human_distance is not None]
@@ -5389,8 +7633,49 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
     def rate(values, target):
         return float(np.mean([v == target for v in values])) if values else None
 
+    env_step_time_ms = np.asarray([m.env_step_time_ms for m in metrics], dtype=np.float32)
+    policy_obs_adapt_time_ms = np.asarray([m.policy_obs_adapt_time_ms for m in metrics], dtype=np.float32)
+    policy_action_time_ms = np.asarray([m.policy_action_time_ms for m in metrics], dtype=np.float32)
+    policy_obs_update_time_ms = np.asarray([m.policy_obs_update_time_ms for m in metrics], dtype=np.float32)
+    policy_total_time_ms = policy_obs_adapt_time_ms + policy_action_time_ms + policy_obs_update_time_ms
+    step_wall_time_ms = np.asarray([1000.0 * m.step_wall_time_s for m in metrics], dtype=np.float32)
+    filter_time_ms = np.asarray([m.filter_time_ms for m in metrics], dtype=np.float32)
+    monitor_time_ms = np.asarray([m.monitor_time_ms for m in metrics], dtype=np.float32)
+    residual_time_ms = np.maximum(
+        0.0,
+        step_wall_time_ms
+        - filter_time_ms
+        - monitor_time_ms
+        - env_step_time_ms
+        - policy_total_time_ms,
+    )
+
     summary.update(
         {
+            "mean_env_step_time_ms": float(np.mean(env_step_time_ms)),
+            "p50_env_step_time_ms": float(np.percentile(env_step_time_ms, 50)),
+            "p95_env_step_time_ms": float(np.percentile(env_step_time_ms, 95)),
+            "max_env_step_time_ms": float(np.max(env_step_time_ms)),
+            "mean_policy_obs_adapt_time_ms": float(np.mean(policy_obs_adapt_time_ms)),
+            "p50_policy_obs_adapt_time_ms": float(np.percentile(policy_obs_adapt_time_ms, 50)),
+            "p95_policy_obs_adapt_time_ms": float(np.percentile(policy_obs_adapt_time_ms, 95)),
+            "max_policy_obs_adapt_time_ms": float(np.max(policy_obs_adapt_time_ms)),
+            "mean_policy_action_time_ms": float(np.mean(policy_action_time_ms)),
+            "p50_policy_action_time_ms": float(np.percentile(policy_action_time_ms, 50)),
+            "p95_policy_action_time_ms": float(np.percentile(policy_action_time_ms, 95)),
+            "max_policy_action_time_ms": float(np.max(policy_action_time_ms)),
+            "mean_policy_obs_update_time_ms": float(np.mean(policy_obs_update_time_ms)),
+            "p50_policy_obs_update_time_ms": float(np.percentile(policy_obs_update_time_ms, 50)),
+            "p95_policy_obs_update_time_ms": float(np.percentile(policy_obs_update_time_ms, 95)),
+            "max_policy_obs_update_time_ms": float(np.max(policy_obs_update_time_ms)),
+            "mean_policy_total_time_ms": float(np.mean(policy_total_time_ms)),
+            "p50_policy_total_time_ms": float(np.percentile(policy_total_time_ms, 50)),
+            "p95_policy_total_time_ms": float(np.percentile(policy_total_time_ms, 95)),
+            "max_policy_total_time_ms": float(np.max(policy_total_time_ms)),
+            "mean_latency_residual_ms": float(np.mean(residual_time_ms)),
+            "p50_latency_residual_ms": float(np.percentile(residual_time_ms, 50)),
+            "p95_latency_residual_ms": float(np.percentile(residual_time_ms, 95)),
+            "max_latency_residual_ms": float(np.max(residual_time_ms)),
             "mean_chunk_arm_delta": float(np.mean(chunk_arm_delta)),
             "max_chunk_arm_delta": float(np.max(chunk_arm_delta)),
             "mean_chunk_non_arm_delta": float(np.mean(chunk_non_arm_delta)),
@@ -5419,6 +7704,7 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
             "horizon_risk_gap_rate": float(np.mean(horizon_risk_gap_active)) if horizon_risk_gap_active else None,
             "horizon_only_risk_rate": float(np.mean(horizon_only_risk)) if horizon_only_risk else None,
             "mean_deformation_norm": float(np.mean(deform_norms)) if deform_norms else None,
+            "mean_retiming_norm": float(np.mean(retiming_norm)) if retiming_norm.size else None,
             "deform_safe_rate": float(np.mean(deform_safe)) if deform_safe else None,
             "optimized_attempts": int(len(optimized_records)),
             "optimized_safe_count": int(np.sum(optimized_safe)) if optimized_records else 0,
@@ -5458,6 +7744,70 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
             "recover_steps": recover_steps,
             "brake_steps": brake_step_count,
             "fallback_steps": fallback_step_count,
+            "pacs_background_check_only_steps": pacs_background_check_only_steps,
+            "pacs_background_brake_steps": pacs_background_brake_steps,
+            "pacs_background_act_steps": pacs_background_act_steps,
+            "pacs_background_check_only_rate": (
+                float(pacs_background_check_only_steps / total_steps) if total_steps else None
+            ),
+            "pacs_background_brake_rate": (
+                float(pacs_background_brake_steps / total_steps) if total_steps else None
+            ),
+            "pacs_background_act_rate": (
+                float(pacs_background_act_steps / total_steps) if total_steps else None
+            ),
+            "mean_pacs_background_min_clearance": (
+                float(np.mean(pacs_background_min_clearance))
+                if pacs_background_min_clearance.size
+                else None
+            ),
+            "min_pacs_background_min_clearance": (
+                float(np.min(pacs_background_min_clearance))
+                if pacs_background_min_clearance.size
+                else None
+            ),
+            "mean_pacs_background_arm_delta": (
+                float(np.mean(pacs_background_arm_delta))
+                if pacs_background_arm_delta.size
+                else None
+            ),
+            "mean_pacs_background_chunk_arm_delta": (
+                float(np.mean(pacs_background_chunk_arm_delta))
+                if pacs_background_chunk_arm_delta.size
+                else None
+            ),
+            "mean_pacs_background_chunk_modified_fraction": (
+                float(np.mean(pacs_background_chunk_modified_fraction))
+                if pacs_background_chunk_modified_fraction.size
+                else None
+            ),
+            "mean_pacs_background_retiming_arm_delta": (
+                float(np.mean(pacs_background_retiming_arm_delta))
+                if pacs_background_retiming_arm_delta.size
+                else None
+            ),
+            "mean_pacs_background_retiming_chunk_arm_delta": (
+                float(np.mean(pacs_background_retiming_chunk_arm_delta))
+                if pacs_background_retiming_chunk_arm_delta.size
+                else None
+            ),
+            "mean_pacs_background_retiming_changed_fraction": (
+                float(np.mean(pacs_background_retiming_changed_fraction))
+                if pacs_background_retiming_changed_fraction.size
+                else None
+            ),
+            "pacs_background_path_consistent_brake_intended_rate": rate(
+                pacs_background_modes,
+                "path_consistent_brake_intended_step",
+            ),
+            "pacs_background_verified_failsafe_rate": rate(
+                pacs_background_modes,
+                "verified_failsafe",
+            ),
+            "pacs_background_unverified_emergency_failsafe_rate": rate(
+                pacs_background_modes,
+                "unverified_emergency_failsafe",
+            ),
             "optimized_attempt_steps": optimized_attempt_steps,
             "optimized_accepted_steps": optimized_accepted_steps,
             "committed_chunk_started_count": committed_chunk_started_count,
@@ -5468,6 +7818,15 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
             "committed_abort_due_to_prediction_error_count": committed_abort_due_to_prediction_error_count,
             "committed_abort_due_to_safety_semantics_mismatch_count": committed_abort_due_to_safety_semantics_mismatch_count,
             "committed_state_mismatch_abort_count": committed_state_mismatch_abort_count,
+            "committed_state_mismatch_recovered_count": committed_state_mismatch_recovered_count,
+            "committed_suffix_replan_attempt_count": committed_suffix_replan_attempt_count,
+            "committed_suffix_replan_accepted_count": committed_suffix_replan_accepted_count,
+            "committed_suffix_replan_rejected_count": committed_suffix_replan_rejected_count,
+            "committed_suffix_replan_reject_reason_counts": committed_suffix_replan_reject_reason_counts,
+            "committed_opportunistic_resume_count": committed_opportunistic_resume_count,
+            "committed_released_for_act_resume_count": committed_released_for_act_resume_count,
+            "committed_recovery_budget_exit_count": committed_recovery_budget_exit_count,
+            "committed_replan_due_to_recovery_budget_count": committed_replan_due_to_recovery_budget_count,
             "mean_planning_vs_replay_clearance_post_error": (
                 float(np.mean(planning_vs_replay_clearance_post_error))
                 if planning_vs_replay_clearance_post_error.size
@@ -5527,6 +7886,8 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
             "deform_replan_count": deform_replan_count,
             "recover_replan_count": recover_replan_count,
             "recovery_replan_count": recovery_replan_count,
+            "recovery_optimization_skipped_count": recovery_optimization_skipped_count,
+            "recovery_optimization_skipped_steps": recovery_optimization_skipped_steps,
             "stale_recovery_suppressed_count": stale_recovery_suppressed_count,
             "recovery_target_infeasible_count": recovery_target_infeasible_count,
             "emergency_brake_steps": emergency_brake_steps,
@@ -5596,6 +7957,24 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
                     else None
                 )
             ),
+            "mean_recover_direction_cosine": (
+                float(np.mean(recover_direction_cosine))
+                if recover_direction_cosine.size
+                else (
+                    float(np.mean(finite_metric("mean_recover_direction_cosine")))
+                    if finite_metric("mean_recover_direction_cosine").size
+                    else None
+                )
+            ),
+            "mean_recover_direction_loss": (
+                float(np.mean(recover_direction_loss))
+                if recover_direction_loss.size
+                else (
+                    float(np.mean(finite_metric("mean_recover_direction_loss")))
+                    if finite_metric("mean_recover_direction_loss").size
+                    else None
+                )
+            ),
             "mean_recover_task_progress_score": (
                 float(np.mean(recover_task_progress_score))
                 if recover_task_progress_score.size
@@ -5604,6 +7983,58 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
                     if finite_metric("mean_recover_task_progress_score").size
                     else None
                 )
+            ),
+            "mean_recover_ordered_pose_loss": (
+                float(np.mean(recover_ordered_pose_loss))
+                if recover_ordered_pose_loss.size
+                else (
+                    float(np.mean(finite_metric("mean_recover_ordered_pose_loss")))
+                    if finite_metric("mean_recover_ordered_pose_loss").size
+                    else None
+                )
+            ),
+            "mean_recover_ordered_delta_loss": (
+                float(np.mean(recover_ordered_delta_loss))
+                if recover_ordered_delta_loss.size
+                else (
+                    float(np.mean(finite_metric("mean_recover_ordered_delta_loss")))
+                    if finite_metric("mean_recover_ordered_delta_loss").size
+                    else None
+                )
+            ),
+            "mean_recover_ordered_loss": (
+                float(np.mean(recover_ordered_loss))
+                if recover_ordered_loss.size
+                else (
+                    float(np.mean(finite_metric("mean_recover_ordered_loss")))
+                    if finite_metric("mean_recover_ordered_loss").size
+                    else None
+                )
+            ),
+            "mean_cem_iterations_run": (
+                float(np.mean(cem_iterations_run)) if cem_iterations_run.size else None
+            ),
+            "max_cem_iterations_run": (
+                int(np.max(cem_iterations_run)) if cem_iterations_run.size else None
+            ),
+            "cem_early_stopped_count": int(
+                np.sum([bool(m.cem_early_stopped) for m in metrics])
+            ),
+            "mean_yield_cem_iterations_run": (
+                float(np.mean(yield_cem_iterations_run))
+                if yield_cem_iterations_run.size
+                else None
+            ),
+            "mean_return_cem_iterations_run": (
+                float(np.mean(return_cem_iterations_run))
+                if return_cem_iterations_run.size
+                else None
+            ),
+            "yield_cem_early_stopped_count": int(
+                np.sum([bool(m.yield_cem_early_stopped) for m in metrics])
+            ),
+            "return_cem_early_stopped_count": int(
+                np.sum([bool(m.return_cem_early_stopped) for m in metrics])
             ),
             "hold_unsafe_count": hold_unsafe_count,
             "hold_predicted_contact_count": hold_predicted_contact_count,
@@ -5649,7 +8080,12 @@ def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optiona
             "task_success_threshold": success_threshold,
             "likely_failure_cause": likely_failure_cause,
             "pass_through_rate": rate(modes, "pass_through"),
+            "horizon_brake_rate": rate(modes, "horizon_brake"),
             "path_consistent_brake_rate": rate(modes, "path_consistent_brake"),
+            "path_consistent_brake_intended_rate": rate(modes, "path_consistent_brake_intended_step"),
+            "horizon_brake_intended_rate": rate(modes, "horizon_brake_intended_step"),
+            "verified_failsafe_rate": rate(modes, "verified_failsafe"),
+            "unverified_emergency_failsafe_rate": rate(modes, "unverified_emergency_failsafe"),
             "horizon_deform_rate": rate(modes, "horizon_deform"),
             "sequential_oscbf_rate": rate(modes, "sequential_oscbf"),
             "pause_on_unsafe_rate": rate(modes, "pause_on_unsafe"),
@@ -5698,6 +8134,20 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
         vals = [s[key] for s in episode_summaries if s.get(key) is not None]
         return int(np.sum(vals)) if vals else None
 
+    def _merge_count_dicts(summaries, key):
+        merged = {}
+        for item in summaries:
+            counts = item.get(key)
+            if not isinstance(counts, dict):
+                continue
+            for name, value in counts.items():
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    continue
+                merged[str(name)] = merged.get(str(name), 0) + value
+        return merged
+
     summary.update(
         {
             "mean_chunk_arm_delta": mean_of("mean_chunk_arm_delta"),
@@ -5735,6 +8185,12 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "fallback_used_count": sum_of("fallback_used_count"),
             "deform_stage_accepted_count": sum_of("deform_stage_accepted_count"),
             "recover_accepted_count": sum_of("recover_accepted_count"),
+            "recovery_optimization_skipped_count": sum_of(
+                "recovery_optimization_skipped_count"
+            ),
+            "recovery_optimization_skipped_steps": sum_of(
+                "recovery_optimization_skipped_steps"
+            ),
             "cached_motion_active_count": sum_of("cached_motion_active_count"),
             "resumed_from_cached_count": sum_of("resumed_from_cached_count"),
             "mean_deform_stage_min_clearance": mean_of("mean_deform_stage_min_clearance"),
@@ -5756,6 +8212,30 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "max_ee_rejoin_dist_over_episodes": max_of("max_ee_rejoin_dist"),
             "mean_rejoin_q_eval_time_ms": mean_of("mean_rejoin_q_eval_time_ms"),
             "mean_rejoin_qd_eval_time_ms": mean_of("mean_rejoin_qd_eval_time_ms"),
+            "mean_env_step_time_ms": mean_of("mean_env_step_time_ms"),
+            "p50_env_step_time_ms": mean_of("p50_env_step_time_ms"),
+            "p95_env_step_time_ms": mean_of("p95_env_step_time_ms"),
+            "max_env_step_time_ms_over_episodes": max_of("max_env_step_time_ms"),
+            "mean_policy_obs_adapt_time_ms": mean_of("mean_policy_obs_adapt_time_ms"),
+            "p50_policy_obs_adapt_time_ms": mean_of("p50_policy_obs_adapt_time_ms"),
+            "p95_policy_obs_adapt_time_ms": mean_of("p95_policy_obs_adapt_time_ms"),
+            "max_policy_obs_adapt_time_ms_over_episodes": max_of("max_policy_obs_adapt_time_ms"),
+            "mean_policy_action_time_ms": mean_of("mean_policy_action_time_ms"),
+            "p50_policy_action_time_ms": mean_of("p50_policy_action_time_ms"),
+            "p95_policy_action_time_ms": mean_of("p95_policy_action_time_ms"),
+            "max_policy_action_time_ms_over_episodes": max_of("max_policy_action_time_ms"),
+            "mean_policy_obs_update_time_ms": mean_of("mean_policy_obs_update_time_ms"),
+            "p50_policy_obs_update_time_ms": mean_of("p50_policy_obs_update_time_ms"),
+            "p95_policy_obs_update_time_ms": mean_of("p95_policy_obs_update_time_ms"),
+            "max_policy_obs_update_time_ms_over_episodes": max_of("max_policy_obs_update_time_ms"),
+            "mean_policy_total_time_ms": mean_of("mean_policy_total_time_ms"),
+            "p50_policy_total_time_ms": mean_of("p50_policy_total_time_ms"),
+            "p95_policy_total_time_ms": mean_of("p95_policy_total_time_ms"),
+            "max_policy_total_time_ms_over_episodes": max_of("max_policy_total_time_ms"),
+            "mean_latency_residual_ms": mean_of("mean_latency_residual_ms"),
+            "p50_latency_residual_ms": mean_of("p50_latency_residual_ms"),
+            "p95_latency_residual_ms": mean_of("p95_latency_residual_ms"),
+            "max_latency_residual_ms_over_episodes": max_of("max_latency_residual_ms"),
             "mean_ee_nom_cache_time_ms": mean_of("mean_ee_nom_cache_time_ms"),
             "mean_ee_final_check_time_ms": mean_of("mean_ee_final_check_time_ms"),
             "act_steps": sum_of("act_steps"),
@@ -5763,6 +8243,23 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "recover_steps": sum_of("recover_steps"),
             "brake_steps": sum_of("brake_steps"),
             "fallback_steps": sum_of("fallback_steps"),
+            "pacs_background_check_only_steps": sum_of("pacs_background_check_only_steps"),
+            "pacs_background_brake_steps": sum_of("pacs_background_brake_steps"),
+            "pacs_background_act_steps": sum_of("pacs_background_act_steps"),
+            "mean_pacs_background_check_only_rate": mean_of("pacs_background_check_only_rate"),
+            "mean_pacs_background_brake_rate": mean_of("pacs_background_brake_rate"),
+            "mean_pacs_background_act_rate": mean_of("pacs_background_act_rate"),
+            "mean_pacs_background_min_clearance": mean_of("mean_pacs_background_min_clearance"),
+            "min_pacs_background_min_clearance": min_of("min_pacs_background_min_clearance"),
+            "mean_pacs_background_arm_delta": mean_of("mean_pacs_background_arm_delta"),
+            "mean_pacs_background_chunk_arm_delta": mean_of("mean_pacs_background_chunk_arm_delta"),
+            "mean_pacs_background_chunk_modified_fraction": mean_of("mean_pacs_background_chunk_modified_fraction"),
+            "mean_pacs_background_retiming_arm_delta": mean_of("mean_pacs_background_retiming_arm_delta"),
+            "mean_pacs_background_retiming_chunk_arm_delta": mean_of("mean_pacs_background_retiming_chunk_arm_delta"),
+            "mean_pacs_background_retiming_changed_fraction": mean_of("mean_pacs_background_retiming_changed_fraction"),
+            "mean_pacs_background_path_consistent_brake_intended_rate": mean_of("pacs_background_path_consistent_brake_intended_rate"),
+            "mean_pacs_background_verified_failsafe_rate": mean_of("pacs_background_verified_failsafe_rate"),
+            "mean_pacs_background_unverified_emergency_failsafe_rate": mean_of("pacs_background_unverified_emergency_failsafe_rate"),
             "optimized_attempt_steps": sum_of("optimized_attempt_steps"),
             "optimized_accepted_steps": sum_of("optimized_accepted_steps"),
             "committed_chunk_started_count": sum_of("committed_chunk_started_count"),
@@ -5773,6 +8270,18 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "committed_abort_due_to_prediction_error_count": sum_of("committed_abort_due_to_prediction_error_count"),
             "committed_abort_due_to_safety_semantics_mismatch_count": sum_of("committed_abort_due_to_safety_semantics_mismatch_count"),
             "committed_state_mismatch_abort_count": sum_of("committed_state_mismatch_abort_count"),
+            "committed_state_mismatch_recovered_count": sum_of("committed_state_mismatch_recovered_count"),
+            "committed_suffix_replan_attempt_count": sum_of("committed_suffix_replan_attempt_count"),
+            "committed_suffix_replan_accepted_count": sum_of("committed_suffix_replan_accepted_count"),
+            "committed_suffix_replan_rejected_count": sum_of("committed_suffix_replan_rejected_count"),
+            "committed_opportunistic_resume_count": sum_of("committed_opportunistic_resume_count"),
+            "committed_released_for_act_resume_count": sum_of("committed_released_for_act_resume_count"),
+            "committed_recovery_budget_exit_count": sum_of("committed_recovery_budget_exit_count"),
+            "committed_replan_due_to_recovery_budget_count": sum_of("committed_replan_due_to_recovery_budget_count"),
+            "committed_suffix_replan_reject_reason_counts": _merge_count_dicts(
+                episode_summaries,
+                "committed_suffix_replan_reject_reason_counts",
+            ),
             "mean_planning_vs_replay_clearance_post_error": mean_of("mean_planning_vs_replay_clearance_post_error"),
             "mean_planning_vs_replay_human_error": mean_of("mean_planning_vs_replay_human_error"),
             "mean_actual_vs_planned_post_q_error": mean_of("mean_actual_vs_planned_post_q_error"),
@@ -5852,7 +8361,19 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "recover_nonpositive_projection_count": max_of("recover_nonpositive_projection_count"),
             "mean_recover_projection_on_nominal": mean_of("mean_recover_projection_on_nominal"),
             "mean_recover_cosine_to_nominal": mean_of("mean_recover_cosine_to_nominal"),
+            "mean_recover_direction_cosine": mean_of("mean_recover_direction_cosine"),
+            "mean_recover_direction_loss": mean_of("mean_recover_direction_loss"),
             "mean_recover_task_progress_score": mean_of("mean_recover_task_progress_score"),
+            "mean_recover_ordered_pose_loss": mean_of("mean_recover_ordered_pose_loss"),
+            "mean_recover_ordered_delta_loss": mean_of("mean_recover_ordered_delta_loss"),
+            "mean_recover_ordered_loss": mean_of("mean_recover_ordered_loss"),
+            "mean_cem_iterations_run": mean_of("mean_cem_iterations_run"),
+            "max_cem_iterations_run": max_of("max_cem_iterations_run"),
+            "cem_early_stopped_count": sum_of("cem_early_stopped_count"),
+            "mean_yield_cem_iterations_run": mean_of("mean_yield_cem_iterations_run"),
+            "mean_return_cem_iterations_run": mean_of("mean_return_cem_iterations_run"),
+            "yield_cem_early_stopped_count": sum_of("yield_cem_early_stopped_count"),
+            "return_cem_early_stopped_count": sum_of("return_cem_early_stopped_count"),
             "hold_unsafe_count": max_of("hold_unsafe_count"),
             "hold_predicted_contact_count": max_of("hold_predicted_contact_count"),
             "emergency_deform_away_steps": max_of("emergency_deform_away_steps"),
@@ -5891,7 +8412,12 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
                 for cause in sorted({s.get("likely_failure_cause") for s in episode_summaries if s.get("likely_failure_cause") is not None})
             },
             "mean_pass_through_rate": mean_of("pass_through_rate"),
+            "mean_horizon_brake_rate": mean_of("horizon_brake_rate"),
             "mean_path_consistent_brake_rate": mean_of("path_consistent_brake_rate"),
+            "mean_path_consistent_brake_intended_rate": mean_of("path_consistent_brake_intended_rate"),
+            "mean_horizon_brake_intended_rate": mean_of("horizon_brake_intended_rate"),
+            "mean_verified_failsafe_rate": mean_of("verified_failsafe_rate"),
+            "mean_unverified_emergency_failsafe_rate": mean_of("unverified_emergency_failsafe_rate"),
             "mean_horizon_deform_rate": mean_of("horizon_deform_rate"),
             "mean_sequential_oscbf_rate": mean_of("sequential_oscbf_rate"),
             "mean_pause_on_unsafe_rate": mean_of("pause_on_unsafe_rate"),
@@ -6142,19 +8668,31 @@ def main():
         time_base=args.video_time_base,
     )
     video_stop_steps = _resolve_video_stop_steps(args, video_recorder)
+    if args.frame_image_dir is not None:
+        frame_image_dir = Path(args.frame_image_dir)
+    else:
+        frame_image_dir = output_root / "frames"
+    if args.save_frame_images:
+        frame_image_dir.mkdir(parents=True, exist_ok=True)
+    saved_frame_image_paths = []
 
     trajectory_logging_enabled = bool(
         args.log_chunk_trajectories
-        and args.condition in {"sequential", "sequential_oscbf", "chunk_deform"}
+        and args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}
     )
     chunk_trajectory_jsonl_path = output_root / "chunk_trajectory_traces.jsonl"
     human_arm_trajectory_jsonl_path = output_root / "human_arm_trajectory.jsonl"
-    trajectory_plot_dir = output_root / "trajectory_plots"
+    executed_policy_trajectory_jsonl_path = output_root / "executed_policy_trajectory.jsonl"
+    trajectory_plot_dir = output_root / "trajectory_viewers"
     if trajectory_logging_enabled and args.plot_chunk_trajectories_3d:
         trajectory_plot_dir.mkdir(parents=True, exist_ok=True)
 
     print("record_video:", args.record_video)
     print("video_dir:", video_dir)
+    print("save_frame_images:", args.save_frame_images)
+    if args.save_frame_images:
+        print("frame_image_dir:", frame_image_dir)
+        print("frame_image_every:", args.frame_image_every)
     print("stop_video_at_seconds:", args.stop_video_at_seconds)
     print("video_time_base:", args.video_time_base)
     print("stop_video_at_steps:", video_stop_steps)
@@ -6162,8 +8700,9 @@ def main():
     if trajectory_logging_enabled:
         print("chunk_trajectory_jsonl:", chunk_trajectory_jsonl_path)
         print("human_arm_trajectory_jsonl:", human_arm_trajectory_jsonl_path)
+        print("executed_policy_trajectory_jsonl:", executed_policy_trajectory_jsonl_path)
         print("plot_chunk_trajectories_3d:", args.plot_chunk_trajectories_3d)
-        print("trajectory_plot_dir:", trajectory_plot_dir)
+        print("trajectory_viewer_dir:", trajectory_plot_dir)
 
     replay_actions = None
     if args.replay_actions is not None:
@@ -6187,11 +8726,21 @@ def main():
         print("replay_actions:", replay_path)
         print("replay_actions_shape:", replay_actions.shape)
 
-    print("\n=== Creating OSCBF monitor/filter ===")
+    path_consistent_brake_eval_config = _path_consistent_brake_eval_config(args)
+    path_consistent_background_check_only = bool(
+        path_consistent_brake_eval_config.get("background_check_only", False)
+    )
+    barrier_operator_min_clearance = (
+        path_consistent_brake_eval_config.get("min_clearance", args.chunk_min_clearance)
+        if args.condition == "path_consistent_brake"
+        else args.chunk_min_clearance
+    )
+
+    print("\n=== Creating barrier safety operator/filter ===")
     oscbf = make_oscbf_filter(args)
     horizon_operator = HorizonOSCBFOperator(
         oscbf,
-        min_clearance=args.chunk_min_clearance,
+        min_clearance=barrier_operator_min_clearance,
         dt=0.05,
         predict_human_motion=args.chunk_horizon_predict_human_motion,
         human_prediction_max_time=args.chunk_human_motion_prediction_max_time,
@@ -6199,8 +8748,11 @@ def main():
     )
     safechunk = make_safechunk_filter(args, horizon_operator, oscbf=oscbf)
     print("condition:", args.condition)
+    if args.condition == "path_consistent_brake":
+        print("path_consistent_background_check_only:", path_consistent_background_check_only)
+        print("path_consistent_config_min_clearance:", barrier_operator_min_clearance)
     print("arm indices:", oscbf.bigym_action_arm_indices.tolist())
-    if args.condition in {"sequential", "sequential_oscbf", "chunk_deform"}:
+    if args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}:
         print("chunk controlled indices:", safechunk.controlled_action_indices.tolist())
         print("chunk_deform_mode:", safechunk.mode)
         print("chunk_deformation_enabled:", safechunk.deformation_enabled)
@@ -6221,6 +8773,10 @@ def main():
         print("explicit_recovery_committed_execution_margin:", safechunk.committed_execution_margin)
         print("explicit_recovery_committed_state_error_threshold:", safechunk.committed_state_error_threshold)
         print("explicit_recovery_committed_state_error_action:", safechunk.committed_state_error_action)
+        print(
+            "explicit_recovery_committed_state_mismatch_abort_requires_unsafe:",
+            safechunk.committed_state_mismatch_abort_requires_unsafe,
+        )
         print("recoverable_deform_horizon:", safechunk.yield_horizon)
         print("recoverable_recover_horizon:", safechunk.return_horizon)
         print("recoverable_use_ee_final_check:", safechunk.use_ee_final_check)
@@ -6242,6 +8798,7 @@ def main():
     all_episode_summaries: list[dict] = []
     all_chunk_trajectory_records: list[dict] = []
     all_human_arm_trajectory_samples: list[dict] = []
+    all_executed_policy_trajectory_samples: list[dict] = []
     trajectory_plot_paths: list[str] = []
     show_progress = tqdm is not None and not args.no_progress
     episode_bar = None
@@ -6307,6 +8864,16 @@ def main():
             episode_metrics: list[StepMetrics] = []
             episode_chunk_trajectory_records: list[dict] = []
             episode_human_arm_trajectory_samples: list[dict] = []
+            episode_executed_policy_trajectory_samples: list[dict] = []
+            if trajectory_logging_enabled:
+                initial_executed_sample = _annotate_executed_trajectory_sample(
+                    _robot_ee_trajectory_sample(env, episode, 0),
+                    None,
+                    initial=True,
+                )
+                if initial_executed_sample is not None:
+                    episode_executed_policy_trajectory_samples.append(initial_executed_sample)
+                    all_executed_policy_trajectory_samples.append(initial_executed_sample)
             saved_episode_actions = []
             episode_stop_reason = None
             policy_video_frames = []
@@ -6330,6 +8897,181 @@ def main():
             post_recovery_reanchor_started = False
             if hasattr(safechunk, "reset"):
                 safechunk.reset()
+            if episode == 0:
+                warm_h1state = extract_h1_state(env)
+                warm_q = np.asarray(warm_h1state.q_full, dtype=np.float32).reshape(-1)
+                warm_qd = np.asarray(warm_h1state.qd_full, dtype=np.float32).reshape(-1)
+                warm_obs = _chunk_obs_with_q(obs, warm_q)
+                horizon_operator.set_context(safety_runtime_env, warm_obs, warm_q, warm_qd)
+                if args.live_h_monitor:
+                    warm_monitor_t0 = time.perf_counter()
+                    compute_oscbf_h_monitor(
+                        filt=oscbf,
+                        env=safety_runtime_env,
+                        obs=obs,
+                        q_full=warm_q,
+                        qd_full=warm_qd,
+                    )
+                    print(
+                        "live_h_warmup_time_ms:",
+                        f"{1000.0 * (time.perf_counter() - warm_monitor_t0):.3f}",
+                    )
+                if (
+                    args.condition == "chunk_deform"
+                    and getattr(safechunk, "mode", None) == "optimized"
+                ):
+                    warmup_info = safechunk.warmup_optimizer(warm_obs)
+                    print(
+                        "safechunk_optimizer_warmup_time_ms:",
+                        f"{warmup_info.get('optimizer_warmup_time_ms', 0.0):.3f}",
+                    )
+                    print(
+                        "safechunk_optimizer_warmup_results:",
+                        warmup_info.get("optimizer_warmup_results"),
+                    )
+                    print(
+                        "safechunk_optimizer_warmup_live_path_result:",
+                        warmup_info.get("optimizer_warmup_live_path_result"),
+                    )
+                if args.condition in {
+                    "sequential",
+                    "sequential_oscbf",
+                    "chunk_deform",
+                    "path_consistent_brake",
+                }:
+                    try:
+                        if replay_actions is None:
+                            warm_policy_obs = _adapt_policy_obs_to_space(
+                                policy_obs,
+                                policy_observation_space,
+                            )
+                            warm_env_action = policy_action(ws, warm_policy_obs, step=policy_step)
+                            warm_env_action = normalise_env_action_shape(
+                                warm_env_action,
+                                env_action_shape,
+                            )
+                        elif episode < replay_actions.shape[0] and replay_actions.shape[1] > 0:
+                            warm_env_action = replay_actions[episode, 0].copy()
+                        else:
+                            warm_env_action = None
+                        if warm_env_action is not None:
+                            warm_nominal_chunk, _ = _as_chunk(warm_env_action)
+                            if (
+                                args.condition in {"sequential", "sequential_oscbf"}
+                                or (
+                                    args.condition == "chunk_deform"
+                                    and bool(getattr(safechunk, "sequential_oscbf_fallback", False))
+                                )
+                            ):
+                                sequential_warmup_t0 = time.perf_counter()
+                                _seq_warm_chunk, sequential_warmup_info = horizon_operator.filter_chunk(
+                                    warm_nominal_chunk,
+                                    obs=warm_obs,
+                                    env=safety_runtime_env,
+                                    q_full=warm_q,
+                                    qd_full=warm_qd,
+                                )
+                                print(
+                                    "sequential_oscbf_jax_warmup_time_ms:",
+                                    f"{1000.0 * (time.perf_counter() - sequential_warmup_t0):.3f}",
+                                )
+                                print(
+                                    "sequential_oscbf_jax_warmup_info:",
+                                    {
+                                        "used": sequential_warmup_info.get("jax_sequential_oscbf_used"),
+                                        "pelvis": sequential_warmup_info.get("jax_sequential_oscbf_use_pelvis_cbf"),
+                                        "filter_time_ms": sequential_warmup_info.get("jax_sequential_oscbf_time_ms"),
+                                    },
+                                )
+                                if getattr(horizon_operator, "predict_human_motion", False):
+                                    try:
+                                        human_obstacles, _ = horizon_operator._current_human_obstacles(warm_obs)
+                                        horizon_operator._capsule_a_velocity_world = np.zeros_like(
+                                            human_obstacles["capsule_a"],
+                                            dtype=np.float32,
+                                        )
+                                        horizon_operator._capsule_b_velocity_world = np.zeros_like(
+                                            human_obstacles["capsule_b"],
+                                            dtype=np.float32,
+                                        )
+                                        horizon_operator._human_motion_prediction_available = True
+                                        horizon_operator._human_motion_prediction_speed = 0.0
+                                        horizon_operator._human_rollout_cache = {}
+                                        predicted_warmup_t0 = time.perf_counter()
+                                        _seq_pred_warm_chunk, sequential_pred_warmup_info = (
+                                            horizon_operator.filter_chunk(
+                                                warm_nominal_chunk,
+                                                obs=warm_obs,
+                                                env=safety_runtime_env,
+                                                q_full=warm_q,
+                                                qd_full=warm_qd,
+                                            )
+                                        )
+                                        print(
+                                            "sequential_oscbf_jax_predicted_warmup_time_ms:",
+                                            f"{1000.0 * (time.perf_counter() - predicted_warmup_t0):.3f}",
+                                        )
+                                        print(
+                                            "sequential_oscbf_jax_predicted_warmup_info:",
+                                            {
+                                                "used": sequential_pred_warmup_info.get("jax_sequential_oscbf_used"),
+                                                "pelvis": sequential_pred_warmup_info.get("jax_sequential_oscbf_use_pelvis_cbf"),
+                                                "prediction_available": sequential_pred_warmup_info.get("human_motion_prediction_available"),
+                                                "filter_time_ms": sequential_pred_warmup_info.get("jax_sequential_oscbf_time_ms"),
+                                            },
+                                        )
+                                    except Exception as exc:  # noqa: BLE001
+                                        print(f"sequential_oscbf_jax_predicted_warmup_failed: {exc}")
+                                    finally:
+                                        horizon_operator._human_rollout_cache = {}
+                            live_warmup_t0 = time.perf_counter()
+                            if (
+                                args.condition == "chunk_deform"
+                                and getattr(safechunk, "mode", None) == "optimized"
+                            ):
+                                policy_warmup_info = safechunk.warmup_optimizer(
+                                    warm_obs,
+                                    nominal_chunk=warm_nominal_chunk,
+                                )
+                                print(
+                                    "safechunk_policy_chunk_warmup_time_ms:",
+                                    f"{1000.0 * (time.perf_counter() - live_warmup_t0):.3f}",
+                                )
+                                print(
+                                    "safechunk_policy_chunk_warmup_live_path_result:",
+                                    policy_warmup_info.get(
+                                        "optimizer_warmup_live_path_result"
+                                    ),
+                                )
+                                live_warmup_t0 = time.perf_counter()
+                            if args.condition in {"sequential", "sequential_oscbf"}:
+                                safechunk.deform_chunk_with_oscbf(
+                                    warm_obs,
+                                    warm_nominal_chunk,
+                                    env=safety_runtime_env,
+                                    q_full=warm_q,
+                                    qd_full=warm_qd,
+                                )
+                            else:
+                                safechunk.filter_chunk(
+                                    warm_obs,
+                                    warm_nominal_chunk,
+                                    env=safety_runtime_env,
+                                    q_full=warm_q,
+                                    qd_full=warm_qd,
+                                    task_progress=None,
+                                    live_monitor_min_h=None,
+                                    live_monitor_h_violation=False,
+                                )
+                            print(
+                                "chunk_filter_live_warmup_time_ms:",
+                                f"{1000.0 * (time.perf_counter() - live_warmup_t0):.3f}",
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"chunk_filter_live_warmup_failed: {exc}")
+                    finally:
+                        if hasattr(safechunk, "reset"):
+                            safechunk.reset()
             episode_wall_t0 = time.perf_counter()
             last_step_wall_t = episode_wall_t0
             if show_progress:
@@ -6505,13 +9247,19 @@ def main():
                         policy_video_frames.append(policy_frame)
                         policy_video_timestamps.append(time.perf_counter())
 
+                policy_obs_adapt_time_ms = 0.0
+                policy_action_time_ms = 0.0
                 if replay_actions is None:
+                    policy_obs_adapt_t0 = time.perf_counter()
                     policy_obs_for_action = _adapt_policy_obs_to_space(
                         policy_obs,
                         policy_observation_space,
                     )
+                    policy_obs_adapt_time_ms = 1000.0 * (time.perf_counter() - policy_obs_adapt_t0)
+                    policy_action_t0 = time.perf_counter()
                     env_action = policy_action(ws, policy_obs_for_action, step=policy_step)
                     env_action = normalise_env_action_shape(env_action, env_action_shape)
+                    policy_action_time_ms = 1000.0 * (time.perf_counter() - policy_action_t0)
                 else:
                     if episode >= replay_actions.shape[0] or step >= replay_actions.shape[1]:
                         print(
@@ -6522,7 +9270,7 @@ def main():
                     env_action = replay_actions[episode, step].copy()
 
                 first_action = extract_first_action(env_action)
-                chunk_filter_mode = args.condition in {"sequential", "sequential_oscbf", "chunk_deform"}
+                chunk_filter_mode = args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}
                 pelvis_cbf_mode = (
                     args.condition == "oscbf"
                     and getattr(oscbf, "enable_pelvis_cbf", False)
@@ -6550,19 +9298,28 @@ def main():
                 valid_base_idx = base_idx[base_idx < first_action.shape[0]]
                 non_arm_idx = get_non_arm_indices(first_action.shape[0], arm_idx)
 
-                monitor_t0 = time.perf_counter()
-                min_h, h_values, h_violation = compute_oscbf_h_monitor(
-                    filt=oscbf,
-                    env=safety_runtime_env,
-                    obs=obs,
-                    q_full=q_full,
-                    qd_full=qd_full,
-                )
-                monitor_time_ms = 1000.0 * (time.perf_counter() - monitor_t0)
+                live_h_monitor_skipped = not bool(args.live_h_monitor)
+                if live_h_monitor_skipped:
+                    min_h = None
+                    h_values = None
+                    h_violation = False
+                    monitor_time_ms = 0.0
+                else:
+                    monitor_t0 = time.perf_counter()
+                    min_h, h_values, h_violation = compute_oscbf_h_monitor(
+                        filt=oscbf,
+                        env=safety_runtime_env,
+                        obs=obs,
+                        q_full=q_full,
+                        qd_full=qd_full,
+                    )
+                    monitor_time_ms = 1000.0 * (time.perf_counter() - monitor_t0)
 
                 filter_t0 = time.perf_counter()
                 safety_info = {}
                 chunk_trace_context = None
+                pacs_background_safety_info = None
+                pacs_background_chunk_for_metrics = None
 
                 if chunk_filter_mode:
                     chunk_obs = _chunk_obs_with_q(obs, q_full)
@@ -6597,6 +9354,72 @@ def main():
                             live_monitor_min_h=min_h,
                             live_monitor_h_violation=h_violation,
                         )
+                    if (
+                        args.condition == "path_consistent_brake"
+                        and path_consistent_background_check_only
+                    ):
+                        pacs_background_safety_info = dict(safety_info)
+                        pacs_background_chunk_for_metrics = np.asarray(
+                            safe_chunk,
+                            dtype=np.float32,
+                        ).copy()
+                        pacs_background_mode = (
+                            _safe_info_get(pacs_background_safety_info, "safety_mode")
+                            or _safe_info_get(pacs_background_safety_info, "mode")
+                        )
+                        pacs_background_source = _safe_info_get(
+                            pacs_background_safety_info,
+                            "deformation_source",
+                        )
+                        pacs_background_retiming_source = _safe_info_get(
+                            pacs_background_safety_info,
+                            "retiming_source",
+                        )
+                        if pacs_background_retiming_source is None:
+                            pacs_background_retiming_source = pacs_background_source
+                        safety_info = dict(safety_info)
+                        safety_info.update(
+                            {
+                                "pacs_background_check_only": True,
+                                "pacs_background_safety_mode": pacs_background_mode,
+                                "pacs_background_deformation_source": pacs_background_source,
+                                "pacs_background_retiming_source": pacs_background_retiming_source,
+                                "pacs_background_min_clearance": _safe_info_get(
+                                    pacs_background_safety_info,
+                                    "min_clearance",
+                                ),
+                                "pacs_background_first_violation": _safe_info_get(
+                                    pacs_background_safety_info,
+                                    "first_violation",
+                                ),
+                                "pacs_background_unsafe_count": _safe_info_get(
+                                    pacs_background_safety_info,
+                                    "unsafe_count",
+                                ),
+                                "safety_mode": "pass_through",
+                                "mode": "pass_through",
+                                "deformation_source": None,
+                                "deformation_norm": 0.0,
+                                "retiming_source": None,
+                                "retiming_norm": 0.0,
+                                "suppress_outer_pause": True,
+                            }
+                        )
+                        safe_chunk = np.asarray(nominal_chunk, dtype=np.float32).copy()
+
+                    if live_h_monitor_skipped:
+                        fallback_min_h, fallback_h_values, fallback_h_violation = (
+                            _chunk_horizon_h_monitor_fallback(
+                                safety_info,
+                                getattr(safechunk, "min_clearance", 0.0),
+                            )
+                        )
+                        if fallback_min_h is not None:
+                            min_h = fallback_min_h
+                            h_values = fallback_h_values
+                            h_violation = bool(fallback_h_violation)
+                            safety_info["h_monitor_source"] = "chunk_horizon_clearance"
+
                     safe_env_action = _restore_action_shape(
                         np.asarray(safe_chunk, dtype=np.float32),
                         was_single_chunk,
@@ -6962,6 +9785,12 @@ def main():
                         generated_chunk=safe_env_action,
                         safety_info=safety_info,
                         human_sample=human_arm_trace_sample,
+                        policy_anchor_sample=_robot_ee_trajectory_sample(
+                            env,
+                            episode,
+                            step,
+                            task_state_before,
+                        ),
                     )
                     if trace_record is not None:
                         episode_chunk_trajectory_records.append(trace_record)
@@ -6979,8 +9808,12 @@ def main():
                     and not last_safety_intervention_active
                 )
 
+                env_step_t0 = time.perf_counter()
                 obs, reward, terminated, truncated, info = env.step(safe_env_action)
+                env_step_time_ms = 1000.0 * (time.perf_counter() - env_step_t0)
+                policy_obs_update_time_ms = 0.0
                 if policy_env is None:
+                    policy_obs_update_t0 = time.perf_counter()
                     if args.hide_human_arm_policy_obs:
                         policy_obs = _policy_obs_with_hidden_human_arm(
                             env,
@@ -6989,10 +9822,13 @@ def main():
                         )
                     else:
                         policy_obs = obs
+                    policy_obs_update_time_ms = 1000.0 * (time.perf_counter() - policy_obs_update_t0)
                 else:
+                    policy_env_step_t0 = time.perf_counter()
                     policy_obs, _policy_reward, policy_terminated, policy_truncated, _policy_info = policy_env.step(
                         safe_env_action
                     )
+                    env_step_time_ms += 1000.0 * (time.perf_counter() - policy_env_step_t0)
                     if (policy_terminated or policy_truncated) and not (
                         terminated or truncated or extract_success(info, float(reward), bool(terminated))
                     ):
@@ -7013,6 +9849,15 @@ def main():
                         "object_state": None,
                     }
                 )
+                if trajectory_logging_enabled:
+                    executed_sample = _annotate_executed_trajectory_sample(
+                        _robot_ee_trajectory_sample(env, episode, step + 1, task_state_after),
+                        safety_info,
+                    )
+                    if executed_sample is not None:
+                        episode_executed_policy_trajectory_samples.append(executed_sample)
+                        all_executed_policy_trajectory_samples.append(executed_sample)
+
                 task_progress_delta = _diagnostic_progress_delta(
                     task_state_before,
                     task_state_after,
@@ -7178,6 +10023,14 @@ def main():
                     human_done_clear_steps = 0
 
                 video_recorder.record(safety_runtime_env)
+                if args.save_frame_images and step % args.frame_image_every == 0:
+                    frame = _render_single_env_if_vector(safety_runtime_env)
+                    if frame is not None:
+                        frame_path = frame_image_dir / (
+                            f"{args.condition}_episode_{episode:03d}_step_{step:06d}.png"
+                        )
+                        imageio.imwrite(str(frame_path), np.asarray(frame))
+                        saved_frame_image_paths.append(str(frame_path))
                 step_wall_t = time.perf_counter()
                 elapsed_wall_time_s = step_wall_t - episode_wall_t0
                 step_wall_time_s = step_wall_t - last_step_wall_t
@@ -7228,8 +10081,8 @@ def main():
                     arm_idx,
                     args.intervention_eps,
                 )
-                path_consistency_metrics = (
-                    _path_consistency_metrics(
+                path_deviation_metrics = (
+                    _path_deviation_metrics(
                         safechunk,
                         _chunk_obs_with_q(obs, q_full),
                         nominal_chunk_for_metrics,
@@ -7242,6 +10095,49 @@ def main():
                         "path_final_deviation": None,
                     }
                 )
+                if pacs_background_chunk_for_metrics is not None:
+                    pacs_background_chunk = np.asarray(
+                        pacs_background_chunk_for_metrics,
+                        dtype=np.float32,
+                    )
+                    pacs_background_first_action = pacs_background_chunk[0]
+                    pacs_background_arm_delta = float(
+                        np.linalg.norm(pacs_background_first_action[arm_idx] - nominal_arm)
+                    )
+                    pacs_background_chunk_arm_delta = float(
+                        np.linalg.norm(
+                            pacs_background_chunk[:, arm_idx]
+                            - nominal_chunk_for_metrics[:, arm_idx]
+                        )
+                    )
+                    pacs_background_advantage_metrics = _chunk_filter_advantage_metrics(
+                        nominal_chunk_for_metrics,
+                        pacs_background_chunk,
+                        arm_idx,
+                        args.intervention_eps,
+                    )
+                    pacs_background_flags = _diagnostic_mode_flags(
+                        pacs_background_safety_info or {},
+                        arm_delta=pacs_background_arm_delta,
+                        eps=args.intervention_eps,
+                    )
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "pacs_background_brake_step": pacs_background_flags["brake_step"],
+                            "pacs_background_act_step": pacs_background_flags["act_step"],
+                            "pacs_background_arm_delta": pacs_background_arm_delta,
+                            "pacs_background_chunk_arm_delta": pacs_background_chunk_arm_delta,
+                            "pacs_background_chunk_modified_fraction": pacs_background_advantage_metrics[
+                                "chunk_modified_fraction"
+                            ],
+                            "pacs_background_retiming_arm_delta": pacs_background_arm_delta,
+                            "pacs_background_retiming_chunk_arm_delta": pacs_background_chunk_arm_delta,
+                            "pacs_background_retiming_changed_fraction": pacs_background_advantage_metrics[
+                                "chunk_modified_fraction"
+                            ],
+                        }
+                    )
                 if args.diagnostics_enabled:
                     diagnostic_flags = _diagnostic_mode_flags(
                         safety_info,
@@ -7336,12 +10232,28 @@ def main():
                     min_h=min_h,
                     h_values=h_values,
                     h_violation=h_violation,
+                    live_h_monitor_skipped=bool(live_h_monitor_skipped),
                     chunk_min_clearance=_safe_info_get(safety_info, "min_clearance"),
                     chunk_first_violation=_safe_info_get(safety_info, "first_violation"),
                     chunk_unsafe_count=_safe_info_get(safety_info, "unsafe_count"),
                     horizon_risk_gap=horizon_risk_gap,
                     horizon_risk_gap_active=horizon_risk_gap_active,
                     horizon_clearance_drop=horizon_clearance_drop,
+                    pacs_background_check_only=_safe_info_get(safety_info, "pacs_background_check_only"),
+                    pacs_background_safety_mode=_safe_info_get(safety_info, "pacs_background_safety_mode"),
+                    pacs_background_deformation_source=_safe_info_get(safety_info, "pacs_background_deformation_source"),
+                    pacs_background_retiming_source=_safe_info_get(safety_info, "pacs_background_retiming_source"),
+                    pacs_background_brake_step=_safe_info_get(safety_info, "pacs_background_brake_step"),
+                    pacs_background_act_step=_safe_info_get(safety_info, "pacs_background_act_step"),
+                    pacs_background_min_clearance=_safe_info_get(safety_info, "pacs_background_min_clearance"),
+                    pacs_background_first_violation=_safe_info_get(safety_info, "pacs_background_first_violation"),
+                    pacs_background_unsafe_count=_safe_info_get(safety_info, "pacs_background_unsafe_count"),
+                    pacs_background_arm_delta=_safe_info_get(safety_info, "pacs_background_arm_delta"),
+                    pacs_background_chunk_arm_delta=_safe_info_get(safety_info, "pacs_background_chunk_arm_delta"),
+                    pacs_background_chunk_modified_fraction=_safe_info_get(safety_info, "pacs_background_chunk_modified_fraction"),
+                    pacs_background_retiming_arm_delta=_safe_info_get(safety_info, "pacs_background_retiming_arm_delta"),
+                    pacs_background_retiming_chunk_arm_delta=_safe_info_get(safety_info, "pacs_background_retiming_chunk_arm_delta"),
+                    pacs_background_retiming_changed_fraction=_safe_info_get(safety_info, "pacs_background_retiming_changed_fraction"),
 
                     contact_count=contact_count,
                     contact_pairs=contact_pairs,
@@ -7373,9 +10285,9 @@ def main():
                     chunk_nominal_arm_variation=chunk_advantage_metrics["chunk_nominal_arm_variation"],
                     chunk_arm_variation_delta=chunk_advantage_metrics["chunk_arm_variation_delta"],
                     chunk_edit_variation=chunk_advantage_metrics["chunk_edit_variation"],
-                    path_mean_deviation=path_consistency_metrics["path_mean_deviation"],
-                    path_max_deviation=path_consistency_metrics["path_max_deviation"],
-                    path_final_deviation=path_consistency_metrics["path_final_deviation"],
+                    path_mean_deviation=path_deviation_metrics["path_mean_deviation"],
+                    path_max_deviation=path_deviation_metrics["path_max_deviation"],
+                    path_final_deviation=path_deviation_metrics["path_final_deviation"],
                     chunk_preemptive_intervention=chunk_advantage_metrics["chunk_preemptive_intervention"],
                     intervention_active=bool(chunk_arm_delta > args.intervention_eps),
 
@@ -7398,6 +10310,8 @@ def main():
                     pause_reason=_safe_info_get(safety_info, "pause_reason"),
                     deformation_source=_safe_info_get(safety_info, "deformation_source"),
                     deformation_norm=_safe_info_get(safety_info, "deformation_norm"),
+                    retiming_source=_safe_info_get(safety_info, "retiming_source"),
+                    retiming_norm=_safe_info_get(safety_info, "retiming_norm"),
                     deform_safe=_safe_info_get(safety_info, "deform_safe"),
                     deform_min_clearance=_safe_info_get(safety_info, "deform_min_clearance"),
                     chunk_deform_scale=_safe_info_get(safety_info, "chunk_deform_scale"),
@@ -7588,6 +10502,36 @@ def main():
                     committed_aborted_due_to_state_mismatch=_safe_info_get(safety_info, "committed_aborted_due_to_state_mismatch"),
                     committed_replan_due_to_state_mismatch=_safe_info_get(safety_info, "committed_replan_due_to_state_mismatch"),
                     committed_rejected_missing_planned_q=_safe_info_get(safety_info, "committed_rejected_missing_planned_q"),
+                    committed_state_mismatch_detected=_safe_info_get(safety_info, "committed_state_mismatch_detected"),
+                    committed_state_mismatch_recovered=_safe_info_get(safety_info, "committed_state_mismatch_recovered"),
+                    committed_suffix_replan_attempted=_safe_info_get(safety_info, "committed_suffix_replan_attempted"),
+                    committed_suffix_replan_accepted=_safe_info_get(safety_info, "committed_suffix_replan_accepted"),
+                    committed_suffix_replan_rejected=_safe_info_get(safety_info, "committed_suffix_replan_rejected"),
+                    committed_suffix_replan_reject_reason=_safe_info_get(safety_info, "committed_suffix_replan_reject_reason"),
+                    committed_suffix_replan_from_index=_safe_info_get(safety_info, "committed_suffix_replan_from_index"),
+                    committed_suffix_replan_old_length=_safe_info_get(safety_info, "committed_suffix_replan_old_length"),
+                    committed_suffix_replan_new_length=_safe_info_get(safety_info, "committed_suffix_replan_new_length"),
+                    committed_suffix_replan_target_index=_safe_info_get(safety_info, "committed_suffix_replan_target_index"),
+                    committed_suffix_replan_seed_start_index=_safe_info_get(safety_info, "committed_suffix_replan_seed_start_index"),
+                    committed_suffix_replan_min_clearance=_safe_info_get(safety_info, "committed_suffix_replan_min_clearance"),
+                    committed_suffix_replan_required_clearance=_safe_info_get(safety_info, "committed_suffix_replan_required_clearance"),
+                    committed_opportunistic_resume=_safe_info_get(safety_info, "committed_opportunistic_resume"),
+                    committed_released_for_act_resume=_safe_info_get(safety_info, "committed_released_for_act_resume"),
+                    committed_recovery_budget_exit=_safe_info_get(safety_info, "committed_recovery_budget_exit"),
+                    committed_replan_due_to_recovery_budget=_safe_info_get(safety_info, "committed_replan_due_to_recovery_budget"),
+                    committed_opportunistic_resume_available=_safe_info_get(safety_info, "committed_opportunistic_resume_available"),
+                    committed_opportunistic_resume_reason=_safe_info_get(safety_info, "committed_opportunistic_resume_reason"),
+                    committed_opportunistic_resume_q_dist=_safe_info_get(safety_info, "committed_opportunistic_resume_q_dist"),
+                    committed_opportunistic_resume_q_threshold=_safe_info_get(safety_info, "committed_opportunistic_resume_q_threshold"),
+                    committed_opportunistic_resume_min_clearance=_safe_info_get(safety_info, "committed_opportunistic_resume_min_clearance"),
+                    committed_opportunistic_resume_required_clearance=_safe_info_get(safety_info, "committed_opportunistic_resume_required_clearance"),
+                    committed_opportunistic_resume_rejoin_index=_safe_info_get(safety_info, "committed_opportunistic_resume_rejoin_index"),
+                    committed_recover_steps_since_act=_safe_info_get(safety_info, "committed_recover_steps_since_act"),
+                    max_recover_steps_before_act_resume=_safe_info_get(safety_info, "max_recover_steps_before_act_resume"),
+                    committed_suffix_replans_in_current_recovery=_safe_info_get(safety_info, "committed_suffix_replans_in_current_recovery"),
+                    max_suffix_replans_per_recovery=_safe_info_get(safety_info, "max_suffix_replans_per_recovery"),
+                    planned_q_at_index_before_suffix_replan=_safe_info_get(safety_info, "planned_q_at_index_before_suffix_replan"),
+                    actual_q_at_suffix_replan=_safe_info_get(safety_info, "actual_q_at_suffix_replan"),
                     actual_q_at_replay=_safe_info_get(safety_info, "actual_q_at_replay"),
                     diagnostic_step_mode=diagnostic_flags["diagnostic_step_mode"],
                     mode_transition=mode_transition,
@@ -7602,6 +10546,13 @@ def main():
                     brake_streak=_safe_info_get(safety_info, "brake_streak"),
                     recovery_failure_streak=_safe_info_get(safety_info, "recovery_failure_streak"),
                     recovery_failure_streak_max=_safe_info_get(safety_info, "recovery_failure_streak_max"),
+                    recovery_optimizer_cooldown_remaining=_safe_info_get(safety_info, "recovery_optimizer_cooldown_remaining"),
+                    recovery_retry_cooldown_steps=_safe_info_get(safety_info, "recovery_retry_cooldown_steps"),
+                    recovery_attempts_in_unsafe_streak=_safe_info_get(safety_info, "recovery_attempts_in_unsafe_streak"),
+                    recovery_max_attempts_per_unsafe_streak=_safe_info_get(safety_info, "recovery_max_attempts_per_unsafe_streak"),
+                    recovery_optimization_skipped=_safe_info_get(safety_info, "recovery_optimization_skipped"),
+                    recovery_optimization_skip_reason=_safe_info_get(safety_info, "recovery_optimization_skip_reason"),
+                    recovery_optimization_skipped_count=_safe_info_get(safety_info, "recovery_optimization_skipped_count"),
                     temporary_blocker_waiting=_safe_info_get(safety_info, "temporary_blocker_waiting"),
                     deform_trigger_reason=_safe_info_get(safety_info, "deform_trigger_reason"),
                     nominal_became_safe_after_brake=_safe_info_get(safety_info, "nominal_became_safe_after_brake"),
@@ -7670,6 +10621,23 @@ def main():
                     safe_prefix_execution=_safe_info_get(safety_info, "safe_prefix_execution"),
                     recover_projection_on_nominal=_safe_info_get(safety_info, "recover_projection_on_nominal"),
                     recover_cosine_to_nominal=_safe_info_get(safety_info, "recover_cosine_to_nominal"),
+                    recover_direction_cosine=_safe_info_get(safety_info, "recover_direction_cosine"),
+                    recover_direction_cosine_threshold=_safe_info_get(safety_info, "recover_direction_cosine_threshold"),
+                    recover_direction_loss=_safe_info_get(safety_info, "recover_direction_loss"),
+                    recover_direction_ok=_safe_info_get(safety_info, "recover_direction_ok"),
+                    recover_direction_alignment_available=_safe_info_get(safety_info, "recover_direction_alignment_available"),
+                    recover_direction_alignment_weight=_safe_info_get(safety_info, "recover_direction_alignment_weight"),
+                    recover_ordered_path_available=_safe_info_get(safety_info, "recover_ordered_path_available"),
+                    recover_ordered_target_index=_safe_info_get(safety_info, "recover_ordered_target_index"),
+                    recover_ordered_horizon=_safe_info_get(safety_info, "recover_ordered_horizon"),
+                    recover_ordered_pose_loss=_safe_info_get(safety_info, "recover_ordered_pose_loss"),
+                    recover_ordered_delta_loss=_safe_info_get(safety_info, "recover_ordered_delta_loss"),
+                    recover_ordered_loss=_safe_info_get(safety_info, "recover_ordered_loss"),
+                    recover_ordered_pose_weight=_safe_info_get(safety_info, "recover_ordered_pose_weight"),
+                    recover_ordered_delta_weight=_safe_info_get(safety_info, "recover_ordered_delta_weight"),
+                    recover_ordered_pose_threshold=_safe_info_get(safety_info, "recover_ordered_pose_threshold"),
+                    recover_ordered_delta_threshold=_safe_info_get(safety_info, "recover_ordered_delta_threshold"),
+                    recover_ordered_ok=_safe_info_get(safety_info, "recover_ordered_ok"),
                     nominal_rejoin_score=_safe_info_get(safety_info, "nominal_rejoin_score"),
                     nominal_rejoin_available=_safe_info_get(safety_info, "nominal_rejoin_available"),
                     nominal_rejoin_suppressed_reason=_safe_info_get(safety_info, "nominal_rejoin_suppressed_reason"),
@@ -7679,6 +10647,14 @@ def main():
                     recover_score_total=_safe_info_get(safety_info, "recover_score_total"),
                     recover_rejoin_weight_effective=_safe_info_get(safety_info, "recover_rejoin_weight_effective"),
                     recover_step_since_deform=_safe_info_get(safety_info, "recover_step_since_deform"),
+                    cem_iterations_run=_safe_info_get(safety_info, "cem_iterations_run"),
+                    cem_early_stopped=_safe_info_get(safety_info, "cem_early_stopped"),
+                    cem_max_iters=_safe_info_get(safety_info, "cem_max_iters"),
+                    cem_population=_safe_info_get(safety_info, "cem_population"),
+                    yield_cem_iterations_run=_safe_info_get(safety_info, "yield_cem_iterations_run"),
+                    yield_cem_early_stopped=_safe_info_get(safety_info, "yield_cem_early_stopped"),
+                    return_cem_iterations_run=_safe_info_get(safety_info, "return_cem_iterations_run"),
+                    return_cem_early_stopped=_safe_info_get(safety_info, "return_cem_early_stopped"),
                     nominal_rejoin_available_count=_safe_info_get(safety_info, "nominal_rejoin_available_count"),
                     nominal_rejoin_suppressed_count=_safe_info_get(safety_info, "nominal_rejoin_suppressed_count"),
                     stale_nominal_rejoin_suppressed_count=_safe_info_get(safety_info, "stale_nominal_rejoin_suppressed_count"),
@@ -7687,7 +10663,12 @@ def main():
                     recover_nonpositive_projection_count=_safe_info_get(safety_info, "recover_nonpositive_projection_count"),
                     mean_recover_projection_on_nominal=_safe_info_get(safety_info, "mean_recover_projection_on_nominal"),
                     mean_recover_cosine_to_nominal=_safe_info_get(safety_info, "mean_recover_cosine_to_nominal"),
+                    mean_recover_direction_cosine=_safe_info_get(safety_info, "mean_recover_direction_cosine"),
+                    mean_recover_direction_loss=_safe_info_get(safety_info, "mean_recover_direction_loss"),
                     mean_recover_task_progress_score=_safe_info_get(safety_info, "mean_recover_task_progress_score"),
+                    mean_recover_ordered_pose_loss=_safe_info_get(safety_info, "mean_recover_ordered_pose_loss"),
+                    mean_recover_ordered_delta_loss=_safe_info_get(safety_info, "mean_recover_ordered_delta_loss"),
+                    mean_recover_ordered_loss=_safe_info_get(safety_info, "mean_recover_ordered_loss"),
                     contact_during_hold=_safe_info_get(safety_info, "contact_during_hold"),
                     contact_during_brake=_safe_info_get(safety_info, "contact_during_brake"),
                     contact_during_deform=_safe_info_get(safety_info, "contact_during_deform"),
@@ -7738,6 +10719,10 @@ def main():
 
                     filter_time_ms=float(filter_time_ms),
                     monitor_time_ms=float(monitor_time_ms),
+                    env_step_time_ms=float(env_step_time_ms),
+                    policy_obs_adapt_time_ms=float(policy_obs_adapt_time_ms),
+                    policy_action_time_ms=float(policy_action_time_ms),
+                    policy_obs_update_time_ms=float(policy_obs_update_time_ms),
                 )
 
                 episode_metrics.append(step_metrics)
@@ -7859,6 +10844,16 @@ def main():
             episode_summary["execution_length"] = workspace_cfg.get("execution_length", None)
             episode_summary["action_sequence"] = workspace_cfg.get("action_sequence", None)
             episode_summary["video_time_base"] = args.video_time_base
+            if args.save_frame_images:
+                episode_frame_prefix = f"{args.condition}_episode_{episode:03d}_"
+                episode_frames = [
+                    path for path in saved_frame_image_paths
+                    if Path(path).name.startswith(episode_frame_prefix)
+                ]
+                episode_summary["frame_image_dir"] = str(frame_image_dir)
+                episode_summary["frame_image_every"] = int(args.frame_image_every)
+                episode_summary["frame_image_count"] = int(len(episode_frames))
+                episode_summary["frame_image_paths"] = episode_frames
             if trajectory_logging_enabled:
                 episode_summary["chunk_trajectory_trace_events"] = int(
                     len(episode_chunk_trajectory_records)
@@ -7866,22 +10861,27 @@ def main():
                 episode_summary["human_arm_trajectory_samples"] = int(
                     len(episode_human_arm_trajectory_samples)
                 )
+                episode_summary["executed_policy_trajectory_samples"] = int(
+                    len(episode_executed_policy_trajectory_samples)
+                )
                 if args.plot_chunk_trajectories_3d and (
                     episode_chunk_trajectory_records
                     or episode_human_arm_trajectory_samples
+                    or episode_executed_policy_trajectory_samples
                 ):
                     plot_path = trajectory_plot_dir / (
-                        f"{args.condition}_episode_{episode:03d}_trajectories_3d.png"
+                        f"{args.condition}_episode_{episode:03d}_trajectories_3d.html"
                     )
-                    saved_plot = _save_chunk_trajectory_plot(
+                    saved_plot = _save_chunk_trajectory_viewer(
                         plot_path,
-                        episode,
+                        f"Episode {episode:03d} SafeChunk 3D trajectories",
                         episode_chunk_trajectory_records,
                         episode_human_arm_trajectory_samples,
+                        episode_executed_policy_trajectory_samples,
                         args.chunk_trajectory_plot_max_events,
                     )
                     if saved_plot is not None:
-                        episode_summary["chunk_trajectory_plot_3d"] = saved_plot
+                        episode_summary["chunk_trajectory_viewer_3d"] = saved_plot
                         trajectory_plot_paths.append(saved_plot)
             all_episode_summaries.append(episode_summary)
 
@@ -7934,10 +10934,14 @@ def main():
         final_summary["human_arm_trajectory_samples"] = int(
             len(all_human_arm_trajectory_samples)
         )
+        final_summary["executed_policy_trajectory_samples"] = int(
+            len(all_executed_policy_trajectory_samples)
+        )
         final_summary["chunk_trajectory_trace_jsonl"] = str(chunk_trajectory_jsonl_path)
         final_summary["human_arm_trajectory_jsonl"] = str(human_arm_trajectory_jsonl_path)
-        final_summary["chunk_trajectory_plot_count"] = int(len(trajectory_plot_paths))
-        final_summary["chunk_trajectory_plots"] = list(trajectory_plot_paths)
+        final_summary["executed_policy_trajectory_jsonl"] = str(executed_policy_trajectory_jsonl_path)
+        final_summary["chunk_trajectory_viewer_count"] = int(len(trajectory_plot_paths))
+        final_summary["chunk_trajectory_viewers"] = list(trajectory_plot_paths)
         final_summary["chunk_trajectory_include_q_states"] = bool(
             args.chunk_trajectory_include_q_states
         )
@@ -7972,6 +10976,9 @@ def main():
         with human_arm_trajectory_jsonl_path.open("w") as f:
             for sample in all_human_arm_trajectory_samples:
                 f.write(json.dumps(_jsonable_trace_value(sample)) + "\n")
+        with executed_policy_trajectory_jsonl_path.open("w") as f:
+            for sample in all_executed_policy_trajectory_samples:
+                f.write(json.dumps(_jsonable_trace_value(sample)) + "\n")
 
     with step_jsonl_path.open("w") as f:
         for metric in all_step_metrics:
@@ -7997,8 +11004,9 @@ def main():
     if trajectory_logging_enabled:
         print("  chunk trajectory traces:", chunk_trajectory_jsonl_path)
         print("  human arm trajectory:", human_arm_trajectory_jsonl_path)
+        print("  executed policy trajectory:", executed_policy_trajectory_jsonl_path)
         if trajectory_plot_paths:
-            print("  trajectory plots:", trajectory_plot_dir)
+            print("  trajectory viewers:", trajectory_plot_dir)
     if args.save_actions is not None:
         print("  saved actions:", final_summary["saved_actions"])
 

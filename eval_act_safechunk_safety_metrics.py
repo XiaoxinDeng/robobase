@@ -51,6 +51,7 @@ except ImportError:  # tqdm may not be installed in every environment
 from eval_act_oscbf_safety_metrics import (
     _make_progress_bar,
     _parse_duration_seconds,
+    _path_consistent_brake_kwargs_from_config,
     _plot_episode_metrics,
     _video_duration_seconds,
 )
@@ -75,6 +76,7 @@ from robobase.eval_utils import (
 from robobase.safetyfilter.h1_state_bridge import extract_h1_state
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
 from robobase.safetyfilter.safechunk_deform_filter import SafeChunkDeformFilter
+from robobase.safetyfilter.path_consistent_brake_filter import PathConsistentBrakeFilter
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -422,11 +424,21 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--condition",
-        choices=["act", "chunk_deform", "sequential_oscbf"],
+        choices=["act", "chunk_deform", "path_consistent_brake", "sequential_oscbf"],
         required=True,
         help=(
             "act = monitor only; chunk_deform = SafeChunk-Deform horizon "
-            "deformation; sequential_oscbf = apply OSCBF to each chunk action."
+            "deformation; path_consistent_brake = standalone path-consistent braking filter; "
+            "sequential_oscbf = apply OSCBF to each chunk action."
+        ),
+    )
+    parser.add_argument(
+        "--path-consistent-brake-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional YAML overlay for PathConsistentBrake parameters. Relative "
+            "names are resolved under robobase/cfgs/safety_filter."
         ),
     )
     parser.add_argument("--snapshot", required=True, type=str)
@@ -486,7 +498,16 @@ def make_oscbf_filter(args) -> OSCBFFilter:
 
 
 def make_safechunk_filter(args, operator: HorizonOSCBFOperator) -> SafeChunkDeformFilter:
-    return SafeChunkDeformFilter(
+    filter_cls = (
+        PathConsistentBrakeFilter
+        if args.condition == "path_consistent_brake"
+        else SafeChunkDeformFilter
+    )
+    path_consistent_brake_kwargs = {}
+    if args.condition == "path_consistent_brake":
+        path_consistent_brake_kwargs = _path_consistent_brake_kwargs_from_config(args)
+
+    return filter_cls(
         oscbf_operator=operator,
         horizon=args.horizon,
         dt=0.05,
@@ -495,10 +516,15 @@ def make_safechunk_filter(args, operator: HorizonOSCBFOperator) -> SafeChunkDefo
         control_type="absolute",
         min_clearance=args.chunk_min_clearance,
         brake_progress_threshold=0.05,
-        deformation_enabled=True,
+        deformation_enabled=args.condition != "path_consistent_brake",
         chunk_deformation_scales=args.chunk_deformation_scales,
         chunk_deformation_smoothing=args.chunk_deformation_smoothing,
-        sequential_oscbf_fallback=args.sequential_oscbf_fallback,
+        sequential_oscbf_fallback=(
+            False
+            if args.condition == "path_consistent_brake"
+            else args.sequential_oscbf_fallback
+        ),
+        **path_consistent_brake_kwargs,
         debug=args.debug,
     )
 
@@ -526,7 +552,7 @@ def apply_filter(args, safechunk, env_action, obs, env, q_full, qd_full):
         safety_info = safechunk.evaluate_horizon_safety(obs, q_seq)
         safety_info = dict(safety_info)
         safety_info.update({"safety_mode": "act", "mode": "act"})
-    elif args.condition == "chunk_deform":
+    elif args.condition in {"chunk_deform", "path_consistent_brake"}:
         safe_chunk, safety_info = safechunk.filter_chunk(
             obs,
             chunk,
@@ -606,7 +632,12 @@ def summarise_chunk_episode(metrics: list[ChunkStepMetrics]) -> dict:
             "mean_deformation_norm": float(np.mean(deform_norms)) if deform_norms else None,
             "deform_safe_rate": float(np.mean(deform_safe)) if deform_safe else None,
             "pass_through_rate": rate(modes, "pass_through"),
+            "horizon_brake_rate": rate(modes, "horizon_brake"),
             "path_consistent_brake_rate": rate(modes, "path_consistent_brake"),
+            "path_consistent_brake_intended_rate": rate(modes, "path_consistent_brake_intended_step"),
+            "horizon_brake_intended_rate": rate(modes, "horizon_brake_intended_step"),
+            "verified_failsafe_rate": rate(modes, "verified_failsafe"),
+            "unverified_emergency_failsafe_rate": rate(modes, "unverified_emergency_failsafe"),
             "horizon_deform_rate": rate(modes, "horizon_deform"),
             "sequential_oscbf_rate": rate(modes, "sequential_oscbf"),
             "chunk_deform_source_rate": rate(sources, "chunk_deform"),
@@ -635,7 +666,12 @@ def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
             "mean_deformation_norm": mean_of("mean_deformation_norm"),
             "mean_deform_safe_rate": mean_of("deform_safe_rate"),
             "mean_pass_through_rate": mean_of("pass_through_rate"),
+            "mean_horizon_brake_rate": mean_of("horizon_brake_rate"),
             "mean_path_consistent_brake_rate": mean_of("path_consistent_brake_rate"),
+            "mean_path_consistent_brake_intended_rate": mean_of("path_consistent_brake_intended_rate"),
+            "mean_horizon_brake_intended_rate": mean_of("horizon_brake_intended_rate"),
+            "mean_verified_failsafe_rate": mean_of("verified_failsafe_rate"),
+            "mean_unverified_emergency_failsafe_rate": mean_of("unverified_emergency_failsafe_rate"),
             "mean_horizon_deform_rate": mean_of("horizon_deform_rate"),
             "mean_sequential_oscbf_rate": mean_of("sequential_oscbf_rate"),
             "mean_chunk_deform_source_rate": mean_of("chunk_deform_source_rate"),

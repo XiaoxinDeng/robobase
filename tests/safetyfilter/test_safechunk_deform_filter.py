@@ -2,15 +2,36 @@ import logging
 
 import numpy as np
 
-from robobase.safetyfilter.safechunk_deform_filter import SafeChunkDeformFilter
+from robobase.safetyfilter.safechunk_deform_filter import RecoveryContext, SafeChunkDeformFilter
+from robobase.safetyfilter.path_consistent_brake_filter import PathConsistentBrakeFilter
 
 
 CTRL = np.asarray([4, 5, 6, 7, 9, 10, 11, 12])
+BASE_ARM_CTRL = np.asarray([0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12])
 PASS = np.asarray([i for i in range(16) if i not in set(CTRL.tolist())])
+BASE_ARM_PASS = np.asarray([i for i in range(16) if i not in set(BASE_ARM_CTRL.tolist())])
 
 
 class FakeOSCBF:
     def __call__(self, action, obs=None, **kwargs):
+        out = np.array(action, copy=True)
+        out[CTRL] *= 0.5
+        return out
+
+
+class FakeChunkOSCBF:
+    def __init__(self):
+        self.chunk_calls = 0
+        self.single_calls = 0
+
+    def filter_chunk(self, action_chunk, obs=None, **kwargs):
+        self.chunk_calls += 1
+        out = np.array(action_chunk, copy=True)
+        out[:, CTRL] *= 0.25
+        return out, {"operator_chunk_info": True}
+
+    def __call__(self, action, obs=None, **kwargs):
+        self.single_calls += 1
         out = np.array(action, copy=True)
         out[CTRL] *= 0.5
         return out
@@ -162,6 +183,408 @@ def test_single_action_returns_same_shape():
     assert filt.last_info["safety_mode"] == "single_step_oscbf"
 
 
+def test_jax_batched_optimizer_is_default_and_matches_serial_rollout():
+    filt = SafeChunkDeformFilter(mode="optimized", debug=False)
+    assert filt.jax_batched_optimizer is True
+
+    chunk = make_chunk(4)
+    chunks = np.stack([chunk, chunk + 0.05], axis=0).astype(np.float32)
+    obs = {"q": np.linspace(0.0, 0.13, 14, dtype=np.float32)}
+
+    batch_rollout = filt.rollout_nominal_chunk_batch(obs, chunks)
+    serial_rollout = np.stack(
+        [filt.rollout_nominal_chunk(obs, candidate) for candidate in chunks],
+        axis=0,
+    )
+
+    np.testing.assert_allclose(batch_rollout, serial_rollout, rtol=1e-6, atol=1e-6)
+
+
+def test_base_indices_roll_out_as_delta_when_arm_is_absolute():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+    )
+    q0 = np.zeros(14, dtype=np.float32)
+    q0[:5] = [1.0, 2.0, 3.0, 0.5, 0.25]
+    chunk = np.zeros((3, 16), dtype=np.float32)
+    chunk[:, 0] = [0.1, 0.2, -0.05]
+    chunk[:, 1] = [0.0, 0.3, 0.0]
+    chunk[:, 2] = [0.01, 0.01, 0.01]
+    chunk[:, 3] = [0.2, 0.0, -0.1]
+    chunk[:, 4] = [0.9, 0.8, 0.7]
+    chunk[:, 5] = [-0.4, -0.3, -0.2]
+
+    q_seq = filt.rollout_nominal_chunk({"q": q0}, chunk)
+
+    np.testing.assert_allclose(q_seq[:, 0], [1.1, 1.3, 1.25])
+    np.testing.assert_allclose(q_seq[:, 1], [2.0, 2.3, 2.3])
+    np.testing.assert_allclose(q_seq[:, 2], [3.01, 3.02, 3.03])
+    np.testing.assert_allclose(q_seq[:, 3], [0.7, 0.7, 0.6])
+    np.testing.assert_allclose(q_seq[:, 4], [0.9, 0.8, 0.7])
+    np.testing.assert_allclose(q_seq[:, 5], [-0.4, -0.3, -0.2])
+
+
+def test_base_delta_absolute_arm_rollout_batch_matches_serial():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+    )
+    q0 = np.linspace(-0.2, 0.45, 14, dtype=np.float32)
+    chunk = np.zeros((4, 16), dtype=np.float32)
+    chunk[:, 0] = [0.05, -0.02, 0.03, 0.01]
+    chunk[:, 1] = [0.0, 0.04, 0.0, -0.02]
+    chunk[:, 2] = [0.01, 0.01, -0.02, 0.0]
+    chunk[:, 3] = [-0.1, 0.1, 0.0, 0.05]
+    chunk[:, CTRL] = np.linspace(0.1, 0.4, chunk.shape[0], dtype=np.float32)[:, None]
+    chunks = np.stack([chunk, chunk + 0.03], axis=0).astype(np.float32)
+
+    batch_rollout = filt.rollout_nominal_chunk_batch({"q": q0}, chunks)
+    serial_rollout = np.stack(
+        [filt.rollout_nominal_chunk({"q": q0}, candidate) for candidate in chunks],
+        axis=0,
+    )
+
+    np.testing.assert_allclose(batch_rollout, serial_rollout, rtol=1e-6, atol=1e-6)
+
+
+def test_return_seed_tracks_future_nominal_q_with_base_delta_actions():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+        min_rejoin_offset=2,
+    )
+    filt.return_horizon = 3
+    nominal_chunk = np.zeros((8, 16), dtype=np.float32)
+    nominal_chunk[:, :4] = 0.01
+    nominal_q_seq = np.zeros((8, 14), dtype=np.float32)
+    nominal_q_seq[2, :4] = [0.10, -0.05, 0.02, 0.04]
+    nominal_q_seq[3, :4] = [0.18, -0.03, 0.03, 0.07]
+    nominal_q_seq[4, :4] = [0.25, -0.01, 0.05, 0.10]
+    nominal_q_seq[2, CTRL] = 0.20
+    nominal_q_seq[3, CTRL] = 0.30
+    nominal_q_seq[4, CTRL] = 0.40
+    nominal_q_seq[5:, BASE_ARM_CTRL] = 2.0
+    nominal_chunk[2:5, CTRL] = nominal_q_seq[2:5, CTRL]
+    context = RecoveryContext(
+        nominal_chunk=nominal_chunk,
+        nominal_q_seq=nominal_q_seq,
+    )
+    q_start = np.zeros(14, dtype=np.float32)
+    current_chunk = np.zeros_like(nominal_chunk)
+
+    return_chunk, target_index = filt._make_return_seed_chunk(
+        context,
+        q_start,
+        current_chunk,
+        BASE_ARM_CTRL,
+    )
+    q_seq = filt.rollout_nominal_chunk({"q": q_start}, return_chunk)
+
+    assert target_index == 2
+    np.testing.assert_allclose(return_chunk[0, :4], nominal_q_seq[2, :4], atol=1e-6)
+    np.testing.assert_allclose(
+        return_chunk[1, :4],
+        nominal_q_seq[3, :4] - nominal_q_seq[2, :4],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(q_seq[:3, :4], nominal_q_seq[2:5, :4], atol=1e-6)
+    np.testing.assert_allclose(q_seq[:3, CTRL], nominal_q_seq[2:5, CTRL], atol=1e-6)
+
+
+def test_recovery_terminal_ordered_path_ends_at_terminal_rejoin_index():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+        min_rejoin_offset=2,
+        safechunk_recover={
+            "ordered_pose_weight": 10.0,
+            "ordered_delta_weight": 5.0,
+            "require_ordered_path": True,
+        },
+    )
+    filt.return_horizon = 3
+    filt.evaluate_horizon_safety = lambda _obs, q_seq: {
+        "horizon_safe": True,
+        "min_clearance": 1.0,
+        "min_clearances": np.ones(q_seq.shape[0], dtype=np.float32),
+    }
+    nominal_chunk = np.zeros((8, 16), dtype=np.float32)
+    nominal_q_seq = np.zeros((8, 14), dtype=np.float32)
+    nominal_q_seq[2, :4] = [0.10, -0.05, 0.02, 0.04]
+    nominal_q_seq[3, :4] = [0.18, -0.03, 0.03, 0.07]
+    nominal_q_seq[4, :4] = [0.25, -0.01, 0.05, 0.10]
+    nominal_q_seq[2, CTRL] = 0.20
+    nominal_q_seq[3, CTRL] = 0.30
+    nominal_q_seq[4, CTRL] = 0.40
+    nominal_q_seq[5:, BASE_ARM_CTRL] = 2.0
+    context = RecoveryContext(
+        nominal_chunk=nominal_chunk,
+        nominal_q_seq=nominal_q_seq,
+    )
+    q_start = np.zeros(14, dtype=np.float32)
+    return_chunk, seed_index = filt._make_return_seed_chunk(
+        context,
+        q_start,
+        np.zeros_like(nominal_chunk),
+        BASE_ARM_CTRL,
+    )
+    terminal = filt._recovery_terminal_rejoin_info(
+        {"q": q_start},
+        return_chunk,
+        context,
+        filt._make_rejoin_context(nominal_q_seq),
+        default_target_index=seed_index,
+    )
+
+    assert terminal["target_index"] == 4
+    assert terminal["recover_ordered_target_index"] == 2
+    assert terminal["recover_ordered_ok"] is True
+    np.testing.assert_allclose(terminal["recover_ordered_pose_loss"], 0.0, atol=1e-6)
+    np.testing.assert_allclose(terminal["recover_ordered_delta_loss"], 0.0, atol=1e-6)
+
+
+def test_task_progress_recover_seed_tracks_context_nominal_with_base_delta_actions():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+        min_rejoin_offset=2,
+    )
+    filt.return_horizon = 3
+    nominal_chunk = np.zeros((8, 16), dtype=np.float32)
+    nominal_q_seq = np.zeros((8, 14), dtype=np.float32)
+    nominal_q_seq[2, :4] = [0.10, -0.05, 0.02, 0.04]
+    nominal_q_seq[3, :4] = [0.18, -0.03, 0.03, 0.07]
+    nominal_q_seq[4, :4] = [0.25, -0.01, 0.05, 0.10]
+    nominal_q_seq[2, CTRL] = 0.20
+    nominal_q_seq[3, CTRL] = 0.30
+    nominal_q_seq[4, CTRL] = 0.40
+    nominal_q_seq[5:, BASE_ARM_CTRL] = 2.0
+    context = RecoveryContext(
+        nominal_chunk=nominal_chunk,
+        nominal_q_seq=nominal_q_seq,
+    )
+    q_start = np.zeros(14, dtype=np.float32)
+    current_chunk = np.zeros_like(nominal_chunk)
+
+    recover_chunk, target_index = filt._make_task_progress_recover_chunk(
+        q_start,
+        current_chunk,
+        BASE_ARM_CTRL,
+        context=context,
+        default_target_index=2,
+    )
+    q_seq = filt.rollout_nominal_chunk({"q": q_start}, recover_chunk)
+
+    assert target_index == 2
+    np.testing.assert_allclose(recover_chunk[0, :4], nominal_q_seq[2, :4], atol=1e-6)
+    np.testing.assert_allclose(
+        recover_chunk[1, :4],
+        nominal_q_seq[3, :4] - nominal_q_seq[2, :4],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(q_seq[:3, :4], nominal_q_seq[2:5, :4], atol=1e-6)
+    np.testing.assert_allclose(q_seq[:3, CTRL], nominal_q_seq[2:5, CTRL], atol=1e-6)
+
+
+def test_immediate_base_arm_absolute_brake_zeroes_base_delta_and_holds_arm_q():
+    filt = unsafe_filter(
+        first_violation=0,
+        safe=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+    )
+    chunk = make_chunk()
+    q = np.linspace(-0.7, 0.7, 14, dtype=np.float32)
+
+    braked, info = filt.horizon_brake({"q": q}, chunk, {"first_violation": 0})
+
+    assert info["brake_stop_idx"] == 0
+    assert info["brake_hold_current"] is True
+    np.testing.assert_allclose(braked[:, :4], 0.0)
+    np.testing.assert_allclose(braked[:, CTRL], np.repeat(q[None, CTRL], chunk.shape[0], axis=0))
+    np.testing.assert_allclose(braked[:, BASE_ARM_PASS], chunk[:, BASE_ARM_PASS])
+
+
+def test_chunk_trajectory_trace_logs_only_receding_horizon_first_action():
+    from eval_act_oscbf_safety_metrics import _collect_chunk_trajectory_trace
+
+    class Args:
+        condition = "path_consistent_brake"
+        chunk_trajectory_include_q_states = True
+
+    class FakeHorizonOperator:
+        def ee_pose_sequence(self, q_seq):
+            q_seq = np.asarray(q_seq, dtype=np.float32)
+            return q_seq[:, :3]
+
+    filt = SafeChunkDeformFilter(debug=False)
+    nominal = make_chunk(h=4)
+    generated = nominal.copy()
+    generated[:, CTRL] = 0.0
+
+    record = _collect_chunk_trajectory_trace(
+        args=Args(),
+        episode=0,
+        step=3,
+        safechunk=filt,
+        horizon_operator=FakeHorizonOperator(),
+        obs={"q": np.zeros(14, dtype=np.float32)},
+        nominal_chunk=nominal,
+        generated_chunk=generated,
+        safety_info={
+            "safety_mode": "path_consistent_brake",
+            "deformation_source": "path_consistent_brake",
+        },
+    )
+
+    assert record["planned_action_horizon"] == 4
+    assert record["executed_action_horizon"] == 1
+    assert record["segment_lengths"]["planned_total"] == 4
+    assert record["segment_lengths"]["total"] == 1
+    for trace_name in ("nominal", "braking", "generated"):
+        trace = record["traces"][trace_name]
+        assert trace["horizon"] == 1
+        assert trace["action_shape"] == [1, 16]
+        assert len(trace["action_chunk"]) == 1
+        assert len(trace["q_seq"]) == 1
+
+    executed = record["executed_policy_sample"]
+    assert executed["source"] == "transformed_safe_action_sequence"
+    assert executed["step"] == 4
+    np.testing.assert_allclose(executed["ee_pos"], record["traces"]["generated"]["ee_xyz"][0])
+    np.testing.assert_allclose(executed["q"], record["traces"]["generated"]["q_seq"][0])
+    np.testing.assert_allclose(executed["action"], record["traces"]["generated"]["action_chunk"][0])
+
+
+def test_actual_execution_segments_are_colored_by_adjacent_modes():
+    from eval_act_oscbf_safety_metrics import (
+        _execution_marker_segments,
+        _execution_pair_segments,
+    )
+
+    samples = [
+        {"episode": 0, "step": 0, "ee_pos": [0.0, 0.0, 0.0], "execution_mode": "policy"},
+        {"episode": 0, "step": 1, "ee_pos": [1.0, 0.0, 0.0], "execution_mode": "policy"},
+        {"episode": 0, "step": 2, "ee_pos": [2.0, 0.0, 0.0], "execution_mode": "braking"},
+        {"episode": 0, "step": 3, "ee_pos": [3.0, 0.0, 0.0], "execution_mode": "braking"},
+        {"episode": 0, "step": 4, "ee_pos": [4.0, 0.0, 0.0], "execution_mode": "deform"},
+    ]
+
+    policy_segments = _execution_pair_segments(samples, "policy")
+    intervention_segments = _execution_pair_segments(samples, "intervention")
+    transition_segments = _execution_pair_segments(samples, "transition")
+    policy_markers = _execution_marker_segments(samples, "policy", "policy")
+    intervention_markers = _execution_marker_segments(samples, "intervention", "intervention")
+
+    assert [segment["steps"] for segment in policy_segments] == [[0, 1]]
+    assert [segment["steps"] for segment in intervention_segments] == [[2, 3]]
+    assert [segment["steps"] for segment in transition_segments] == [[1, 2], [3, 4]]
+    assert policy_markers[0]["steps"] == [0, 1]
+    assert intervention_markers[0]["steps"] == [2, 3, 4]
+
+
+def test_drawer_reference_uses_logged_handle_and_open_distance():
+    from eval_act_oscbf_safety_metrics import _drawer_reference_from_samples
+
+    ref = _drawer_reference_from_samples([
+        {
+            "episode": 0,
+            "step": 1,
+            "ee_pos": [0.0, 0.0, 0.0],
+            "handle_pos": [0.875, -0.1, 0.666],
+            "drawer_open_distance": 0.1,
+            "drawer_open_fraction": 0.25,
+        }
+    ])
+
+    assert ref is not None
+    np.testing.assert_allclose(ref["handle_pos"], [0.875, -0.1, 0.666])
+    assert ref["source"] in {"base_cabinet_600_xml", "handle_fallback"}
+    assert ref["cabinet"]
+    assert ref["drawer"]
+    assert ref["handle"]
+    if ref["source"] == "base_cabinet_600_xml":
+        assert ref["absolute"] is True
+        np.testing.assert_allclose(ref["origin"], [0.0, 0.0, 0.0])
+        drawer_points = np.asarray(ref["drawer"], dtype=np.float64).reshape(-1, 3)
+        assert drawer_points[:, 0].min() < 0.875 < drawer_points[:, 0].max()
+        assert drawer_points[:, 1].min() < -0.1 < drawer_points[:, 1].max()
+    else:
+        np.testing.assert_allclose(ref["origin"], [0.875, 0.0, 0.666])
+        np.testing.assert_allclose(ref["open_axis"], [0.0, -1.0, 0.0])
+        assert ref["default_open"] == 0.1
+
+
+def test_drawer_reference_prefers_logged_mujoco_geometry():
+    from eval_act_oscbf_safety_metrics import _drawer_reference_from_samples
+
+    cabinet = [[[1.0, 2.0, 3.0], [1.5, 2.0, 3.0]]]
+    drawer = [[[2.0, 2.0, 3.0], [2.5, 2.0, 3.0]]]
+    ref = _drawer_reference_from_samples([
+        {
+            "episode": 0,
+            "step": 1,
+            "ee_pos": [0.0, 0.0, 0.0],
+            "object_state": {
+                "handle_pos": [0.875, -0.1, 0.666],
+                "drawer_open_distance": 0.1,
+                "drawer_open_fraction": 0.25,
+                "drawer_scene_geometry": {
+                    "absolute": True,
+                    "cabinet": cabinet,
+                    "drawer": drawer,
+                },
+            },
+        }
+    ])
+
+    assert ref is not None
+    assert ref["absolute"] is True
+    assert ref["source"] == "mujoco_geoms"
+    assert ref["cabinet"] == cabinet
+    assert ref["drawer"] == drawer
+    np.testing.assert_allclose(ref["handle_pos"], [0.875, -0.1, 0.666])
+
+
+def test_pause_scaling_keeps_base_as_delta_and_arm_as_absolute():
+    from eval_act_oscbf_safety_metrics import (
+        _pause_arm_at_current_q,
+        _scale_controlled_motion_from_current_q,
+    )
+
+    q = np.linspace(-0.7, 0.7, 14, dtype=np.float32)
+    action = np.zeros(16, dtype=np.float32)
+    action[:4] = [0.2, -0.1, 0.05, 0.3]
+    action[CTRL] = q[CTRL] + 0.4
+
+    paused = _pause_arm_at_current_q(action, q, BASE_ARM_CTRL, BASE_ARM_CTRL)
+    scaled = _scale_controlled_motion_from_current_q(
+        action, q, BASE_ARM_CTRL, BASE_ARM_CTRL, scale=0.5
+    )
+
+    np.testing.assert_allclose(paused[:4], 0.0)
+    np.testing.assert_allclose(paused[CTRL], q[CTRL])
+    np.testing.assert_allclose(scaled[:4], 0.5 * action[:4])
+    np.testing.assert_allclose(scaled[CTRL], q[CTRL] + 0.5 * (action[CTRL] - q[CTRL]))
+
+
 def test_non_controlled_dimensions_are_preserved_by_deformation():
     filt = unsafe_filter(
         first_violation=1,
@@ -182,7 +605,7 @@ def test_braking_holds_from_previous_safe_index():
     filt = unsafe_filter(first_violation=5, safe=False)
     chunk = make_chunk()
 
-    braked, info = filt.path_consistent_brake(
+    braked, info = filt.horizon_brake(
         {"q": np.zeros(14)},
         chunk,
         {"first_violation": 5},
@@ -199,7 +622,7 @@ def test_immediate_violation_brake_holds_current_q():
     chunk = make_chunk()
     q = np.linspace(-0.7, 0.7, 14, dtype=np.float32)
 
-    braked, info = filt.path_consistent_brake(
+    braked, info = filt.horizon_brake(
         {"q": q},
         chunk,
         {"first_violation": 0},
@@ -210,6 +633,61 @@ def test_immediate_violation_brake_holds_current_q():
     np.testing.assert_allclose(braked[:, CTRL], np.repeat(q[None, CTRL], chunk.shape[0], axis=0))
     np.testing.assert_allclose(braked[:, PASS], chunk[:, PASS])
 
+
+
+def test_path_consistent_q_transition_keeps_base_as_delta():
+    filt = PathConsistentBrakeFilter(
+        waypoint_substeps=1,
+        certified_backup_enabled=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+        debug=False,
+    )
+    action = np.zeros(16, dtype=np.float32)
+    q_prev = np.linspace(-0.5, 0.8, 14, dtype=np.float32)
+    q_next = q_prev.copy()
+    q_next[:4] += [0.10, -0.05, 0.02, 0.30]
+    q_next[CTRL] = np.linspace(0.2, 0.9, CTRL.shape[0], dtype=np.float32)
+
+    converted = filt._action_from_q_transition(
+        action, q_prev, q_next, BASE_ARM_CTRL, BASE_ARM_CTRL
+    )
+    hold = filt._make_hold_chunk_from_q(
+        {"q": q_prev}, np.ones((3, 16), dtype=np.float32), q_prev, horizon=3
+    )
+
+    np.testing.assert_allclose(converted[:4], q_next[:4] - q_prev[:4])
+    np.testing.assert_allclose(converted[CTRL], q_next[CTRL])
+    np.testing.assert_allclose(hold[:, :4], 0.0)
+    np.testing.assert_allclose(hold[:, CTRL], np.repeat(q_prev[None, CTRL], 3, axis=0))
+
+
+def test_path_consistent_brake_filter_is_restored_under_requested_name():
+    filt = PathConsistentBrakeFilter(
+        waypoint_substeps=1,
+        certified_backup_enabled=False,
+        debug=False,
+    )
+    chunk = np.zeros((2, 16), dtype=np.float32)
+
+    def evaluate(_obs, q_seq):
+        return {
+            "horizon_safe": True,
+            "min_clearance": 1.0,
+            "min_clearances": np.ones(q_seq.shape[0], dtype=np.float32),
+            "first_violation": None,
+            "unsafe_count": 0,
+            "safety_eval_available": True,
+        }
+
+    filt.evaluate_horizon_safety = evaluate
+    safe, info = filt.filter_chunk({"q": np.zeros(14, dtype=np.float32)}, chunk)
+
+    assert isinstance(filt, PathConsistentBrakeFilter)
+    assert info["filter_name"] == "path_consistent_brake"
+    assert info["safety_mode"] == "pass_through"
+    np.testing.assert_allclose(safe, chunk)
 
 def test_deadlock_defers_deformation_until_window():
     filt = SafeChunkDeformFilter(
@@ -240,7 +718,7 @@ def test_deadlock_defers_deformation_until_window():
 
     assert info["deadlock"] is True
     assert info["deformation_deferred"] is True
-    assert info["safety_mode"] == "path_consistent_brake"
+    assert info["safety_mode"] == "horizon_brake"
     np.testing.assert_allclose(safe[:, CTRL], 0.0)
 
     safe, info = filt.filter_chunk({"q": np.zeros(14)}, chunk)
@@ -259,7 +737,7 @@ def test_unsafe_deformation_falls_back_to_brake():
 
     assert info["deformation_rejected"] is True
     assert info["fallback_reason"] == "deform_unsafe"
-    assert info["safety_mode"] == "path_consistent_brake"
+    assert info["safety_mode"] == "horizon_brake"
     np.testing.assert_allclose(safe[:, CTRL], 0.0)
     np.testing.assert_allclose(safe[:, PASS], chunk[:, PASS])
 
@@ -275,10 +753,43 @@ def test_fake_oscbf_changes_only_controlled_dimensions_and_reports_norm():
     assert info["deformation_norm"] > 0.0
 
 
+def test_deform_chunk_uses_batched_oscbf_operator_when_available():
+    op = FakeChunkOSCBF()
+    filt = SafeChunkDeformFilter(oscbf_operator=op, debug=False)
+    chunk = make_chunk()
+
+    safe, info = filt.deform_chunk_with_oscbf({"q": np.zeros(14)}, chunk)
+
+    assert op.chunk_calls == 1
+    assert op.single_calls == 0
+    np.testing.assert_allclose(safe[:, CTRL], chunk[:, CTRL] * 0.25)
+    np.testing.assert_allclose(safe[:, PASS], chunk[:, PASS])
+    assert info["operator_chunk_info"] is True
+    assert info["sequential_oscbf_batched"] is True
+    assert info["sequential_oscbf_batch_method"] == "filter_chunk"
+    assert info["deformation_norm"] > 0.0
+
+
 def test_existing_oscbf_import_is_not_broken():
     from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
 
     assert OSCBFFilter is not None
+
+
+def test_oscbf_base_conversion_uses_delta_under_absolute_control():
+    from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
+
+    filt = object.__new__(OSCBFFilter)
+    filt.control_type = "absolute"
+    filt.dt = 0.05
+    q_base = np.asarray([1.0, -2.0, 0.5, 0.25], dtype=np.float32)
+    base_delta = np.asarray([0.10, -0.05, 0.02, 0.30], dtype=np.float32)
+
+    velocity = filt._bigym_base_action_to_velocity(q_base, base_delta)
+    recovered_action = filt._bigym_base_velocity_to_action(q_base, velocity)
+
+    np.testing.assert_allclose(velocity, base_delta / filt.dt)
+    np.testing.assert_allclose(recovered_action, base_delta)
 
 
 class RaisingOSCBF:
@@ -472,7 +983,7 @@ def test_optimized_mode_falls_back_to_brake_when_unrecoverable():
     assert info["optimized_fallback"] == "brake"
     assert info["fallback_reason"] == "unrecoverable"
     assert info["rejection_cause"] == "unrecoverable"
-    assert info["safety_mode"] == "path_consistent_brake"
+    assert info["safety_mode"] == "horizon_brake"
     np.testing.assert_allclose(safe[:, CTRL], 0.0)
     np.testing.assert_allclose(safe[:, PASS], chunk[:, PASS])
 
@@ -944,6 +1455,45 @@ def test_explicit_recovery_requires_return_rejoin_loss_to_pass():
     assert info["optimized_accepted"] is not True if "optimized_accepted" in info else True
 
 
+def test_task_progress_recovery_cost_uses_return_seed_as_direction_reference():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        debug=False,
+        controlled_action_indices=BASE_ARM_CTRL,
+        controlled_state_indices=BASE_ARM_CTRL,
+        control_type="absolute",
+        safechunk_recover={
+            "direction_alignment_weight": 10.0,
+            "min_direction_cosine": 0.7,
+            "ordered_pose_weight": 1.0,
+            "ordered_delta_weight": 1.0,
+        },
+    )
+    filt.evaluate_horizon_safety = lambda _obs, q_seq: {
+        "horizon_safe": True,
+        "min_clearance": 1.0,
+        "min_clearances": np.ones(q_seq.shape[0], dtype=np.float32),
+    }
+    obs = {"q": np.zeros(14, dtype=np.float32)}
+    reference = np.zeros((3, 16), dtype=np.float32)
+    reference[:, 0] = 0.1
+    reference[:, CTRL] = 0.2
+    stale_latest = -reference.copy()
+    filt.latest_nominal_chunk = stale_latest
+
+    _cost, losses = filt._recover_task_progress_cost(
+        obs,
+        reference.copy(),
+        reference.copy(),
+        BASE_ARM_CTRL,
+        reference_chunk=reference,
+    )
+
+    assert losses["recover_direction_ok"] is True
+    assert losses["recover_direction_cosine"] > 0.99
+    assert losses["recover_ordered_ok"] is True
+
+
 def test_task_progress_recovery_checks_q_rejoin_without_optimizing_it():
     filt = _explicit_recovery_filter(q_rejoin_threshold=0.5)
     filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
@@ -986,8 +1536,31 @@ def test_task_progress_recovery_checks_q_rejoin_without_optimizing_it():
     assert info["rejection_cause"] == "unrecoverable"
 
 
-def test_task_progress_recovery_rejects_bad_qd_rejoin():
+def test_task_progress_recovery_treats_bad_qd_rejoin_as_soft_by_default():
     filt = _explicit_recovery_filter(q_rejoin_threshold=0.5)
+    filt.qd_rejoin_threshold = 0.5
+
+    reason = filt._recovery_reject_reason(
+        {
+            "q_rejoin_ok": True,
+            "qd_rejoin_ok": False,
+            "qd_rejoin_required": False,
+            "qd_rejoin_hard_failed": False,
+        },
+        {"immediate_safe": True, "prefix_safe": True, "path_safe": True},
+        direction_ok=True,
+        ordered_ok=True,
+    )
+
+    assert reason is None
+
+
+
+def test_task_progress_recovery_rejects_bad_qd_rejoin_when_required():
+    filt = _explicit_recovery_filter(
+        q_rejoin_threshold=0.5,
+        recoverable_deform={"require_qd_rejoin": True},
+    )
     filt.qd_rejoin_threshold = 0.5
     filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
     chunk = make_chunk()
@@ -1136,6 +1709,7 @@ def test_explicit_recovery_delays_when_direct_recovery_corridor_is_unsafe():
 
 def test_explicit_recovery_accepts_safe_detour_after_direct_corridor_reject():
     filt = _explicit_recovery_filter(q_rejoin_threshold=10.0)
+    filt.enable_detour_rejoin = True
     filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
 
     def fake_recovery_path(_obs, _chunk, candidate_name="recover"):
@@ -1225,7 +1799,7 @@ def test_explicit_recovery_fallback_used_when_return_fails():
     assert info["recover_accepted"] is False
     assert info["fallback_used"] is True
     assert info["optimized_accepted"] is False
-    assert info["safety_mode"] == "path_consistent_brake"
+    assert info["safety_mode"] == "horizon_brake"
     np.testing.assert_allclose(safe[:, CTRL], 0.0)
 
 
@@ -1237,6 +1811,7 @@ def test_explicit_recovery_commits_accepted_chunk_and_serves_return_step():
         yield_horizon=1,
         return_horizon=2,
         deadlock_window=0,
+        explicit_recovery={"opportunistic_act_resume": False},
     )
     filt.task_progress_brake_threshold = 1.0
     chunk = make_chunk()
@@ -1279,6 +1854,114 @@ def test_explicit_recovery_commits_accepted_chunk_and_serves_return_step():
     assert info1["recover_steps_executed"] == 1
     assert info1["committed_chunk_index"] == 1
     assert filt.committed_chunk_index == 2
+
+
+def test_committed_recovery_opportunistically_resumes_act_when_rejoined():
+    filt = _explicit_recovery_filter(
+        q_rejoin_threshold=10.0,
+        yield_horizon=1,
+        return_horizon=2,
+        explicit_recovery={
+            "opportunistic_act_resume": True,
+            "opportunistic_resume_min_clearance": 0.08,
+        },
+    )
+    filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
+    chunk = make_chunk()
+    chunk[:, CTRL] = 0.1
+    obs = {"q": np.zeros(14, dtype=np.float32)}
+    nominal_q_seq = filt.rollout_nominal_chunk(obs, chunk)
+    filt.recovery_context = RecoveryContext(
+        nominal_chunk=chunk.copy(),
+        nominal_q_seq=nominal_q_seq.copy(),
+        active=False,
+        target_rejoin_index=3,
+        phase="recover",
+    )
+    info = {
+        "optimized_accepted": True,
+        "deform_chunk_length": 1,
+        "recover_chunk_length": 2,
+        "recover_target_index": 3,
+        "recover_min_clearance": 1.0,
+    }
+
+    committed, reject_info = filt._commit_explicit_recovery_chunk(obs, chunk, info)
+    assert committed is True
+    assert reject_info == {}
+    filt.committed_chunk_index = 1
+    replay_q = nominal_q_seq[0].copy()
+
+    result = filt._serve_committed_chunk(
+        {"q": replay_q},
+        chunk,
+        chunk.shape,
+        q_full=replay_q,
+    )
+
+    assert result is not None
+    safe_chunk, replay_info = result
+    np.testing.assert_allclose(safe_chunk, chunk)
+    assert replay_info["committed_opportunistic_resume"] is True
+    assert replay_info["committed_released_for_act_resume"] is True
+    assert replay_info["mode"] == "pass_through"
+    assert replay_info["recover_steps_executed"] == 0
+    assert replay_info["act_resume_index"] is not None
+    assert filt.committed_chunk is None
+    assert filt.committed_opportunistic_resume_count == 1
+
+
+def test_committed_recovery_budget_exit_replans_when_not_rejoined():
+    filt = _explicit_recovery_filter(
+        q_rejoin_threshold=10.0,
+        yield_horizon=1,
+        return_horizon=2,
+        explicit_recovery={
+            "opportunistic_act_resume": True,
+            "opportunistic_resume_q_threshold": 0.0,
+            "max_recover_steps_before_act_resume": 1,
+        },
+    )
+    filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
+    chunk = make_chunk()
+    chunk[:, CTRL] = 0.1
+    obs = {"q": np.zeros(14, dtype=np.float32)}
+    nominal_q_seq = filt.rollout_nominal_chunk(obs, chunk)
+    filt.recovery_context = RecoveryContext(
+        nominal_chunk=chunk.copy(),
+        nominal_q_seq=nominal_q_seq.copy(),
+        active=False,
+        target_rejoin_index=3,
+        phase="recover",
+    )
+    info = {
+        "optimized_accepted": True,
+        "deform_chunk_length": 1,
+        "recover_chunk_length": 2,
+        "recover_target_index": 3,
+        "recover_min_clearance": 1.0,
+    }
+
+    committed, reject_info = filt._commit_explicit_recovery_chunk(obs, chunk, info)
+    assert committed is True
+    assert reject_info == {}
+    filt.committed_chunk_index = 1
+    filt.committed_recover_steps_since_act = 1
+    replay_q = nominal_q_seq[0].copy()
+
+    result = filt._serve_committed_chunk(
+        {"q": replay_q},
+        chunk,
+        chunk.shape,
+        q_full=replay_q,
+    )
+
+    assert result is None
+    assert filt.committed_chunk is None
+    pending = filt._pop_pending_committed_replan_info()
+    assert pending["committed_recovery_budget_exit"] is True
+    assert pending["committed_replan_due_to_recovery_budget"] is True
+    assert filt.committed_recovery_budget_exit_count == 1
 
 
 def test_explicit_recovery_commit_disabled_preserves_replanning_behavior():
@@ -1414,12 +2097,8 @@ def test_committed_replay_state_mismatch_replans_before_safety_repair():
         q_rejoin_threshold=10.0,
         yield_horizon=1,
         return_horizon=2,
-        explicit_recovery={
-            "committed_state_error_threshold": 0.25,
-            "committed_state_error_action": "replan",
-            "committed_state_mismatch_abort_requires_unsafe": False,
-        },
     )
+    assert filt.committed_state_mismatch_abort_requires_unsafe is False
     filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
     chunk = make_chunk()
     chunk[:, CTRL] = 0.1
@@ -1457,6 +2136,73 @@ def test_committed_replay_state_mismatch_replans_before_safety_repair():
     assert pending["committed_state_error_threshold"] == 0.25
     assert pending["actual_q_at_replay"] is not None
     assert pending["planned_q_at_index"] is not None
+
+
+
+def test_committed_state_mismatch_replans_recovery_suffix_from_actual_q():
+    filt = _explicit_recovery_filter(
+        q_rejoin_threshold=10.0,
+        yield_horizon=1,
+        return_horizon=3,
+        explicit_recovery={
+            "committed_state_error_threshold": 0.05,
+            "replan_committed_suffix_on_state_mismatch": True,
+            "committed_execution_margin": 0.0,
+            "opportunistic_act_resume": False,
+        },
+        safechunk_recover={
+            "enabled": True,
+            "require_direction_alignment": False,
+            "require_ordered_path": False,
+        },
+    )
+    filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=10.0)
+    chunk = make_chunk(h=5)
+    chunk[:, CTRL] = 0.1
+    obs = {"q": np.zeros(14, dtype=np.float32)}
+    nominal_q_seq = filt.rollout_nominal_chunk(obs, chunk)
+    filt.recovery_context = RecoveryContext(
+        nominal_chunk=chunk.copy(),
+        nominal_q_seq=nominal_q_seq.copy(),
+        active=False,
+        target_rejoin_index=3,
+        phase="recover",
+    )
+    info = {
+        "optimized_accepted": True,
+        "deform_chunk_length": 1,
+        "recover_chunk_length": 3,
+        "recover_target_index": 3,
+        "recover_min_clearance": 1.0,
+    }
+
+    committed, reject_info = filt._commit_explicit_recovery_chunk(obs, chunk, info)
+    assert committed is True
+    assert reject_info == {}
+    filt.committed_chunk_index = 1
+    mismatched_q = np.zeros(14, dtype=np.float32)
+    mismatched_q[CTRL] = 0.4
+
+    result = filt._serve_committed_chunk(
+        {"q": mismatched_q},
+        chunk,
+        chunk.shape,
+        q_full=mismatched_q,
+    )
+
+    assert result is not None
+    safe_chunk, replay_info = result
+    np.testing.assert_allclose(safe_chunk[:, PASS], chunk[:, PASS])
+    assert replay_info["committed_state_mismatch_detected"] is True
+    assert replay_info["committed_state_mismatch_recovered"] is True
+    assert replay_info["committed_suffix_replan_attempted"] is True
+    assert replay_info["committed_suffix_replan_accepted"] is True
+    assert replay_info["committed_chunk_mode"] == "recover"
+    assert replay_info["recover_steps_executed"] == 1
+    assert filt.committed_suffix_replan_attempt_count == 1
+    assert filt.committed_suffix_replan_accepted_count == 1
+    assert filt.committed_chunk is not None
+    assert filt.committed_chunk_index == 1
 
 
 def test_committed_chunk_rejects_missing_or_malformed_planned_q():
@@ -1531,6 +2277,11 @@ def _recover_rejoin_filter(clearances=(0.10, 0.10, 0.10, 0.10), **recover_cfg):
     filt.safechunk_recover_enabled = parsed["enabled"]
     filt.recover_rejoin_nominal_weight = parsed["rejoin_nominal_weight"]
     filt.recover_task_progress_weight = parsed["task_progress_weight"]
+    filt.recover_ordered_pose_weight = parsed["ordered_pose_weight"]
+    filt.recover_ordered_delta_weight = parsed["ordered_delta_weight"]
+    filt.recover_ordered_pose_threshold = parsed["ordered_pose_threshold"]
+    filt.recover_ordered_delta_threshold = parsed["ordered_delta_threshold"]
+    filt.require_recover_ordered_path = parsed["require_ordered_path"]
     filt.recover_safety_weight = parsed["safety_weight"]
     filt.recover_action_deviation_weight = parsed["action_deviation_weight"]
     filt.recover_smoothness_weight = parsed["smoothness_weight"]
@@ -1567,6 +2318,104 @@ def test_nominal_rejoin_score_zero_for_opposite_candidate():
 
     assert info["nominal_rejoin_score"] == 0.0
     assert info["recover_cosine_to_nominal"] < 0.0
+
+
+def test_ordered_recovery_path_loss_tracks_ordered_nominal_slice():
+    filt = _recover_rejoin_filter(ordered_pose_weight=2.0, ordered_delta_weight=3.0)
+    nominal_q_seq = np.zeros((6, 14), dtype=np.float32)
+    for k in range(nominal_q_seq.shape[0]):
+        nominal_q_seq[k, CTRL] = 0.1 * k
+    q_seq = nominal_q_seq[2:5].copy()
+
+    terms = filt._ordered_recovery_path_terms(q_seq, nominal_q_seq, target_index=2)
+
+    assert terms["recover_ordered_path_available"] is True
+    assert terms["recover_ordered_target_index"] == 2
+    assert terms["recover_ordered_horizon"] == 3
+    assert terms["recover_ordered_pose_loss"] == 0.0
+    assert terms["recover_ordered_delta_loss"] == 0.0
+    assert terms["recover_ordered_loss"] == 0.0
+    assert terms["recover_ordered_ok"] is True
+
+    deviated = q_seq.copy()
+    deviated[1, CTRL] += 0.25
+    bad_terms = filt._ordered_recovery_path_terms(deviated, nominal_q_seq, target_index=2)
+
+    assert bad_terms["recover_ordered_pose_loss"] > 0.0
+    assert bad_terms["recover_ordered_delta_loss"] > 0.0
+    assert bad_terms["recover_ordered_loss"] > bad_terms["recover_ordered_pose_loss"]
+    assert bad_terms["recover_ordered_ok"] is False
+
+
+def test_ordered_recovery_path_reject_reason_is_unrecoverable():
+    filt = _recover_rejoin_filter()
+    reason = filt._recovery_reject_reason(
+        {"q_rejoin_ok": True, "qd_rejoin_ok": True},
+        {"immediate_safe": True, "prefix_safe": True, "path_safe": True},
+        direction_ok=True,
+        ordered_ok=False,
+    )
+
+    assert reason == "ordered_path_failed"
+
+
+def test_return_deformation_cost_adds_ordered_recovery_loss():
+    filt = _explicit_recovery_filter(
+        safechunk_recover={
+            "ordered_pose_weight": 2.0,
+            "ordered_delta_weight": 3.0,
+        }
+    )
+    filt.evaluate_horizon_safety = _controlled_limit_safety(filt, limit=2.0)
+    obs = {"q": np.zeros(14, dtype=np.float32)}
+    nominal = make_chunk(h=5)
+    for k in range(nominal.shape[0]):
+        nominal[k, CTRL] = 0.1 * k
+    candidate = nominal.copy()
+    candidate[:, CTRL] = 0.0
+    nominal_q_seq = filt.rollout_nominal_chunk(obs, nominal)
+    rejoin_context = filt._make_rejoin_context(nominal_q_seq)
+
+    cost, losses = filt._return_deformation_cost(
+        obs,
+        candidate,
+        nominal,
+        nominal_q_seq,
+        rejoin_context,
+        CTRL,
+    )
+
+    assert losses["recover_ordered_path_available"] is True
+    assert losses["recover_ordered_pose_loss"] > 0.0
+    assert losses["recover_ordered_loss"] > 0.0
+    expected = (
+        filt.lambda_return_rejoin * losses["rejoin_loss"]
+        + filt.lambda_return_safety * losses["safety_loss"]
+        + filt.lambda_return_smooth * losses["smoothness_loss"]
+        + filt.lambda_return_action * losses["action_deviation_loss"]
+        + losses["recover_ordered_loss"]
+    )
+    np.testing.assert_allclose(cost, expected)
+
+
+def test_batched_q_rejoin_indices_are_absolute_future_indices():
+    filt = SafeChunkDeformFilter(
+        mode="optimized",
+        recoverable_deform={"enabled": True, "inner_rejoin_metric": "q_state"},
+        debug=False,
+    )
+    nominal_q_seq = np.zeros((6, 14), dtype=np.float32)
+    for k in range(nominal_q_seq.shape[0]):
+        nominal_q_seq[k, CTRL] = float(k)
+    q_seq_batch = np.zeros((1, 3, 14), dtype=np.float32)
+    q_seq_batch[0, -1, CTRL] = nominal_q_seq[3, CTRL]
+
+    _losses, indices, _time_ms = filt._q_rejoin_loss_batch(
+        q_seq_batch,
+        nominal_q_seq=nominal_q_seq,
+    )
+
+    assert indices == [3]
 
 
 def test_stale_nominal_rejoin_target_is_suppressed():
@@ -1712,7 +2561,7 @@ def test_hold_brake_accepted_when_predicted_clearance_safe():
     filt = _active_safety_filter_for_hold_tests()
     filt.evaluate_candidate_acceptance = _hold_acceptance([0.06, 0.05, 0.05])
     chunk = np.zeros((3, 16), dtype=np.float32)
-    info = {"safety_mode": "path_consistent_brake", "mode": "path_consistent_brake"}
+    info = {"safety_mode": "horizon_brake", "mode": "horizon_brake"}
 
     safe, out = filt._hold_return_or_emergency_deform(
         {"q": np.zeros(14, dtype=np.float32)},
@@ -1723,7 +2572,7 @@ def test_hold_brake_accepted_when_predicted_clearance_safe():
     )
 
     np.testing.assert_allclose(safe, chunk)
-    assert out["safety_mode"] == "path_consistent_brake"
+    assert out["safety_mode"] == "horizon_brake"
     assert out["hold_acceptance_type"] == "hold_or_brake"
     assert out.get("emergency_deform_away") is not True
 
@@ -1732,7 +2581,7 @@ def test_hold_rejected_when_predicted_human_sweep_violates_hard_margin():
     filt = _active_safety_filter_for_hold_tests()
     filt.evaluate_candidate_acceptance = _hold_acceptance([0.05, 0.03, 0.015])
     chunk = np.zeros((3, 16), dtype=np.float32)
-    info = {"safety_mode": "path_consistent_brake", "mode": "path_consistent_brake"}
+    info = {"safety_mode": "horizon_brake", "mode": "horizon_brake"}
 
     _safe, out = filt._hold_return_or_emergency_deform(
         {"q": np.zeros(14, dtype=np.float32)},

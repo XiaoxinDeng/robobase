@@ -43,7 +43,7 @@ METHODS: tuple[Method, ...] = (
     Method(
         name="brake_hold_only",
         condition="chunk_deform",
-        description="SafeChunk path-consistent brake/hold fallback with deformation disabled.",
+        description="SafeChunk horizon-brake brake/hold fallback with deformation disabled.",
         args=(
             "--chunk-deform-mode",
             "optimized",

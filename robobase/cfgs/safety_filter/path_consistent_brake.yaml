@@ -2,7 +2,7 @@
 
 safety_filter:
   enabled: true
-  _target_: robobase.safetyfilter.safechunk_deform_filter.SafeChunkDeformFilter
+  _target_: robobase.safetyfilter.path_consistent_brake_filter.PathConsistentBrakeFilter
   _recursive_: false
 
   horizon: 16
@@ -33,6 +33,49 @@ safety_filter:
   lambda_smooth: 0.1
   optimized_fallback: candidate
   detach_passthrough_dims: true
+
+  waypoint_substeps: 2
+  max_waypoint_delta: null
+  slowdown_enabled: true
+  slowdown_lookahead: 2
+  slowdown_min_scale: 0.0
+  certified_backup_enabled: true
+  trajectory_generation_enabled: true
+  trajectory_max_velocity: 2.0
+  trajectory_max_acceleration: 8.0
+  trajectory_max_jerk: 80.0
+  trajectory_initial_speed: 0.0
+  trajectory_backend: auto
+  trajectory_min_position: null
+  trajectory_max_position: null
+  shield_substeps: 1
+  inner_shield_verification_enabled: true
+  skip_inner_shield_when_rejected: true
+  reuse_operator_human_rollout_cache: true
+  background_check_only: false
+  reachability_certification_enabled: false
+  reachability_fail_closed: false
+  reachability_robot_radius: 0.08
+  reachability_obstacle_radius: 0.0
+  reachability_robot_points_source: auto
+  reachability_inflation_enabled: false
+  reachability_tracking_error: 0.0
+  reachability_measurement_error: 0.0
+  reachability_object_speed: 0.0
+  reachability_object_acceleration: 0.0
+  reachability_sensor_delay: 0.0
+  safety_constraint_type: ssm
+  pfl_energy_threshold: null
+  pfl_contact_margin: 0.0
+  pfl_joint_inertia: 1.0
+  pfl_energy_thresholds: {}
+  pfl_active_threshold_key: null
+
+  safechunk_active_safety:
+    enabled: false
+    check_hold_horizon_safety: false
+    emergency_deform_when_hold_unsafe: false
+    optimize_when_hold_unsafe: false
   recoverable_deform:
     enabled: true
     lambda_rejoin: 0.5
@@ -73,7 +116,7 @@ safety_filter:
     monotonic_committed_repair: true
     committed_execution_margin: 0.02
     committed_state_error_threshold: 0.25
-    committed_state_error_action: "replan"
+    committed_state_error_action: replan
   diagnostics:
     enabled: true
     large_arm_delta_threshold: 3.0

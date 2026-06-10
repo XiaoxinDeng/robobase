@@ -414,18 +414,27 @@ def compute_oscbf_h_monitor(
         capsule_a_urdf = filt._transform_points(T_urdf_world, capsule_a_world)
         capsule_b_urdf = filt._transform_points(T_urdf_world, capsule_b_world)
 
-        filt._validate_capsules(capsule_a_urdf, capsule_b_urdf, capsule_radii)
+        if hasattr(filt, "compute_live_h_values"):
+            h_values = filt.compute_live_h_values(
+                q_urdf,
+                capsule_a_urdf,
+                capsule_b_urdf,
+                capsule_radii,
+            )
+        else:
+            filt._validate_capsules(capsule_a_urdf, capsule_b_urdf, capsule_radii)
+            filt.oscbf_config.set_human_capsules(
+                capsule_a_urdf,
+                capsule_b_urdf,
+                capsule_radii,
+            )
+            h_values = np.asarray(
+                filt.oscbf_config.h_1(jnp.asarray(q_urdf, dtype=jnp.float32)),
+                dtype=np.float32,
+            ).reshape(-1)
 
-        filt.oscbf_config.set_human_capsules(
-            capsule_a_urdf,
-            capsule_b_urdf,
-            capsule_radii,
-        )
-
-        h_values = np.asarray(
-            filt.oscbf_config.h_1(jnp.asarray(q_urdf, dtype=jnp.float32)),
-            dtype=np.float32,
-        ).reshape(-1)
+        if h_values is None:
+            return None, None, None
 
         min_h = float(np.min(h_values))
         return min_h, h_values.tolist(), bool(min_h < 0.0)
@@ -681,13 +690,18 @@ def summarise_all_episodes(episode_summaries: list[dict]) -> dict:
     if len(episode_summaries) == 0:
         return {}
 
-    def mean_of(key):
-        vals = [s[key] for s in episode_summaries if s.get(key) is not None]
+    def mean_of(key, summaries=None):
+        summaries = episode_summaries if summaries is None else summaries
+        vals = [s[key] for s in summaries if s.get(key) is not None]
         return float(np.mean(vals)) if vals else None
 
     def sum_of(key):
         vals = [s[key] for s in episode_summaries if s.get(key) is not None]
         return float(np.sum(vals)) if vals else None
+
+    successful_summaries = [s for s in episode_summaries if bool(s.get("success"))]
+    failed_summaries = [s for s in episode_summaries if not bool(s.get("success"))]
+    mean_success_episode_length = mean_of("episode_length", successful_summaries)
 
     return {
         "condition": episode_summaries[0]["condition"],
@@ -695,7 +709,11 @@ def summarise_all_episodes(episode_summaries: list[dict]) -> dict:
 
         "success_rate": mean_of("success"),
         "mean_return": mean_of("episode_return"),
-        "mean_episode_length": mean_of("episode_length"),
+        "mean_episode_length": mean_success_episode_length,
+        "mean_steps": mean_success_episode_length,
+        "mean_success_episode_length": mean_success_episode_length,
+        "mean_all_episode_length": mean_of("episode_length"),
+        "mean_failed_episode_length": mean_of("episode_length", failed_summaries),
 
         "mean_episode_min_h": mean_of("episode_min_h"),
         "mean_h_violation_rate": mean_of("h_violation_rate"),

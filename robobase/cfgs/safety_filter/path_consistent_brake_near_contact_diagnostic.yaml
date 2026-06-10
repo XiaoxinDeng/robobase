@@ -1,0 +1,22 @@
+# @package _global_
+
+# Diagnostic-only PACS overlay. This intentionally removes almost all
+# clearance/reachability slack to test whether intended ACT steps are rejected
+# mainly by conservative certification margins.
+safety_filter:
+  min_clearance: 0.0
+  shield_substeps: 2
+  inner_shield_verification_enabled: true
+
+  reachability_certification_enabled: true
+  reachability_fail_closed: false
+  reachability_robot_radius: 0.0
+  reachability_obstacle_radius: 0.0
+  reachability_robot_points_source: q_base
+
+  reachability_inflation_enabled: false
+  reachability_tracking_error: 0.0
+  reachability_measurement_error: 0.0
+  reachability_object_speed: 0.0
+  reachability_object_acceleration: 0.0
+  reachability_sensor_delay: 0.0
