@@ -55,15 +55,17 @@ class OSCBFEEHumanCapsuleVelocityConfig(CBFConfig):
             ),
             dtype=jnp.float32,
         )
-        # The current URDF surrogate ends its EE at the right elbow, while MuJoCo
-        # contacts show the distal elbow shell and Robotiq gripper extend roughly
-        # 0.14-0.45 m forward from that point. Add one conservative gripper
-        # envelope to make h cover those contact-heavy geoms.
-        self.right_gripper_sphere_offset = jnp.asarray(
-            [0.28, 0.0, 0.0],
+        # The URDF surrogate ends at the right elbow. Approximate the physical arm
+        # with a short forearm capsule and a small end-gripper sphere.
+        self.right_forearm_capsule_offset = jnp.asarray(
+            [0.30, 0.0, 0.0],
             dtype=jnp.float32,
         )
-        self.right_gripper_sphere_radius = jnp.asarray(0.18, dtype=jnp.float32)
+        self.right_gripper_sphere_offset = jnp.asarray(
+            [0.36, 0.0, 0.0],
+            dtype=jnp.float32,
+        )
+        self.right_gripper_sphere_radius = jnp.asarray(0.13, dtype=jnp.float32)
 
         self.right_shoulder_yaw_idx = self.robot.joint_index(
             "right_shoulder_yaw_joint"
@@ -166,10 +168,11 @@ class OSCBFEEHumanCapsuleVelocityConfig(CBFConfig):
         transforms = self.robot.joint_to_world_transforms(q)
         shoulder = transforms[self.right_shoulder_yaw_idx, :3, 3]
         elbow = transforms[self.right_elbow_idx, :3, 3]
-        ee = self.robot.ee_position(q)
+        elbow_tf = transforms[self.right_elbow_idx]
+        forearm_end = elbow_tf[:3, 3] + elbow_tf[:3, :3] @ self.right_forearm_capsule_offset
 
         capsule_a = jnp.vstack([shoulder, elbow])
-        capsule_b = jnp.vstack([elbow, ee])
+        capsule_b = jnp.vstack([elbow, forearm_end])
         return capsule_a, capsule_b, self.right_arm_capsule_radii
 
     def _right_gripper_sphere(self, q):
@@ -294,7 +297,12 @@ class OSCBFPelvisArmHumanCapsuleVelocityConfig(OSCBFEEHumanCapsuleVelocityConfig
         )
         self.pelvis_velocity_limits = tuple(float(x) for x in pelvis_velocity_limits)
 
-        # Reuse the same conservative robot envelope as the arm-only config.
+        # Reuse the same conservative robot envelope as the arm-only config and
+        # model the missing wrist segment explicitly as a forearm capsule.
+        self.right_forearm_capsule_offset = jnp.asarray(
+            [0.30, 0.0, 0.0],
+            dtype=jnp.float32,
+        )
         self.right_arm_contact_margin = 0.065
         self.right_arm_capsule_radii = jnp.asarray(
             (
@@ -304,10 +312,10 @@ class OSCBFPelvisArmHumanCapsuleVelocityConfig(OSCBFEEHumanCapsuleVelocityConfig
             dtype=jnp.float32,
         )
         self.right_gripper_sphere_offset = jnp.asarray(
-            [0.28, 0.0, 0.0],
+            [0.36, 0.0, 0.0],
             dtype=jnp.float32,
         )
-        self.right_gripper_sphere_radius = jnp.asarray(0.18, dtype=jnp.float32)
+        self.right_gripper_sphere_radius = jnp.asarray(0.13, dtype=jnp.float32)
         self.right_shoulder_yaw_idx = self.robot.joint_index(
             "right_shoulder_yaw_joint"
         )

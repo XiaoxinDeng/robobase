@@ -1,0 +1,20 @@
+# @package _global_
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_handoff_gate_ablation_ep0_ep5
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    explicit_recovery:
+      # Gate-only ablation: preserve safety and recovery execution, but let
+      # action agreement be evaluated without the conservative readiness veto.
+      mpc_handoff_require_resume_readiness: false
+
+eval_args:
+  episodes: 6
+  episode_index_offset: 0
+  steps: 300

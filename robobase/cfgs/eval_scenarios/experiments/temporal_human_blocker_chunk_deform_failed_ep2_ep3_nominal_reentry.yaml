@@ -1,0 +1,111 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_failed_ep2_ep3_nominal_reentry
+  description: >-
+    Re-run the previously failing temporal-blocker episodes 2 and 3 with
+    phase reanchor tracking a fixed successful nominal ACT re-entry window.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    temporary_blocker:
+      enabled: true
+
+eval_args:
+  condition: chunk_deform
+  episodes: 2
+  episode_index_offset: 2
+  steps: 300
+  seed: 1
+  continue_after_success: true
+  no_progress: true
+  log_chunk_trajectories: true
+  log_mpc_replay_diagnostics: true
+  mpc_replay_diagnostics_max_events: 300
+  plot_chunk_trajectories_3d: true
+  video_time_base: sim
+  stop_video_at_steps: 300
+  phase_reanchor_nominal_window_enabled: true
+  phase_reanchor_nominal_window_track_base: false
+  phase_reanchor_nominal_window_source: eval_safety/temporal_human_blocker_chunk_deform_4ep_debug_20260708_064741
+  phase_reanchor_nominal_window_len: 4
+  phase_reanchor_nominal_window_lead_steps: 3
+  phase_reanchor_nominal_window_pregrasp_lags: [24, 16, 8]
+  phase_reanchor_nominal_window_selector: distribution_first
+  phase_reanchor_nominal_window_stage: pregrasp
+  phase_reanchor_steps: 48
+  phase_reanchor_bypass_temporal_ensemble: true
+  post_recovery_task_guard_steps: 48
+  post_recovery_no_progress_distance_source: control
+  post_recovery_task_guard_reanchor_phases: [pre_grasp, grasp, pull]
+  post_recovery_act_bridge_no_progress_monitor_steps: 32
+  post_recovery_act_bridge_no_progress_min_steps: 8
+  post_recovery_act_bridge_no_progress_patience: 8
+  post_recovery_act_bridge_no_progress_epsilon: 1.0e-05
+  phase_reanchor_live_taskspace_stop_on_worsening: true
+  phase_reanchor_live_taskspace_stop_min_steps: 16
+  phase_reanchor_suppress_q_servo_far_target: false
+  phase_reanchor_q_servo_enable_target_dist: 0.24
+  phase_reanchor_release_requires_live_taskspace: true
+  phase_reanchor_task_point_source: ee_site
+  phase_reanchor_measurement_task_point_source: gripper_geom
+  phase_reanchor_control_error_source: control
+  phase_reanchor_live_handle_assist: false
+  phase_reanchor_live_handle_assist_trigger_target_dist: 0.30
+  phase_reanchor_live_handle_assist_gain: 0.45
+  phase_reanchor_live_handle_assist_max_base_step_xy: [0.03, 0.006]
+  phase_reanchor_near_live_target_suppress_q_servo: false
+  phase_reanchor_near_live_target_suppress_dist: 0.22
+  phase_reanchor_live_release_target_error: 0.16
+  phase_reanchor_live_release_handle_dist: 0.24
+  phase_reanchor_live_release_require_both: false
+  phase_reanchor_bridge_seed_mode: nominal_history
+  phase_reanchor_bridge_seed_obs_source: recovery
+  phase_reanchor_bridge_policy_step_source: nominal_window
+  phase_reanchor_bridge_reseed_action_history_with_post_seed_act: false
+  phase_reanchor_bridge_requires_resume_affordance: false
+  phase_reanchor_bridge_requires_post_seed_action_agreement: true
+  phase_reanchor_bridge_action_agreement_l2: 1.0
+  phase_reanchor_bridge_action_agreement_cosine: 0.8
+  phase_reanchor_bridge_action_agreement_mode: and
+  phase_reanchor_bridge_requires_handle_proximity: false
+  phase_reanchor_bridge_handle_dist: 0.265
+  phase_reanchor_bridge_preload_validation: false
+  phase_reanchor_bridge_preload_steps: 8
+  phase_reanchor_bridge_preload_progress_delta: 5.0e-04
+  phase_reanchor_bridge_preload_progress_min_abs: 5.0e-04
+  phase_reanchor_bridge_preload_handle_dist: 0.245
+  phase_reanchor_bridge_preload_allow_handle_only: false
+  phase_reanchor_bridge_preload_pull_probe: false
+  phase_reanchor_bridge_preload_pull_step: 0.006
+  phase_reanchor_force_gripper_during_preload: false
+  phase_reanchor_preload_target_grasp: false
+  phase_reanchor_live_extend_on_not_ready: false
+  phase_reanchor_live_extend_steps: 16
+  phase_reanchor_live_max_extensions: 3
+  phase_reanchor_early_release_on_resumable_window: true
+  phase_reanchor_early_release_min_steps: 8
+  phase_reanchor_early_release_arm_q_error: 0.35
+  phase_reanchor_early_release_act_grace_steps: 8
+  phase_reanchor_hold_arm_when_q_servo_suppressed: false
+  phase_reanchor_max_base_step: 0.02
+  phase_reanchor_max_base_step_xy: [0.02, 0.006]
+  phase_reanchor_live_ee_servo: false
+  phase_reanchor_live_ee_servo_with_q_window: false
+  phase_reanchor_live_ee_gain: 0.35
+  phase_reanchor_live_ee_nominal_reg: 0.4
+  phase_reanchor_live_ee_servo_mix: 1.0
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/temporal_human_blocker_chunk_deform_failed_ep2_ep3_nominal_reentry.yaml

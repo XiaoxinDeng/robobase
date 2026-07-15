@@ -15,7 +15,6 @@ import trimesh
 from trimesh.visual import TextureVisuals
 from trimesh.visual.material import PBRMaterial
 
-
 REPO = Path(__file__).resolve().parents[3]
 EXTERNAL = REPO / "external"
 ROBOBASE = EXTERNAL / "robobase"
@@ -29,7 +28,6 @@ from oscbf.core.treemanipulator import TreeManipulator  # noqa: E402
 from robobase.safetyfilter.oscbf.oscbf_eehumancapsule_velocity_config import (  # noqa: E402
     OSCBFEEHumanCapsuleVelocityConfig,
 )
-
 
 DEFAULT_BARRIER_URDF = OSCBF / "oscbf/assets/h1/h1.urdf"
 DEFAULT_SOURCE_URDF = OSCBF / "oscbf/assets/h1/h1_with_hand.urdf"
@@ -70,6 +68,10 @@ SOURCE_LINKS_WITH_HAND = (
 
 SOURCE_LINKS_ARM_ONLY = SOURCE_LINKS_WITH_HAND[:5]
 
+# Apply a fixed scene correction so the right-view orientation matches the
+# robot-specific reference (yaw, pitch, x-rotation): 0°, 180°, 180°.
+# Tuple order is (roll, pitch, yaw) in degrees.
+SCENE_CORRECTION_RPY_DEG = (0.0, 180.0, 180.0)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -106,8 +108,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlay-alpha", type=float, default=0.42)
     parser.add_argument("--capsule-sections", type=int, default=32)
     parser.add_argument("--sphere-subdivisions", type=int, default=4)
+    parser.add_argument(
+        "--hide-axis",
+        action="store_true",
+        help="Hide the XYZ axis gizmo (shown by default).",
+    )
     return parser.parse_args()
-
 
 def hex_to_rgba(hex_color: str, alpha: float) -> tuple[float, float, float, float]:
     color = hex_color.strip().lstrip("#")
@@ -116,11 +122,9 @@ def hex_to_rgba(hex_color: str, alpha: float) -> tuple[float, float, float, floa
     rgb = tuple(int(color[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
     return (*rgb, float(np.clip(alpha, 0.0, 1.0)))
 
-
 def rgba_u8(hex_color: str, alpha: float) -> tuple[int, int, int, int]:
     rgba = hex_to_rgba(hex_color, alpha)
     return tuple(int(round(v * 255)) for v in rgba)
-
 
 def make_material(
     name: str,
@@ -138,7 +142,6 @@ def make_material(
         doubleSided=True,
     )
 
-
 def rpy_to_matrix(rpy: Iterable[float]) -> np.ndarray:
     roll, pitch, yaw = [float(v) for v in rpy]
     cr, sr = math.cos(roll), math.sin(roll)
@@ -150,13 +153,11 @@ def rpy_to_matrix(rpy: Iterable[float]) -> np.ndarray:
     rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]], dtype=np.float64)
     return rz @ ry @ rx
 
-
 def xyz_rpy_to_matrix(xyz: Iterable[float], rpy: Iterable[float]) -> np.ndarray:
     transform = np.eye(4, dtype=np.float64)
     transform[:3, :3] = rpy_to_matrix(rpy)
     transform[:3, 3] = np.asarray(tuple(xyz), dtype=np.float64)
     return transform
-
 
 def axis_angle_to_matrix(axis: Iterable[float], angle: float) -> np.ndarray:
     axis_arr = np.asarray(tuple(axis), dtype=np.float64)
@@ -180,7 +181,6 @@ def axis_angle_to_matrix(axis: Iterable[float], angle: float) -> np.ndarray:
     transform[:3, :3] = rot
     return transform
 
-
 def prismatic_to_matrix(axis: Iterable[float], value: float) -> np.ndarray:
     axis_arr = np.asarray(tuple(axis), dtype=np.float64)
     norm = float(np.linalg.norm(axis_arr))
@@ -189,12 +189,10 @@ def prismatic_to_matrix(axis: Iterable[float], value: float) -> np.ndarray:
         transform[:3, 3] = axis_arr / norm * float(value)
     return transform
 
-
 def parse_vector(raw: str | None, default: tuple[float, ...]) -> tuple[float, ...]:
     if raw is None:
         return default
     return tuple(float(part) for part in raw.split())
-
 
 def parse_urdf(urdf_path: Path) -> tuple[list[str], list[dict], dict[str, dict]]:
     root = ET.parse(urdf_path).getroot()
@@ -245,6 +243,11 @@ def parse_urdf(urdf_path: Path) -> tuple[list[str], list[dict], dict[str, dict]]
 
     return links, joints, link_visuals
 
+def apply_transform_to_point(point: Iterable[float], transform: np.ndarray) -> np.ndarray:
+    point_h = np.ones(4, dtype=np.float64)
+    point_h[:3] = np.asarray(tuple(point), dtype=np.float64)
+    return (transform @ point_h)[:3]
+
 
 def resolve_mesh_path(urdf_path: Path, filename: str, mesh_format: str) -> Path:
     if filename.startswith("package://h1_description/"):
@@ -262,7 +265,6 @@ def resolve_mesh_path(urdf_path: Path, filename: str, mesh_format: str) -> Path:
             return stl_path
 
     return path
-
 
 def forward_kinematics(
     links: list[str],
@@ -298,7 +300,6 @@ def forward_kinematics(
 
     return transforms
 
-
 def load_visual_mesh(
     urdf_path: Path,
     visual: dict,
@@ -318,7 +319,6 @@ def load_visual_mesh(
     mesh.visual.face_colors = face_color
     mesh.visual = TextureVisuals(material=material)
     return mesh
-
 
 def make_capsule_mesh(
     start: np.ndarray,
@@ -348,7 +348,6 @@ def make_capsule_mesh(
     mesh.visual = TextureVisuals(material=material)
     return mesh
 
-
 def make_sphere_mesh(
     center: np.ndarray,
     radius: float,
@@ -361,7 +360,6 @@ def make_sphere_mesh(
     mesh.visual.face_colors = face_color
     mesh.visual = TextureVisuals(material=material)
     return mesh
-
 
 def build_barrier_geometry(
     barrier_urdf: Path,
@@ -422,7 +420,6 @@ def build_barrier_geometry(
     }
     return capsules, {"sphere": sphere, "constants": constants}
 
-
 def scene_bounds(scene: trimesh.Scene) -> dict:
     bounds = np.asarray(scene.bounds, dtype=np.float64)
     center = bounds.mean(axis=0)
@@ -434,7 +431,6 @@ def scene_bounds(scene: trimesh.Scene) -> dict:
         "center": center.tolist(),
         "radius": radius,
     }
-
 
 def build_scene(args: argparse.Namespace) -> tuple[trimesh.Scene, dict]:
     source_urdf = args.source_urdf.resolve()
@@ -455,12 +451,36 @@ def build_scene(args: argparse.Namespace) -> tuple[trimesh.Scene, dict]:
     source_color = rgba_u8(args.source_color, args.source_alpha)
     overlay_color = rgba_u8(args.overlay_color, args.overlay_alpha)
 
+    # Axis gizmo materials (drawn as simple capsules, not affected by alpha controls).
+    axis_colors = {
+        "x": rgba_u8("#ef4444", 1.0),
+        "y": rgba_u8("#22c55e", 1.0),
+        "z": rgba_u8("#3b82f6", 1.0),
+    }
+    axis_hex_colors = {
+        "x": "#ef4444",
+        "y": "#22c55e",
+        "z": "#3b82f6",
+    }
+    axis_materials = {
+        "x": make_material("axis_x_material", "#ef4444", 1.0, roughness=0.2),
+        "y": make_material("axis_y_material", "#22c55e", 1.0, roughness=0.2),
+        "z": make_material("axis_z_material", "#3b82f6", 1.0, roughness=0.2),
+    }
+    axis_length = 0.35
+    axis_radius = 0.004
+    axis_label_offset = 0.42
+
     links, joints, visuals = parse_urdf(source_urdf)
     q_by_joint = {name: value for name, value in zip(OSCBF_ARM_JOINT_NAMES, q_urdf_arm)}
     q_by_joint["right_hand_joint"] = float(args.right_hand_angle)
     source_fk = forward_kinematics(links, joints, q_by_joint)
 
     source_links = SOURCE_LINKS_ARM_ONLY if args.arm_only else SOURCE_LINKS_WITH_HAND
+    scene_transform = xyz_rpy_to_matrix(
+        (0.0, 0.0, 0.0),
+        tuple(math.radians(v) for v in SCENE_CORRECTION_RPY_DEG),
+    )
     scene = trimesh.Scene()
     loaded_links = []
     skipped_links = []
@@ -503,6 +523,47 @@ def build_scene(args: argparse.Namespace) -> tuple[trimesh.Scene, dict]:
     )
     scene.add_geometry(sphere_mesh, geom_name=sphere["name"], node_name=sphere["name"])
 
+    if not args.hide_axis:
+        axis_origin = np.zeros(3, dtype=np.float64)
+        for name, axis_end, axis_mat, axis_face_color in (
+            ("world_x_axis", np.array([axis_length, 0.0, 0.0]), axis_materials["x"], axis_colors["x"]),
+            ("world_y_axis", np.array([0.0, axis_length, 0.0]), axis_materials["y"], axis_colors["y"]),
+            ("world_z_axis", np.array([0.0, 0.0, axis_length]), axis_materials["z"], axis_colors["z"]),
+        ):
+            scene.add_geometry(
+                make_capsule_mesh(
+                    axis_origin,
+                    axis_end,
+                    axis_radius,
+                    max(12, args.capsule_sections),
+                    axis_mat,
+                    axis_face_color,
+                ),
+                geom_name=name,
+                node_name=name,
+            )
+
+    scene.apply_transform(scene_transform)
+    for capsule in capsules:
+        capsule["a"] = apply_transform_to_point(capsule["a"], scene_transform).tolist()
+        capsule["b"] = apply_transform_to_point(capsule["b"], scene_transform).tolist()
+
+    sphere["center"] = apply_transform_to_point(sphere["center"], scene_transform).tolist()
+
+    axis_labels = []
+    if not args.hide_axis:
+        axis_labels = [
+            {"name": "X", "axis": "x", "position": apply_transform_to_point(
+                np.array([axis_label_offset, 0.0, 0.0], dtype=np.float64), scene_transform
+            ).tolist(), "color": axis_hex_colors["x"]},
+            {"name": "Y", "axis": "y", "position": apply_transform_to_point(
+                np.array([0.0, axis_label_offset, 0.0], dtype=np.float64), scene_transform
+            ).tolist(), "color": axis_hex_colors["y"]},
+            {"name": "Z", "axis": "z", "position": apply_transform_to_point(
+                np.array([0.0, 0.0, axis_label_offset], dtype=np.float64), scene_transform
+            ).tolist(), "color": axis_hex_colors["z"]},
+        ]
+
     bounds = scene_bounds(scene)
     metadata = {
         "source_urdf": str(source_urdf),
@@ -516,6 +577,7 @@ def build_scene(args: argparse.Namespace) -> tuple[trimesh.Scene, dict]:
         "barrier_capsules": capsules,
         "barrier_sphere": sphere,
         "barrier_constants": barrier_payload["constants"],
+        "axis_labels": axis_labels,
         "scene_bounds": bounds,
         "note": (
             "The barrier overlay is computed from "
@@ -525,16 +587,32 @@ def build_scene(args: argparse.Namespace) -> tuple[trimesh.Scene, dict]:
     }
     return scene, metadata
 
-
 def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
     center = metadata["scene_bounds"]["center"]
     radius = float(metadata["scene_bounds"]["radius"])
     target = f"{center[0]:.5f}m {center[1]:.5f}m {center[2]:.5f}m"
     distance = max(0.8, radius * 2.4)
-    orbit_default = f"45deg 62deg {distance:.5f}m"
-    orbit_right = f"90deg 68deg {distance:.5f}m"
-    orbit_front = f"0deg 68deg {distance:.5f}m"
-    orbit_top = f"45deg 5deg {distance:.5f}m"
+    # Default camera is the right (+y) view.
+    orbit_default = f"0deg 0deg {distance:.5f}m"
+    # Axis-aligned presets: right(+y), front(-x), top(-z) view directions.
+    # Additional user-requested adjustments:
+    #  - front: +90° clockwise around world Y.
+    #  - top: +90° clockwise around world Z (applied as azimuth offset in this viewer API).
+    orbit_front = f"90deg 90deg {distance:.5f}m"
+    orbit_top = f"180deg 90deg {distance:.5f}m"
+    axis_hotspot_markup = []
+    for idx, item in enumerate(metadata.get("axis_labels", [])):
+        px, py, pz = item.get("position", (0.0, 0.0, 0.0))
+        axis = item.get("axis", "")
+        label = item.get("name", "")
+        axis_class = f"axis-hotspot axis-{axis}" if axis else "axis-hotspot"
+        axis_hotspot_markup.append(
+            f"    <button class=\"{axis_class}\" slot=\"hotspot-{idx}\""
+            f" data-position=\"{px:.5f}m {py:.5f}m {pz:.5f}m\""
+            f" data-normal=\"0 1 0\">{label}</button>"
+        )
+    axis_hotspots = "\n".join(axis_hotspot_markup)
+
     metadata_json = json.dumps(metadata, indent=2)
 
     return f"""<!doctype html>
@@ -613,6 +691,71 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
     .control label {{
       color: var(--muted);
     }}
+    .axis-hotspot {{
+      --min-hotspot-opacity: 0;
+      --max-hotspot-opacity: 1;
+      border: 1px solid rgba(0, 0, 0, 0.2);
+      border-radius: 999px;
+      width: 18px;
+      height: 18px;
+      padding: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1;
+      text-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+    }}
+    .axis-hotspot.axis-x {{
+      background: #ef4444;
+    }}
+    .axis-hotspot.axis-y {{
+      background: #22c55e;
+    }}
+    .axis-hotspot.axis-z {{
+      background: #3b82f6;
+    }}
+    .axis-legend {{
+      margin: 10px 0;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.8);
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .axis-title {{
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink);
+      margin-bottom: 2px;
+    }}
+    .axis-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .axis-dot {{
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      display: inline-block;
+    }}
+    .axis-x {{
+      background: #ef4444;
+    }}
+    .axis-y {{
+      background: #22c55e;
+    }}
+    .axis-z {{
+      background: #3b82f6;
+    }}
     input[type="color"] {{
       width: 100%;
       height: 36px;
@@ -624,6 +767,16 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
     input[type="range"] {{
       width: 100%;
       accent-color: var(--accent);
+    }}
+    input[type="text"], input[type="number"] {{
+      width: 100%;
+      background: white;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--ink);
+      padding: 7px 8px;
+      font: inherit;
+      font-size: 12px;
     }}
     .row {{
       display: grid;
@@ -670,6 +823,7 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
     field-of-view="24deg"
     exposure="0.95"
     shadow-intensity="0.32">
+{axis_hotspots}
   </model-viewer>
 
   <section class="panel" aria-label="viewer controls">
@@ -689,12 +843,18 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
       <label for="sourceAlpha">H1 arm alpha</label>
       <input id="sourceAlpha" type="range" min="0.05" max="1" step="0.01" value="1">
     </div>
+    <div class="control">
+      <label for="hideAxis">Hide axis</label>
+      <input id="hideAxis" type="checkbox">
+    </div>
+    <div id="axisLegend" class="axis-legend" aria-label="Axis legend">
+      <div class="axis-title">Axis</div>
+      <div class="axis-item"><span class="axis-dot axis-x"></span> X</div>
+      <div class="axis-item"><span class="axis-dot axis-y"></span> Y</div>
+      <div class="axis-item"><span class="axis-dot axis-z"></span> Z</div>
+    </div>
+
     <div class="row">
-      <button data-orbit="{orbit_default}">Iso</button>
-      <button data-orbit="{orbit_right}">Right</button>
-      <button data-orbit="{orbit_front}">Front</button>
-      <button data-orbit="{orbit_top}">Top</button>
-      <button id="copyCamera">Copy View</button>
       <button id="capture" class="primary">Capture PNG</button>
       <button id="reset">Reset</button>
     </div>
@@ -709,8 +869,101 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
     const overlayAlpha = document.querySelector("#overlayAlpha");
     const sourceAlpha = document.querySelector("#sourceAlpha");
     const status = document.querySelector("#status");
+    const hideAxis = document.querySelector("#hideAxis");
     const target = "{target}";
     const defaultOrbit = "{orbit_default}";
+
+    function toRadians(deg) {{
+      return Number(deg) * Math.PI / 180;
+    }}
+
+    function toDegrees(rad) {{
+      return Number(rad) * 180 / Math.PI;
+    }}
+
+    function clamp(v, min, max) {{
+      return Math.max(min, Math.min(max, v));
+    }}
+
+    function parseOrbitField(value) {{
+      if (typeof value === "number") {{
+        if (Math.abs(value) <= 2 * Math.PI + 1e-6) {{
+          return toDegrees(value);
+        }}
+        return value;
+      }}
+
+      if (typeof value !== "string") {{
+        return NaN;
+      }}
+
+      const num = Number.parseFloat(value);
+      if (!Number.isFinite(num)) {{
+        return NaN;
+      }}
+
+      const isRad = /rad/i.test(value);
+      if (isRad || Math.abs(num) <= 2 * Math.PI + 1e-6) {{
+        return toDegrees(num);
+      }}
+      return num;
+    }}
+
+    function parseDistanceField(value) {{
+      if (typeof value === "number") {{
+        return value;
+      }}
+
+      if (value && typeof value === "object") {{
+        const num = Number.parseFloat(String(value.value ?? value["value"] ?? value.toString()));
+        return Number.isFinite(num) ? num : NaN;
+      }}
+
+      if (typeof value !== "string") {{
+        return NaN;
+      }}
+
+      const num = Number.parseFloat(value);
+      return Number.isFinite(num) ? num : NaN;
+    }}
+
+    function parseVector3(value) {{
+      if (!value) {{
+        return null;
+      }}
+
+      if (typeof value === "object") {{
+        const x = Number.parseFloat(String(value.x ?? value[0] ?? value.toString()));
+        const y = Number.parseFloat(String(value.y ?? value[1] ?? value.toString()));
+        const z = Number.parseFloat(String(value.z ?? value[2] ?? value.toString()));
+        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {{
+          return [x, y, z];
+        }}
+      }}
+
+      if (typeof value === "string") {{
+        const nums = value
+          .trim()
+          .replace(/m$/i, "")
+          .split(/\s+/)
+          .map((item) => Number.parseFloat(item.replace(/m$/i, "")));
+        if (nums.length === 3 && nums.every(Number.isFinite)) {{
+          return nums;
+        }}
+      }}
+
+      return null;
+    }}
+
+    function formatVector3(v) {{
+      return `${{v[0].toFixed(5)}}m ${{v[1].toFixed(5)}}m ${{v[2].toFixed(5)}}m`;
+    }}
+
+    const AXIS_MATERIAL_FACTORS = {{
+      axis_x_material: [239 / 255, 68 / 255, 68 / 255, 1],
+      axis_y_material: [34 / 255, 197 / 255, 94 / 255, 1],
+      axis_z_material: [59 / 255, 130 / 255, 246 / 255, 1],
+    }};
 
     function hexToFactor(hex, alpha) {{
       const value = hex.replace("#", "");
@@ -726,6 +979,36 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
       material.setDoubleSided(true);
     }}
 
+    function setAxisVisibility() {{
+      const visible = !hideAxis.checked;
+      document.querySelectorAll(".axis-hotspot").forEach((el) => {{
+        el.style.display = visible ? "inline-flex" : "none";
+      }});
+      const axisLegend = document.querySelector("#axisLegend");
+      if (axisLegend) {{
+        axisLegend.style.display = visible ? "grid" : "none";
+      }}
+
+      if (!viewer.model) {{
+        return;
+      }}
+      for (const material of viewer.model.materials) {{
+        const name = material.name || "";
+        if (!name.startsWith("axis_")) {{
+          continue;
+        }}
+        const base = AXIS_MATERIAL_FACTORS[name];
+        if (!base) {{
+          continue;
+        }}
+        if (visible) {{
+          setMaterial(material, base, 1);
+        }} else {{
+          setMaterial(material, [base[0], base[1], base[2], 0], 0);
+        }}
+      }}
+    }}
+
     function applyMaterials() {{
       if (!viewer.model) return;
       const overlayFactor = hexToFactor(overlayColor.value, overlayAlpha.value);
@@ -739,6 +1022,7 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
         }}
       }}
       document.documentElement.style.setProperty("--accent", overlayColor.value);
+      setAxisVisibility();
     }}
 
     viewer.addEventListener("load", () => {{
@@ -748,6 +1032,10 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
 
     [overlayColor, overlayAlpha, sourceAlpha].forEach((input) => {{
       input.addEventListener("input", applyMaterials);
+    }});
+    hideAxis.addEventListener("change", () => {{
+      setAxisVisibility();
+      applyMaterials();
     }});
 
     document.querySelectorAll("[data-orbit]").forEach((button) => {{
@@ -763,17 +1051,9 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
       overlayColor.value = "#ff8a00";
       overlayAlpha.value = "0.42";
       sourceAlpha.value = "1";
+      hideAxis.checked = false;
       applyMaterials();
-    }});
-
-    document.querySelector("#copyCamera").addEventListener("click", async () => {{
-      const text = `camera-target="${{viewer.getCameraTarget()}}" camera-orbit="${{viewer.getCameraOrbit()}}"`;
-      try {{
-        await navigator.clipboard.writeText(text);
-        status.textContent = "Camera view copied.";
-      }} catch (_) {{
-        status.textContent = text;
-      }}
+      setAxisVisibility();
     }});
 
     document.querySelector("#capture").addEventListener("click", async () => {{
@@ -789,7 +1069,6 @@ def html_template(glb_data_uri: str, metadata: dict, glb_filename: str) -> str:
 </html>
 """
 
-
 def write_outputs(scene: trimesh.Scene, metadata: dict, out_dir: Path) -> dict[str, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     glb_path = out_dir / "h1_right_arm_barrier_overlay.glb"
@@ -803,7 +1082,6 @@ def write_outputs(scene: trimesh.Scene, metadata: dict, out_dir: Path) -> dict[s
     html_path.write_text(html_template(glb_data_uri, metadata, glb_path.name))
     return {"glb": glb_path, "html": html_path, "metadata": metadata_path}
 
-
 def main() -> None:
     args = parse_args()
     scene, metadata = build_scene(args)
@@ -813,7 +1091,6 @@ def main() -> None:
     print("saved_metadata:", outputs["metadata"])
     print("barrier_capsules:", len(metadata["barrier_capsules"]))
     print("barrier_sphere_radius:", metadata["barrier_sphere"]["radius"])
-
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,18 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker_chunk_deform_failed_ep2_ep3_nominal_reentry.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_human_exit_visual_resume_ep2_ep3
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+eval_args:
+  # Reset ACT action history only after human phase=done and the configured
+  # clearance has held for resume_clear_steps. No handoff gate is relaxed.
+  reset_action_history_after_human_exit: true
+  reset_visual_history_after_recovery: false
+  reset_visual_history_after_human_exit: true

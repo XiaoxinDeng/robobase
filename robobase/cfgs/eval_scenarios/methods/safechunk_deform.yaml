@@ -1,0 +1,175 @@
+# @package _global_
+
+# Default SafeChunk-Deform method parameters shared by experiments.
+# Environment/scenario-specific configs should extend this file and only add
+# their own environment setup or targeted overrides.
+
+safety_filter:
+  config: safechunk_deform.yaml
+  cfg:
+    safety_filter:
+      rollout_model:
+        enabled: true
+        base_delta_always: true
+        # Nominal/ACT rollout calibration.
+        per_state_delta_scale: [0.024060521, 0.014999674, 0.0040376382, 0.018338958, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        per_state_target_alpha: [1, 1, 1, 1, 0.015920483, 0.0032878132, 0.022673585, 0.097854927, 1, 0.052155215, 0.0085802451, 0.034822036, 0.059637245, 1]
+        per_state_action_bias: [-0.44520566, 0.29817146, -0.87368345, -0.099634141, 0.05935153, -0.12640977, -0.27707592, -0.5295049, 0, -0.55863303, 0.10242508, 0.53800905, 0.34438351, 0]
+        # Recovery/MPC rollout calibration. Recovery actions are usually
+        # sharper than ACT actions, so the recovery executor selects this
+        # profile instead of the nominal one.
+        recovery:
+          enabled: true
+          base_delta_always: true
+          per_state_delta_scale: [0.028915012, 0.016776856, 0.013174196, 0.026945822, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+          per_state_target_alpha: [1, 1, 1, 1, 0.11633795, 0, 0.04875784, 0.13975742, 0.6551318, 0.077646405, 0.036469653, 0.06030909, 0, 0.6335837]
+          per_state_action_bias: [-0.3779557, 0.27096617, -0.69960952, -0.11106134, 0.12905797, 0.19947049, -0.27082452, -0.47739148, 0.06639572, -0.696311, 0.077577859, 0.49142516, -1.4081632, -0.23544773]
+  overrides:
+    min_clearance: 0.05
+    lambda_safety: 300.0
+    lambda_path: 0.1
+    lambda_action: 0.05
+    optimized_fallback: brake
+    recoverable_deform:
+      lambda_rejoin: 0.2
+      inner_rejoin_metric: q_state
+      final_rejoin_metric: q_state
+      # ACT-only ablation shows ACT can resume reliably when the q-window L2
+      # error is <= 0.24. Keep rejoin inside that empirically safe boundary.
+      q_rejoin_threshold: 0.22
+      require_qd_rejoin: false
+      qd_rejoin_hard_threshold: 8.0
+    explicit_recovery:
+      committed_min_clearance_for_abort: 0.02
+      committed_deform_min_clearance_for_abort: 0.0
+      mpc_recovery_prefix_len: 1
+      mpc_recovery_require_ordered_progress: false
+      mpc_recovery_require_live_progress: false
+      mpc_recovery_target_tube_require_progress: false
+      # Tighten MPC recovery toward an ACT-resumable trajectory tube. The hard
+      # radius matches the ACT ablation success boundary, while the large weight
+      # makes tube/window error dominate candidate selection before handoff.
+      mpc_recovery_target_tube_radius: 0.22
+      mpc_recovery_target_tube_weight: 600.0
+      mpc_recovery_target_tube_window_len: 4
+      mpc_recovery_target_tube_window_weight: 18.0
+      mpc_recovery_target_tube_window_dq_weight: 8.0
+      mpc_recovery_target_tube_window_action_weight: 1.5
+      # Hard ACT-resume gates used before accepting/teleporting a recovery window.
+      mpc_recovery_target_tube_window_max_q_frame_l2_mean: 0.24
+      mpc_recovery_target_tube_window_max_q_frame_l2_max: 0.32
+      mpc_recovery_target_tube_window_min_dq_cosine: 0.20
+      mpc_recovery_target_tube_window_max_step_l2_error: 0.12
+      mpc_bridge_direction_hard_gate: true
+      # A068: allow MPC handoff to override noisy actual-direction gates only
+      # when ACT's first action agrees with the selected nominal resume action.
+      mpc_handoff_action_agreement_override_enabled: true
+      mpc_handoff_action_agreement_source: both
+      mpc_handoff_require_resume_readiness: true
+      mpc_handoff_use_selected_act_action_if_safe: false
+      # Shadow-only four-action bridge audit; keep runtime handoff fail-closed.
+      mpc_handoff_shadow_prefix_len: 4
+      mpc_handoff_require_shadow_prefix: false
+      mpc_handoff_action_l2_threshold: 0.20
+      mpc_handoff_action_cosine_threshold: 0.98
+      mpc_handoff_action_arm_l2_threshold: 0.20
+      max_recover_steps_before_act_resume: 4
+      max_recover_steps_with_progress: 8
+      recovery_budget_progress_epsilon: 0.005
+      recovery_budget_no_progress_limit: 1
+    safechunk_acceptance:
+      hard_min_clearance: 0.0
+      desired_min_clearance: 0.04
+      prefix_min_clearance: 0.0
+      allow_fallback_path: false
+    safechunk_recover:
+      action_deviation_weight: 0.8
+      smoothness_weight: 0.6
+      action_rate_limit: 0.35
+      action_rate_limit_weight: 5.0
+      resume_tube_weight: 8.0
+      resume_tube_min_score: 0.7
+      resume_tube_min_component_score: 0.45
+      resume_tube_distance_scale: 0.35
+      resume_tube_min_clearance: 0.02
+      # Ordinary recovery now also optimizes the final 4-frame q context, not
+      # only the terminal q. This helps ACT receive a familiar observation/state
+      # stack after recovery.
+      resume_window_len: 4
+      resume_window_weight: 18.0
+      resume_window_dq_weight: 8.0
+      resume_window_action_weight: 1.5
+      resume_window_max_q_frame_l2_mean: 0.24
+      resume_window_max_q_frame_l2_max: 0.32
+      resume_window_min_dq_cosine: 0.20
+      resume_window_max_step_l2_error: 0.12
+      # Generic task-adapter resume score. This is not drawer-specific: eval
+      # adapters provide target distance/contact/progress under resume_* names,
+      # and recovery uses them as a soft ACT-resumability cue.
+      resume_affordance_enabled: true
+      resume_affordance_weight: 18.0
+      resume_affordance_min_score: 0.50
+      resume_affordance_min_component_score: 0.10
+      resume_affordance_required_for_accept: true
+      resume_affordance_min_component_for_accept: 0.05
+      resume_affordance_target_distance_good: 0.12
+      resume_affordance_target_distance_scale: 0.45
+      resume_affordance_progress_scale: 0.10
+      resume_affordance_progress_epsilon: 0.005
+      resume_affordance_progress_distance_gain: 1.0
+      # Keep expensive JAX EE kinematics out of the inner optimizer loop by default.
+      # Handoff/committed diagnostics can still use task-space EE features.
+      resume_affordance_taskspace_in_optimizer: false
+      resume_affordance_terminal_distance_weight: 30.0
+    safechunk_recovery_corridor:
+      # Recovery starts after deformation has escaped, so the return corridor
+      # must satisfy the same execution clearance instead of a near-collision
+      # escape threshold.
+      recover_path_min_clearance: 0.05
+      recover_immediate_hard_clearance: 0.05
+      recover_prefix_min_clearance: 0.05
+      require_post_recovery_act_window: false
+      post_recovery_min_act_steps: 1
+    temporary_blocker:
+      enabled: false
+
+eval_args:
+  condition: chunk_deform
+  # Enabled logging chunk trajectories for finetuning and visualization.
+  log_chunk_trajectories: true
+  # Enabled live Bigym-vs-MPC replay diagnostics for recovery mismatch debugging.
+  log_mpc_replay_diagnostics: true
+  mpc_replay_diagnostics_max_events: 300
+  # Enabled plotting chunk trajectories in 3D for visualization.
+  plot_chunk_trajectories_3d: true
+  # If recovery returns control but ACT remains pre-contact/no-progress, use
+  # closed-loop q-window tracking to move arm/wrist toward an ACT-resumable
+  # nominal window when available, falling back to the local ACT chunk.
+  phase_reanchor_arm_servo: true
+  phase_reanchor_arm_gain: 1.0
+  phase_reanchor_arm_max_step: 0.12
+  phase_reanchor_arm_servo_mix: 1.0
+  phase_reanchor_nominal_window_enabled: false
+  phase_reanchor_nominal_window_len: 4
+  phase_reanchor_nominal_window_lead_steps: 3
+  phase_reanchor_arm_error_clip: 0.22
+  phase_reanchor_wrist_servo_weight: 1.8
+  post_recovery_task_guard: true
+  post_recovery_task_guard_force_gripper: false
+  post_recovery_task_guard_reanchor_phases: [pre_grasp, grasp, pull]
+  post_recovery_no_progress_reanchor: true
+  post_recovery_no_progress_start_step: 90
+  post_recovery_no_progress_patience: 8
+  post_recovery_no_progress_max_progress: 0.04
+  post_recovery_no_progress_min_target_distance: 0.62
+  post_recovery_mid_progress_no_progress_reanchor: true
+  post_recovery_mid_progress_min_progress: 0.35
+  post_recovery_mid_progress_patience: 2
+  post_recovery_mid_progress_epsilon: 0.001
+  post_recovery_mid_progress_distance_regression: 0.06
+  post_recovery_mid_progress_min_target_distance: 0.42
+  post_recovery_mid_progress_reseed_action_history: true
+  post_recovery_mid_progress_reseed_phases: [pull]
+  post_recovery_mid_progress_reseed_max_count: 1
+  post_recovery_mid_progress_reseed_prior_progress_action: false
+  post_recovery_mid_progress_reseed_prior_max_age: 8

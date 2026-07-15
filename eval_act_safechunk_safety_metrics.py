@@ -55,7 +55,7 @@ from eval_act_oscbf_safety_metrics import (
     _plot_episode_metrics,
     _video_duration_seconds,
 )
-from robobase.eval_utils import (
+from robobase.safetyfilter.eval_utils.eval_utils import (
     WallClockVideoRecorder,
     assert_action_properties,
     compute_oscbf_h_monitor,
@@ -75,8 +75,8 @@ from robobase.eval_utils import (
 )
 from robobase.safetyfilter.h1_state_bridge import extract_h1_state
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
-from robobase.safetyfilter.safechunk_deform_filter import SafeChunkDeformFilter
-from robobase.safetyfilter.path_consistent_brake_filter import PathConsistentBrakeFilter
+from robobase.safetyfilter.safechunkdeform.safechunk_deform_filter import SafeChunkDeformFilter
+from robobase.safetyfilter.pacs.path_consistent_brake_filter import PathConsistentBrakeFilter
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")

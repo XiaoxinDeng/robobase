@@ -1,0 +1,36 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker_chunk_deform.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_force_planned_recovery_q_ablation
+  description: >-
+    Eval-only ablation: when SafeChunk/MPC accepts a recovery/rejoin plan,
+    directly set the Bigym H1 q state to the planner's planned recovery q and
+    then let ACT resume through the normal safety filter. This isolates whether
+    the planned recovery state itself is task-resumable.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+eval_args:
+  ablation_force_planned_recovery_q: true
+  ablation_force_planned_recovery_q_trigger: accepted
+  ablation_force_planned_recovery_q_once_per_episode: true
+  ablation_force_planned_recovery_q_mode: controlled
+  ablation_force_planned_recovery_q_zero_velocity: true
+  ablation_force_planned_recovery_q_hold_current_step: true
+  ablation_force_planned_recovery_q_reset_filter: true
+  ablation_force_planned_recovery_q_reset_history: false
+  episodes: 2
+  steps: 300
+  log_mpc_replay_diagnostics: true
+  mpc_replay_diagnostics_max_events: 300
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/temporal_human_blocker_chunk_deform_force_planned_recovery_q_ablation.yaml

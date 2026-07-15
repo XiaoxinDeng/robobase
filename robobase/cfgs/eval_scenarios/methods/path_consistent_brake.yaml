@@ -1,0 +1,15 @@
+# @package _global_
+
+extends: []
+
+scenario:
+  name: act_path_consistent_brake
+  description: ACT policy guarded by the path-consistent braking filter.
+
+environment: {}
+
+safety_filter:
+  config: path_consistent_brake.yaml
+
+eval_args:
+  condition: path_consistent_brake

@@ -1,0 +1,14 @@
+# @package _global_
+
+extends: []
+
+scenario:
+  name: act_baseline
+  description: Raw ACT policy baseline.
+
+environment: {}
+
+safety_filter: {}
+
+eval_args:
+  condition: act

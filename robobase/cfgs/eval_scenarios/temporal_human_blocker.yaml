@@ -1,0 +1,48 @@
+# @package _global_
+
+extends: []
+
+scenario:
+  name: temporal_human_blocker_environment
+  description: >-
+    Clean drawer task plant with a mirrored human-arm safety/video environment
+    that injects the temporary blocker motion. Safety method is selected by
+    concrete scenarios.
+
+environment:
+  env: bigym/drawer_top_open
+  safety_env: bigym/human_arm_drawer_top_open
+  normalization_source: eval
+  hide_human_arm_policy_obs: true
+  enable_human_arm_collisions: true
+  visual_only_human_arm: false
+  freeze_human_arm: false
+  live_h_monitor: false
+  override:
+    - +env.enable_temporary_human_blocker=true
+    - +env.trigger_dist=1.20
+    - +env.enter_duration=1.20
+    - +env.hold_duration=1.20
+    - +env.exit_duration=1.20
+    - +env.natural_scale=1.0
+    - +env.spawn_x=0.06
+    - +env.spawn_y=-0.31
+    - +env.move_x=0.00
+    - +env.move_y=0.62
+    - +env.block_yaw=1.57
+    - +env.block_pitch=-0.45
+    - +env.block_elbow=1.00
+
+safety_filter: {}
+
+eval_args:
+  snapshot: exp_local/pixel_act/bigym_drawer_top_open_20260528034109/snapshots/3000_snapshot.pt
+  episodes: 2
+  steps: 300
+  demos: 40
+  seed: 1
+  out: metrics.jsonl
+  video_time_base: sim
+  stop_video_at_steps: 300
+  continue_after_success: true
+  no_progress: true

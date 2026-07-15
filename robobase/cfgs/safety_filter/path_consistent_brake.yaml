@@ -12,14 +12,16 @@ safety_filter:
   control_type: absolute
   debug: true
 
-  controlled_action_indices: [4, 5, 6, 7, 9, 10, 11, 12]
-  controlled_state_indices: [4, 5, 6, 7, 9, 10, 11, 12]
+  # Base+arm safety-control indices. Dims 0..3 are floating-base/pelvis
+  # controls; dims 4..12 are arm joints used by the H1 OSCBF model.
+  controlled_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12]
+  controlled_state_indices: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12]
 
   min_clearance: 0.12
   brake_progress_threshold: 0.05
   deadlock_window: 5
   deformation_enabled: false
-  mode: candidate
+  mode: optimized
   chunk_deformation_scales: [0.0, 0.25, 0.5, 0.75]
   chunk_deformation_smoothing: 1
   sequential_oscbf_fallback: false
@@ -31,7 +33,7 @@ safety_filter:
   lambda_action: 0.1
   lambda_path: 0.2
   lambda_smooth: 0.1
-  optimized_fallback: candidate
+  optimized_fallback: brake
   detach_passthrough_dims: true
 
   waypoint_substeps: 2
@@ -88,15 +90,15 @@ safety_filter:
     ee_rejoin_threshold: 0.08
     explicit_return: true
     acceptance_clearance_tol: 0.005
-    lambda_yield_safety: 800.0
-    lambda_yield_action: 0.1
-    lambda_yield_smooth: 0.1
+    lambda_deform_safety: 800.0
+    lambda_deform_action: 0.1
+    lambda_deform_smooth: 0.1
     lambda_retreat: 1.0
     lambda_return_safety: 500.0
     lambda_return_rejoin: 5.0
     lambda_return_smooth: 0.2
     lambda_return_action: 0.1
-    yield_horizon: 4
+    deform_horizon: 4
     return_horizon: 8
     max_return_retries: 3
     use_ee_final_check: false
@@ -106,6 +108,15 @@ safety_filter:
     brake_if_unrecoverable: true
   optimized_deform:
     debug_safety_feasibility: true
+    optimizer_method: gradient
+    gradient_samples: 4
+    gradient_eps: 0.015
+    gradient_adam_beta1: 0.9
+    gradient_adam_beta2: 0.999
+    gradient_min_improvement: 0.000001
+    gradient_line_search_scales: [1.0, 0.5, 0.25]
+    gradient_batched_line_search: true
+    gradient_early_stop_on_path: true
   explicit_recovery:
     commit_accepted_chunks: true
     committed_chunk_safety_check: true
@@ -115,6 +126,7 @@ safety_filter:
     repair_committed_action: true
     monotonic_committed_repair: true
     committed_execution_margin: 0.02
+    committed_rollout_gain: 1.0
     committed_state_error_threshold: 0.25
     committed_state_error_action: replan
   diagnostics:

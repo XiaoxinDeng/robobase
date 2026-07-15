@@ -1,134 +1,58 @@
 # @package _global_
-#
-# Default BiGym human-arm motion scenario for SafeChunk-Deform evaluation.
-# This is intentionally separate from temporary-blocker configs: it uses the
-# normal human_arm_drawer_top_open scripted arm, without forced carrier XY,
-# transient obstruction, drawer obstruction, EE-side sweep, or natural-contact
-# override.
-#
-# The current eval entrypoint is argparse-based, so this file documents a
-# reusable preset and the matching CLI flags rather than being auto-loaded by
-# Hydra.
+
+extends: []
 
 scenario:
-  name: default_human_arm_motion
+  name: default_human_arm_motion_environment
   description: >-
-    Default moving human arm in bigym/human_arm_drawer_top_open with physical
-    collisions enabled. Use this when evaluating normal human-arm motion, not
-    the tuned temporal/temporary blocker scenario.
+    Default human-arm runtime environment used for drawer-top-open ACT safety
+    comparisons. This mirrors the environment setup from the optimized video
+    trajectory run, while leaving the safety method to concrete scenarios.
+
+environment:
+  env: bigym/human_arm_drawer_top_open
+  # A mirror environment, we do not need it
+  safety_env: null
+  # controls where the eval script gets observation/action normalization stats for the ACT policy.
+  normalization_source: auto # eval # policy
+  # Hide human arm from policy observation
+  hide_human_arm_policy_obs: true
+  # allow human arm to collide with the robot
+  enable_human_arm_collisions: false
+  visual_only_human_arm: false
+  # Whether to freeze the human arm motion during evaluation. If set to true, the human arm will not move and will remain in its initial position throughout the evaluation.
+  freeze_human_arm: false
+  # Whether to monitor h violation the entire horizon, even during deform and recovery phase. Enable for logging.
+  live_h_monitor: false
+  override:
+    - env.episode_length=400000
+    - env.manifest=/home/xd1125/.bigym/demonstrations/0.9.0/DrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/lightweight/manifest.json
+    - env.privileged_information=false
+    - env.require_mode_label=false
+    - frame_stack=4
+
+safety_filter: {}
 
 eval_args:
-  env: bigym/human_arm_drawer_top_open
-  safety_env: null
-  normalization_source: auto
-  hide_human_arm_policy_obs: false
-
-  # Human arm contact/visibility mode.
-  enable_human_arm_collisions: true
-  disable_human_arm_collisions: false
-  visual_only_human_arm: false
-  freeze_human_arm: false
-
-  # Default scripted human-arm motion.
-  human_arm_aggression: 1.0
-  human_arm_substeps: 1
-  human_arm_zero_dwell: false
-  human_arm_walk_radius: null
-  human_arm_goal_xy: null
-  human_arm_keepout_min_clear: null
-  human_arm_disable_keepout: false
-  human_arm_yaw_offset_deg: 90.0
-
-  # Explicitly disabled blocker/contact-test modes.
-  human_arm_transient_obstruction: false
-  human_arm_ee_obstruction: false
-  human_arm_ee_side_sweep: false
-  human_arm_drawer_obstruction: false
-  human_arm_force_carrier_xy: null
-  human_arm_force_carrier_amp_xy: null
-  human_arm_natural_contact_motion: false
-  human_arm_final_clear_after_steps: -1
-
-  # Runtime/logging. Disable only the standalone h monitor for speed; SafeChunk
-  # horizon/post-action checks and physical MuJoCo contact counting remain on.
-  live_h_monitor: false
-
-  # SafeChunk-Deform settings for default human-arm motion.
-  condition: chunk_deform
-  chunk_deform_mode: optimized
-  chunk_recoverable_deform_enabled: true
-  chunk_explicit_return: true
-  chunk_commit_accepted_chunks: true
-  chunk_allow_candidate_fallback: false
-  chunk_optimized_fallback: brake
-  chunk_temporary_blocker_enabled: false
-
-  # Relaxed but still conservative h margins for the default moving arm.
-  # Previous 0.12/0.08 settings were safe but caused low ACT utilization and
-  # many committed recovery aborts in s16_optimized_default_human_arm_180step.
-  chunk_min_clearance: 0.08
-  chunk_committed_min_clearance_for_abort: 0.05
-  chunk_committed_execution_margin: 0.02
-  chunk_recover_path_min_clearance: 0.04
-  chunk_recover_immediate_hard_clearance: 0.02
-  chunk_recover_prefix_min_clearance: 0.04
-
-  # Optimizer defaults; JAX batched acceleration is default-on in code.
-  chunk_opt_iters: 20
-  chunk_opt_population: 32
-  chunk_opt_lr: 0.03
-  chunk_lambda_safety: 500.0
-  chunk_lambda_action: 0.1
-  chunk_lambda_path: 0.2
-  chunk_lambda_smooth: 0.1
-  chunk_lambda_rejoin: 0.5
-  chunk_inner_rejoin_metric: q_state
-  chunk_final_rejoin_metric: q_state
-  chunk_q_rejoin_threshold: 0.5
-  chunk_ee_rejoin_threshold: 0.08
-
-  # Horizon human prediction.
-  chunk_horizon_predict_human_motion: true
-  chunk_human_motion_prediction_max_time: 0.25
-  chunk_human_motion_prediction_max_speed: 3.0
-
-cli_overrides:
-  - --env bigym/human_arm_drawer_top_open
-  - --enable-human-arm-collisions
-  - --no-live-h-monitor
-  - --chunk-deform-mode optimized
-  - --no-chunk-temporary-blocker-enabled
-  - --chunk-min-clearance 0.08
-  - --chunk-committed-min-clearance-for-abort 0.05
-  - --chunk-optimized-fallback brake
-  - --no-chunk-allow-candidate-fallback
-
-
-validation_runs:
-  - name: relaxed_margins_success_20260609
-    output_dir: /home/xd1125/Workspace/safe_bigym_hoi/external/robobase/eval_safety/default_human_arm_relaxed_margins_180step_metrics_rerun
-    command_notes: >-
-      1 episode, 180-step cap, no video/trajectory artifacts, physical human-arm
-      contacts enabled, standalone live h monitor disabled for latency.
-    result:
-      task_success: true
-      contacts: 0
-      contact_steps: 0
-      episode_length: 113
-      final_task_progress: 0.9103280901908875
-      drawer_open_distance: 0.3459246710675358
-      optimized_attempts: 4
-      optimized_accepted_count: 3
-      committed_chunk_started_count: 3
-      committed_chunk_completed_count: 2
-      committed_chunk_abort_count: 0
-      committed_repaired_step_count: 2
-      act_steps: 53
-      deform_steps: 12
-      recover_steps: 22
-      brake_steps: 18
-      fallback_steps: 1
-      filter_time_ms_mean: 741.7494
-      filter_time_ms_p50: 5.3526
-      filter_time_ms_p95: 39.6430
-      filter_time_ms_max: 57809.4588
+  # ACT checkpoint
+  snapshot: exp_local/pixel_act/bigym_drawer_top_open_20260528034109/snapshots/3000_snapshot.pt
+  # Number of evaluation episodes to run.
+  episodes: 1
+  # Number of steps to run the evaluation for.
+  steps: 300
+  # Load 40 demos from the manifest for action normalization
+  demos: 40
+  # Human arm motion seed.
+  seed: 1
+  # per-step raw metrics filename, other metrics will be logged to the same prefix, i.e.{out}_episodes.json, {out}_summary.json.
+  out: metrics.jsonl
+  # Use simulation time as the time base for video recording. If set to "wall", will use wall-clock time.
+  video_time_base: sim # wall
+  # Stop video recording after this many steps. If set to 0, will record the entire episode.
+  stop_video_at_steps: 300
+  # Whether to continue evaluation after a successful episode. If set to false, evaluation will stop after the first successful episode.
+  continue_after_success: false
+  # disable the terminal/progress bar output
+  no_progress: true
+  # Override human arm position to prevent collision at spawn.
+  human_arm_force_carrier_xy: [0.06, -0.31]

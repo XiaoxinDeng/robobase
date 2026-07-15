@@ -1,0 +1,13 @@
+# @package _global_
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_ep0_ep5
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+eval_args:
+  episodes: 6
+  episode_index_offset: 0
+  steps: 300

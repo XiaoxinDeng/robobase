@@ -1,73 +1,5 @@
-"""
-export SNAPSHOT_V0=exp_local/pixel_act/bigym_drawer_top_open_20260527214324/snapshots/15000_snapshot.pt
-export SNAPSHOT_V1=exp_local/pixel_act/bigym_drawer_top_open_20260528010800/snapshots/30000_snapshot.pt
-export SNAPSHOT_V2=exp_local/pixel_act/bigym_drawer_top_open_20260528034109/snapshots/3000_snapshot.pt
-export SNAPSHOT=$SNAPSHOT_V2
-export MANIFEST=/home/xd1125/.bigym/demonstrations/0.9.0/DrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/lightweight/manifest.json
-
-ACT evaluation:
-    /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
-    eval_act_oscbf_safety_metrics.py \
-    --condition act \
-    --snapshot $SNAPSHOT_V2 \
-    --env bigym/drawer_top_open \
-    --episodes 5 \
-    --steps 3500 \
-    --stop-video-at 2:00 \
-    --demos 40 \
-    --out debug_act_human_env_drawer_stats.jsonl \
-    --output-dir eval_safety/v2_eval_3000 \
-    --override frame_stack=4 \
-    --debug
-
-
-
-
-ACT + single-action OSCBF evaluation:
-    cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase
-
-    /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
-    eval_act_oscbf_safety_metrics.py \
-    --condition oscbf \
-    --snapshot $SNAPSHOT \
-    --env bigym/human_arm_drawer_top_open \
-    --episodes 2 \
-    --steps 1000 \
-    --demos 40 \
-    --out debug_act_human_env_drawer_stats.jsonl \
-    --output-dir eval_safety/act_monitor_human_env \
-    --override env.manifest=$MANIFEST \
-    --override env.privileged_information=false \
-    --override env.require_mode_label=false \
-    --override frame_stack=4 \
-    --debug
-
-
-
-
-ACT + single-action OSCBF evaluation:
-    cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase
-
-    /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
-    eval_act_oscbf_safety_metrics.py \
-    --condition oscbf \
-    --snapshot $SNAPSHOT \
-    --env bigym/human_arm_drawer_top_open \
-    --episodes 2 \
-    --steps 500 \
-    --demos 40 \
-    --out metrics_act_single_step_oscbf_human.jsonl \
-    --override env.episode_length=20000 \
-    --override env.manifest=$MANIFEST \
-    --override env.privileged_information=false \
-    --override env.require_mode_label=false \
-    --debug \
-    --plot-terminal
-"""
-
 from __future__ import annotations
-
-import argparse
+from robobase.safetyfilter.safechunkdeform.stepmetrics import StepMetrics
 import copy
 import imageio
 import json
@@ -76,67 +8,6 @@ import os
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-import jax
-import jax.numpy as jnp
-
-
-@jax.jit
-def _jax_prepare_horizon_clearance_inputs(
-    q_bigym_flat,
-    capsule_a_world_flat,
-    capsule_b_world_flat,
-    bigym_state_arm_indices,
-    urdf_arm_joint_indices,
-    arm_sign,
-    arm_offset,
-    urdf_neutral_q,
-    t_pelvis_urdf,
-):
-    q_arm_bigym = q_bigym_flat[:, bigym_state_arm_indices]
-    q_arm_urdf = arm_sign[None, :] * q_arm_bigym + arm_offset[None, :]
-    q_urdf = jnp.broadcast_to(
-        urdf_neutral_q[None, :],
-        (q_bigym_flat.shape[0], urdf_neutral_q.shape[0]),
-    )
-    q_urdf = q_urdf.at[:, urdf_arm_joint_indices].set(q_arm_urdf)
-
-    xyz = q_bigym_flat[:, :3]
-    yaw = q_bigym_flat[:, 3]
-    cy = jnp.cos(yaw)
-    sy = jnp.sin(yaw)
-    zeros = jnp.zeros_like(cy)
-    ones = jnp.ones_like(cy)
-    r_world_pelvis = jnp.stack(
-        (
-            jnp.stack((cy, -sy, zeros), axis=-1),
-            jnp.stack((sy, cy, zeros), axis=-1),
-            jnp.stack((zeros, zeros, ones), axis=-1),
-        ),
-        axis=-2,
-    )
-    r_pelvis_urdf = t_pelvis_urdf[:3, :3]
-    t_pelvis_urdf_vec = t_pelvis_urdf[:3, 3]
-    r_world_urdf = jnp.einsum("nij,jk->nik", r_world_pelvis, r_pelvis_urdf)
-    t_world_urdf = xyz + jnp.einsum("nij,j->ni", r_world_pelvis, t_pelvis_urdf_vec)
-    bottom = jnp.broadcast_to(
-        jnp.asarray((0.0, 0.0, 0.0, 1.0), dtype=q_bigym_flat.dtype),
-        (q_bigym_flat.shape[0], 1, 4),
-    )
-    t_world_urdf_h = jnp.concatenate(
-        (jnp.concatenate((r_world_urdf, t_world_urdf[:, :, None]), axis=2), bottom),
-        axis=1,
-    )
-    t_urdf_world_h = jnp.linalg.inv(t_world_urdf_h)
-
-    ones_a = jnp.ones(capsule_a_world_flat.shape[:-1] + (1,), dtype=q_bigym_flat.dtype)
-    ones_b = jnp.ones(capsule_b_world_flat.shape[:-1] + (1,), dtype=q_bigym_flat.dtype)
-    capsule_a_world_h = jnp.concatenate((capsule_a_world_flat, ones_a), axis=-1)
-    capsule_b_world_h = jnp.concatenate((capsule_b_world_flat, ones_b), axis=-1)
-    capsule_a_urdf = jnp.einsum("nij,ncj->nci", t_urdf_world_h, capsule_a_world_h)[:, :, :3]
-    capsule_b_urdf = jnp.einsum("nij,ncj->nci", t_urdf_world_h, capsule_b_world_h)[:, :, :3]
-    return q_urdf, capsule_a_urdf, capsule_b_urdf
-
-
 import sys
 import time
 from dataclasses import dataclass, asdict
@@ -144,15 +15,16 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
-import torch
 from omegaconf import OmegaConf
+import torch
+import jax.numpy as jnp
 
 try:
     from tqdm import tqdm
 except ImportError:  # tqdm may not be installed in every environment
     tqdm = None
 
-from robobase.eval_utils import (
+from robobase.safetyfilter.eval_utils.eval_utils import (
     WallClockVideoRecorder,
     _render_single_env_if_vector,
     infer_env_action_shape,
@@ -166,19 +38,114 @@ from robobase.eval_utils import (
     make_workspace_and_load_snapshot,
     policy_action,
     compute_oscbf_h_monitor,
+    compute_oscbf_full_arm_h_monitor,
     count_robot_human_contacts,
     robot_human_contact_pairs,
     extract_success,
     assert_action_properties,
-    summarise_episode,
-    summarise_all_episodes,
 )
 
-from robobase.envs.bigym import BiGymEnvFactory
-from robobase.safetyfilter.h1_state_bridge import extract_h1_state, get_bigym_task
+from robobase.safetyfilter.eval_utils.eval_environment import (
+    assert_action_properties,
+    _adapt_policy_obs_to_space,
+    _apply_robot_spawn_offset_xy,
+    _configure_human_arm_challenge,
+    _diagnostic_progress_delta,
+    _diagnostic_task_state,
+    _disable_human_arm_collisions,
+    _enable_human_arm_collisions,
+    _find_wrapped_attr,
+    _find_wrapped_env_with_attr,
+    _finite_task_progress,
+    _freeze_human_arm,
+    _hard_hold_action_from_live_robot,
+    _human_arm_trajectory_sample,
+    _make_policy_env_cfg,
+    _normalize_h_robot_part,
+    _phase_reanchor_action,
+    _phase_reanchor_state,
+    _policy_obs_with_hidden_human_arm,
+    _post_recovery_task_guard_ready,
+    _post_recovery_task_guard_reanchor_allowed,
+    _raw_scaled_first_action,
+    _reset_action_sequence_history,
+    _reset_policy_visual_history_after_recovery,
+    _seed_policy_visual_history_after_recovery,
+    _restore_action_sequence_temporal_ensemble,
+    _robot_ee_trajectory_sample,
+    _robot_ee_world_xy,
+    _robot_gripper_geom_world_xy,
+    _set_action_sequence_temporal_ensemble,
+    _set_robot_freeze_next_step,
+    _should_start_phase_reanchor,
+    _sync_animated_legs,
+    _sync_named_mujoco_state,
+    _sync_robot_low_level_hold_state,
+    _update_scripted_human_arm_pose,
+    _update_temporary_human_blocker_if_present,
+)
+
+from robobase.safetyfilter.eval_utils.eval_metrics import (
+    _chunk_filter_advantage_metrics,
+    _chunk_horizon_h_monitor_fallback,
+    _horizon_risk_gap,
+    _optional_bool,
+    _optional_float,
+    _optional_int,
+    _optional_str,
+    _path_deviation_metrics,
+    summarise_all_chunk_episodes,
+    summarise_chunk_episode,
+)
+
+from robobase.safetyfilter.eval_utils.eval_visualization import (
+    _apply_robot_part_color_overrides,
+    _clearance_sequence_payload,
+    _jsonable_trace_value,
+    _plot_episode_metrics,
+    _restore_robot_part_color_overrides,
+    _save_chunk_trajectory_viewer,
+)
+
+from robobase.safetyfilter.eval_utils.eval_config import (
+    DEFAULT_EVAL_ARGS,
+    _args_safety_filter,
+    _flatten_eval_config_paths,
+    _path_consistent_brake_eval_config,
+    _path_consistent_brake_kwargs_from_config,
+    _safety_filter_debug,
+    _safety_filter_section,
+    parse_args,
+)
+
+from robobase.safetyfilter.eval_utils.eval_video import (
+    _make_eval_env_with_normalization,
+    _normalize_rgb_frame,
+    _policy_obs_rgb_frame,
+    _print_normalization_source,
+    _resolve_normalization_cfg,
+    _resolve_video_stop_steps,
+    _save_policy_obs_video,
+    _video_duration_seconds,
+    _video_recorded_steps,
+    _load_snapshot_normalization_cfg
+)
+
+from robobase.safetyfilter.eval_utils.eval_runtime import (
+    HorizonOSCBFOperator,
+    _h_argmin_metadata,
+    _warmup_oscbf_cbf_paths,
+)
+
+from robobase.safetyfilter.h1_state_bridge import (
+    TREE_JOINT_NAMES,
+    build_tree_to_mujoco_index_map,
+    extract_h1_state,
+    get_bigym_mojo,
+)
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
-from robobase.safetyfilter.safechunk_deform_filter import SafeChunkDeformFilter
-from robobase.safetyfilter.path_consistent_brake_filter import PathConsistentBrakeFilter
+from robobase.safetyfilter.safechunkdeform.safechunk_deform_filter import SafeChunkDeformFilter
+from robobase.safetyfilter.pacs.path_consistent_brake_filter import PathConsistentBrakeFilter
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
@@ -195,2393 +162,30 @@ logging.getLogger().addFilter(_IgnoreBigymVersionMismatchFilter())
 
 
 REPO = Path("/home/xd1125/Workspace/safe_bigym_hoi")
-ROBOBASE_CFG = REPO / "external/robobase/robobase/cfgs"
 H1_URDF = REPO / "external/oscbf/oscbf/assets/h1/h1.urdf"
+_H_HUMAN_CAPSULE_PARTS = ("human_upper_arm", "human_forearm")
 
 
-PATH_CONSISTENT_BRAKE_FILTER_CONFIG = (
-    ROBOBASE_CFG / "safety_filter" / "path_consistent_brake.yaml"
-)
-PATH_CONSISTENT_BRAKE_CONFIG_KEYS = (
-    "waypoint_substeps",
-    "max_waypoint_delta",
-    "slowdown_enabled",
-    "slowdown_lookahead",
-    "slowdown_min_scale",
-    "certified_backup_enabled",
-    "trajectory_generation_enabled",
-    "trajectory_max_velocity",
-    "trajectory_max_acceleration",
-    "trajectory_max_jerk",
-    "trajectory_initial_speed",
-    "trajectory_backend",
-    "trajectory_min_position",
-    "trajectory_max_position",
-    "shield_substeps",
-    "inner_shield_verification_enabled",
-    "skip_inner_shield_when_rejected",
-    "reuse_operator_human_rollout_cache",
-    "reachability_certification_enabled",
-    "reachability_fail_closed",
-    "reachability_robot_radius",
-    "reachability_obstacle_radius",
-    "reachability_robot_points_source",
-    "reachability_inflation_enabled",
-    "reachability_tracking_error",
-    "reachability_measurement_error",
-    "reachability_object_speed",
-    "reachability_object_acceleration",
-    "reachability_sensor_delay",
-    "safety_constraint_type",
-    "pfl_energy_threshold",
-    "pfl_contact_margin",
-    "pfl_joint_inertia",
-    "pfl_energy_thresholds",
-    "pfl_active_threshold_key",
-)
-PATH_CONSISTENT_BRAKE_LIMIT_KEYS = (
-    "trajectory_max_velocity",
-    "trajectory_max_acceleration",
-    "trajectory_max_jerk",
-)
-
-
-def _resolve_path_consistent_brake_config_path(config_path: Optional[str]) -> Optional[Path]:
-    if config_path is None:
-        return None
-    raw_path = Path(config_path).expanduser()
-    if raw_path.is_absolute():
-        return raw_path
-    candidates = (
-        Path.cwd() / raw_path,
-        ROBOBASE_CFG / "safety_filter" / raw_path,
-        ROBOBASE_CFG / raw_path,
-        REPO / raw_path,
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return candidates[0]
-
-
-def _load_path_consistent_brake_filter_config(config_path: Optional[str] = None) -> dict[str, Any]:
-    cfg = OmegaConf.create({})
-    if PATH_CONSISTENT_BRAKE_FILTER_CONFIG.exists():
-        cfg = OmegaConf.merge(cfg, OmegaConf.load(PATH_CONSISTENT_BRAKE_FILTER_CONFIG))
-    else:
-        logger.warning("PathConsistentBrake base config missing: %s", PATH_CONSISTENT_BRAKE_FILTER_CONFIG)
-
-    overlay_path = _resolve_path_consistent_brake_config_path(config_path)
-    if overlay_path is not None:
-        if not overlay_path.exists():
-            raise FileNotFoundError(f"PathConsistentBrake config not found: {overlay_path}")
-        if not (
-            PATH_CONSISTENT_BRAKE_FILTER_CONFIG.exists()
-            and overlay_path.resolve() == PATH_CONSISTENT_BRAKE_FILTER_CONFIG.resolve()
-        ):
-            cfg = OmegaConf.merge(cfg, OmegaConf.load(overlay_path))
-
-    safety_cfg = cfg.get("safety_filter", cfg)
-    container = OmegaConf.to_container(safety_cfg, resolve=True)
-    return dict(container or {})
-
-
-def _positive_path_consistent_brake_limit_or_none(value):
-    if value is None:
-        return None
-    if isinstance(value, (int, float, np.number)) and float(value) <= 0.0:
-        return None
-    return value
-
-
-def _path_consistent_brake_kwargs_from_config(
-    args,
-    config: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    if config is None:
-        config = _load_path_consistent_brake_filter_config(
-            getattr(args, "path_consistent_brake_config", None)
-        )
-    kwargs = {
-        key: config[key]
-        for key in PATH_CONSISTENT_BRAKE_CONFIG_KEYS
-        if key in config
-    }
-    for key in PATH_CONSISTENT_BRAKE_LIMIT_KEYS:
-        if key in kwargs:
-            kwargs[key] = _positive_path_consistent_brake_limit_or_none(kwargs[key])
-    return kwargs
-
-
-def _path_consistent_brake_eval_config(args) -> dict[str, Any]:
-    if getattr(args, "condition", None) != "path_consistent_brake":
-        return {}
-    return _load_path_consistent_brake_filter_config(
-        getattr(args, "path_consistent_brake_config", None)
-    )
-
-
-
-@dataclass
-class StepMetrics:
-    condition: str
-    episode: int
-    step: int
-
-    reward: float
-    terminated: bool
-    truncated: bool
-    success: bool
-
-    human_phase: Optional[str]
-    ee_to_handle_dist: Optional[float]
-    human_blocker_triggered: Optional[bool]
-    human_time_in_phase: Optional[float]
-    min_robot_human_distance: Optional[float]
-    drawer_open_distance: Optional[float]
-    drawer_open_fraction: Optional[float]
-    drawer_joint_position: Optional[float]
-    task_progress: Optional[float]
-    task_progress_before: Optional[float]
-    task_progress_after: Optional[float]
-    task_progress_delta: Optional[float]
-    ee_object_distance: Optional[float]
-    object_state: Optional[dict[str, Any]]
-
-    min_h: Optional[float]
-    h_values: Optional[list[float]]
-    h_violation: Optional[bool]
-    live_h_monitor_skipped: Optional[bool]
-    chunk_min_clearance: Optional[float]
-    chunk_first_violation: Optional[int]
-    chunk_unsafe_count: Optional[int]
-    horizon_risk_gap: Optional[float]
-    horizon_risk_gap_active: Optional[bool]
-    horizon_clearance_drop: Optional[float]
-    pacs_background_check_only: Optional[bool]
-    pacs_background_safety_mode: Optional[str]
-    pacs_background_deformation_source: Optional[str]
-    pacs_background_retiming_source: Optional[str]
-    pacs_background_brake_step: Optional[bool]
-    pacs_background_act_step: Optional[bool]
-    pacs_background_min_clearance: Optional[float]
-    pacs_background_first_violation: Optional[int]
-    pacs_background_unsafe_count: Optional[int]
-    pacs_background_arm_delta: Optional[float]
-    pacs_background_chunk_arm_delta: Optional[float]
-    pacs_background_chunk_modified_fraction: Optional[float]
-    pacs_background_retiming_arm_delta: Optional[float]
-    pacs_background_retiming_chunk_arm_delta: Optional[float]
-    pacs_background_retiming_changed_fraction: Optional[float]
-
-    contact_count: Optional[int]
-    contact_pairs: Optional[list[str]]
-
-    arm_delta: float
-    base_delta: float
-    non_arm_delta: float
-    full_delta: float
-    per_step_action_delta_norm: float
-    per_step_arm_delta_norm: float
-    per_step_base_delta_norm: float
-    chunk_arm_delta: Optional[float]
-    chunk_base_delta: Optional[float]
-    chunk_non_arm_delta: Optional[float]
-    chunk_full_delta: Optional[float]
-    chunk_action_delta_norm: Optional[float]
-    chunk_arm_delta_norm: Optional[float]
-    chunk_base_delta_norm: Optional[float]
-    chunk_modified_fraction: Optional[float]
-    chunk_modified_steps: Optional[int]
-    chunk_first_modified_step: Optional[int]
-    chunk_last_modified_step: Optional[int]
-    chunk_mean_step_arm_delta: Optional[float]
-    chunk_max_step_arm_delta: Optional[float]
-    chunk_future_arm_delta: Optional[float]
-    chunk_future_edit_fraction: Optional[float]
-    chunk_first_edit_fraction: Optional[float]
-    chunk_safe_arm_variation: Optional[float]
-    chunk_nominal_arm_variation: Optional[float]
-    chunk_arm_variation_delta: Optional[float]
-    chunk_edit_variation: Optional[float]
-    path_mean_deviation: Optional[float]
-    path_max_deviation: Optional[float]
-    path_final_deviation: Optional[float]
-    chunk_preemptive_intervention: Optional[bool]
-    intervention_active: bool
-
-    nominal_arm_min: float
-    nominal_arm_max: float
-    safe_arm_min: float
-    safe_arm_max: float
-
-    action_norm: float
-    safe_action_norm: float
-    raw_action_norm: Optional[float]
-    raw_arm_min: Optional[float]
-    raw_arm_max: Optional[float]
-    chunk_action_norm: Optional[float]
-    safe_chunk_action_norm: Optional[float]
-    safety_mode: Optional[str]
-    pause_reason: Optional[str]
-    deformation_source: Optional[str]
-    deformation_norm: Optional[float]
-    retiming_source: Optional[str]
-    retiming_norm: Optional[float]
-    deform_safe: Optional[bool]
-    deform_min_clearance: Optional[float]
-    chunk_deform_scale: Optional[float]
-    chunk_deform_attempts: Optional[int]
-    deform_mode: Optional[str]
-    optimized_accepted: Optional[bool]
-    optimized_fallback: Optional[str]
-    optimized_reject_reason: Optional[str]
-    debug_safety_feasibility: Optional[bool]
-    safety_rejected: Optional[bool]
-    recovery_rejected: Optional[bool]
-    rejection_cause: Optional[str]
-    best_min_clearance: Optional[float]
-    required_min_clearance: Optional[float]
-    clearance_gap: Optional[float]
-    recovery_mode: Optional[str]
-    recovery_phase: Optional[str]
-    cached_motion_active: Optional[bool]
-    deform_stage_min_clearance: Optional[float]
-    deform_stage_accepted: Optional[bool]
-    recover_min_clearance: Optional[float]
-    recover_rejoin_loss: Optional[float]
-    recover_target_index: Optional[int]
-    recover_accepted: Optional[bool]
-    recover_required: Optional[bool]
-    recovery_candidate_class: Optional[str]
-    recover_reject_reason: Optional[str]
-    recover_path_min_clearance: Optional[float]
-    recover_immediate_clearance: Optional[float]
-    recover_prefix_min_clearance: Optional[float]
-    recover_path_safe: Optional[bool]
-    recover_immediate_safe: Optional[bool]
-    recover_prefix_safe: Optional[bool]
-    recover_safe_prefix_len: Optional[int]
-    recover_target_key: Optional[str]
-    recovery_path_failure_streak: Optional[int]
-    direct_rejoin_attempted: Optional[bool]
-    direct_rejoin_rejected: Optional[bool]
-    detour_rejoin_attempted: Optional[bool]
-    detour_rejoin_accepted: Optional[bool]
-    delayed_rejoin_active: Optional[bool]
-    delayed_rejoin_steps: Optional[int]
-    repeated_unsafe_target: Optional[bool]
-    post_recovery_act_window_active: Optional[bool]
-    post_recovery_act_steps_remaining: Optional[int]
-    post_recovery_act_window_interrupted: Optional[bool]
-    resumed_from_cached_index: Optional[int]
-    is_recoverable: Optional[bool]
-    rejoin_index: Optional[int]
-    rejoin_cost: Optional[float]
-    safety_loss: Optional[float]
-    action_deviation_loss: Optional[float]
-    path_loss: Optional[float]
-    rejoin_loss: Optional[float]
-    q_rejoin_loss: Optional[float]
-    q_rejoin_dist: Optional[float]
-    q_rejoin_threshold: Optional[float]
-    q_rejoin_index: Optional[int]
-    qd_rejoin_loss: Optional[float]
-    qd_rejoin_dist: Optional[float]
-    qd_rejoin_threshold: Optional[float]
-    qd_rejoin_index: Optional[int]
-    ee_rejoin_loss: Optional[float]
-    ee_rejoin_dist: Optional[float]
-    ee_rejoin_threshold: Optional[float]
-    ee_rejoin_index: Optional[int]
-    ee_final_check_available: Optional[bool]
-    inner_rejoin_metric: Optional[str]
-    final_rejoin_metric: Optional[str]
-    rejoin_q_eval_time_ms: Optional[float]
-    rejoin_qd_eval_time_ms: Optional[float]
-    ee_nom_cache_time_ms: Optional[float]
-    ee_final_check_time_ms: Optional[float]
-    existing_optimization_loss: Optional[float]
-    smoothness_loss: Optional[float]
-    total_loss: Optional[float]
-    fallback_used: Optional[bool]
-    act_resume_index: Optional[int]
-    act_resume_supported: Optional[bool]
-    committed_chunk_active: Optional[bool]
-    committed_chunk_mode: Optional[str]
-    committed_chunk_index: Optional[int]
-    committed_chunk_length: Optional[int]
-    committed_rejoin_index: Optional[int]
-    committed_chunk_started: Optional[bool]
-    committed_chunk_completed: Optional[bool]
-    committed_aborted_due_to_safety: Optional[bool]
-    committed_repaired_step: Optional[bool]
-    committed_repair_min_clearance: Optional[float]
-    committed_repair_clearance_gain: Optional[float]
-    recover_steps_executed: Optional[int]
-    deform_steps_executed: Optional[int]
-    resume_from_committed_rejoin: Optional[bool]
-    request_action_history_reset_after_recovery: Optional[bool]
-    recovery_action_history_reset: Optional[bool]
-    recovery_action_history_reset_count: Optional[int]
-    committed_abort_step: Optional[int]
-    committed_abort_mode: Optional[str]
-    committed_abort_index: Optional[int]
-    committed_abort_chunk_length: Optional[int]
-    committed_abort_action: Optional[list[float]]
-    committed_abort_min_clearance: Optional[float]
-    committed_abort_required_clearance: Optional[float]
-    committed_abort_clearance_gap: Optional[float]
-    committed_abort_human_state: Optional[Any]
-    committed_abort_robot_q: Optional[list[float]]
-    committed_abort_robot_qd: Optional[list[float]]
-    committed_abort_reason: Optional[str]
-    planned_min_clearance_at_index: Optional[float]
-    planned_h_at_index: Optional[float]
-    planned_q_at_index: Optional[list[float]]
-    planned_action_at_index: Optional[list[float]]
-    planned_vs_actual_q_error: Optional[float]
-    planned_vs_actual_action_error: Optional[float]
-    actual_one_step_clearance: Optional[float]
-    planned_clearance_for_this_index: Optional[float]
-    clearance_prediction_error: Optional[float]
-    planned_pre_action_q: Optional[list[float]]
-    planned_post_action_q: Optional[list[float]]
-    predicted_post_action_q: Optional[list[float]]
-    actual_pre_action_q: Optional[list[float]]
-    replay_predicted_post_action_q: Optional[list[float]]
-    committed_action: Optional[list[float]]
-    planned_clearance_pre: Optional[float]
-    planned_clearance_post: Optional[float]
-    replay_clearance_pre: Optional[float]
-    replay_clearance_post: Optional[float]
-    actual_vs_planned_pre_q_error: Optional[float]
-    actual_vs_planned_post_q_error: Optional[float]
-    planning_vs_replay_human_error: Optional[float]
-    planning_vs_replay_clearance_pre_error: Optional[float]
-    planning_vs_replay_clearance_post_error: Optional[float]
-    planning_human_state_snapshot: Optional[Any]
-    replay_human_state: Optional[Any]
-    control_type: Optional[str]
-    dt: Optional[float]
-    controlled_state_indices: Optional[list[int]]
-    controlled_action_indices: Optional[list[int]]
-    action_conversion_mode: Optional[str]
-    human_motion_since_plan: Optional[float]
-    accepted_min_clearance: Optional[float]
-    accepted_clearance_margin: Optional[float]
-    committed_abort_due_to_human_motion: Optional[bool]
-    committed_abort_due_to_prediction_error: Optional[bool]
-    committed_abort_due_to_safety_semantics_mismatch: Optional[bool]
-    committed_state_error: Optional[float]
-    committed_state_error_threshold: Optional[float]
-    committed_aborted_due_to_state_mismatch: Optional[bool]
-    committed_replan_due_to_state_mismatch: Optional[bool]
-    committed_rejected_missing_planned_q: Optional[bool]
-    committed_state_mismatch_detected: Optional[bool]
-    committed_state_mismatch_recovered: Optional[bool]
-    committed_suffix_replan_attempted: Optional[bool]
-    committed_suffix_replan_accepted: Optional[bool]
-    committed_suffix_replan_rejected: Optional[bool]
-    committed_suffix_replan_reject_reason: Optional[str]
-    committed_suffix_replan_from_index: Optional[int]
-    committed_suffix_replan_old_length: Optional[int]
-    committed_suffix_replan_new_length: Optional[int]
-    committed_suffix_replan_target_index: Optional[int]
-    committed_suffix_replan_seed_start_index: Optional[int]
-    committed_suffix_replan_min_clearance: Optional[float]
-    committed_suffix_replan_required_clearance: Optional[float]
-    committed_opportunistic_resume: Optional[bool]
-    committed_released_for_act_resume: Optional[bool]
-    committed_recovery_budget_exit: Optional[bool]
-    committed_replan_due_to_recovery_budget: Optional[bool]
-    committed_opportunistic_resume_available: Optional[bool]
-    committed_opportunistic_resume_reason: Optional[str]
-    committed_opportunistic_resume_q_dist: Optional[float]
-    committed_opportunistic_resume_q_threshold: Optional[float]
-    committed_opportunistic_resume_min_clearance: Optional[float]
-    committed_opportunistic_resume_required_clearance: Optional[float]
-    committed_opportunistic_resume_rejoin_index: Optional[int]
-    committed_recover_steps_since_act: Optional[int]
-    max_recover_steps_before_act_resume: Optional[int]
-    committed_suffix_replans_in_current_recovery: Optional[int]
-    max_suffix_replans_per_recovery: Optional[int]
-    planned_q_at_index_before_suffix_replan: Optional[list[float]]
-    actual_q_at_suffix_replan: Optional[list[float]]
-    actual_q_at_replay: Optional[list[float]]
-    diagnostic_step_mode: Optional[str]
-    mode_transition: Optional[str]
-    act_step: Optional[bool]
-    deform_step: Optional[bool]
-    recover_step: Optional[bool]
-    brake_step: Optional[bool]
-    fallback_step: Optional[bool]
-    optimized_attempt_step: Optional[bool]
-    optimized_accepted_step: Optional[bool]
-    unsafe_streak: Optional[int]
-    brake_streak: Optional[int]
-    recovery_failure_streak: Optional[int]
-    recovery_failure_streak_max: Optional[int]
-    recovery_optimizer_cooldown_remaining: Optional[int]
-    recovery_retry_cooldown_steps: Optional[int]
-    recovery_attempts_in_unsafe_streak: Optional[int]
-    recovery_max_attempts_per_unsafe_streak: Optional[int]
-    recovery_optimization_skipped: Optional[bool]
-    recovery_optimization_skip_reason: Optional[str]
-    recovery_optimization_skipped_count: Optional[int]
-    temporary_blocker_waiting: Optional[bool]
-    deform_trigger_reason: Optional[str]
-    nominal_became_safe_after_brake: Optional[bool]
-    resume_act_after_wait: Optional[bool]
-    temporary_wait_step: Optional[bool]
-    deform_suppressed_by_temporary_wait: Optional[bool]
-    deform_after_persistent_block: Optional[bool]
-    deform_replan_count: Optional[int]
-    recover_replan_count: Optional[int]
-    recovery_replan_count: Optional[int]
-    recovery_target_feasible: Optional[bool]
-    stale_recovery_attempted: Optional[bool]
-    stale_recovery_suppressed_count: Optional[int]
-    recovery_target_infeasible_count: Optional[int]
-    recover_to_task_progress: Optional[bool]
-    recover_anchor_is_current: Optional[bool]
-    deform_anchor_is_current: Optional[bool]
-    emergency_brake_steps: Optional[int]
-    emergency_brake_immediate_unsafe: Optional[bool]
-    optimized_candidate_count: Optional[int]
-    optimized_solution_count: Optional[int]
-    fallback_candidate_count: Optional[int]
-    fallback_candidate_accepted_count: Optional[int]
-    candidate_fallback_enabled: Optional[bool]
-    optimized_rejected_count: Optional[int]
-    deform_candidate_count: Optional[int]
-    deform_accepted_count: Optional[int]
-    deform_rejected_count: Optional[int]
-    recover_candidate_count: Optional[int]
-    recover_accepted_count: Optional[int]
-    recover_rejected_count: Optional[int]
-    safe_corridor_recovery_count: Optional[int]
-    direct_rejoin_attempt_count: Optional[int]
-    direct_rejoin_reject_count: Optional[int]
-    detour_rejoin_attempt_count: Optional[int]
-    detour_rejoin_accept_count: Optional[int]
-    delayed_rejoin_count: Optional[int]
-    recover_path_unsafe_count: Optional[int]
-    recovery_path_failure_streak_max: Optional[int]
-    repeated_unsafe_target_count: Optional[int]
-    post_recovery_act_window_count: Optional[int]
-    post_recovery_act_window_interrupted_count: Optional[int]
-    mean_recover_path_min_clearance: Optional[float]
-    min_recover_path_min_clearance: Optional[float]
-    safe_prefix_accepted_count: Optional[int]
-    first_action_only_accepted_count: Optional[int]
-    immediate_hard_reject_count: Optional[int]
-    no_safe_prefix_reject_count: Optional[int]
-    horizon_margin_reject_count: Optional[int]
-    accepted_deform_steps: Optional[int]
-    accepted_recover_steps: Optional[int]
-    fallback_brake_after_reject_count: Optional[int]
-    accepted_candidate_type: Optional[str]
-    accepted_candidate_name: Optional[str]
-    acceptance_type: Optional[str]
-    safe_prefix_len: Optional[int]
-    immediate_clearance: Optional[float]
-    prefix_min_clearance: Optional[float]
-    horizon_min_clearance: Optional[float]
-    full_horizon_required: Optional[bool]
-    rolling_replan_on_prefix: Optional[bool]
-    safe_prefix_execution: Optional[bool]
-    recover_projection_on_nominal: Optional[float]
-    recover_cosine_to_nominal: Optional[float]
-    recover_direction_cosine: Optional[float]
-    recover_direction_cosine_threshold: Optional[float]
-    recover_direction_loss: Optional[float]
-    recover_direction_ok: Optional[bool]
-    recover_direction_alignment_available: Optional[bool]
-    recover_direction_alignment_weight: Optional[float]
-    recover_ordered_path_available: Optional[bool]
-    recover_ordered_target_index: Optional[int]
-    recover_ordered_horizon: Optional[int]
-    recover_ordered_pose_loss: Optional[float]
-    recover_ordered_delta_loss: Optional[float]
-    recover_ordered_loss: Optional[float]
-    recover_ordered_pose_weight: Optional[float]
-    recover_ordered_delta_weight: Optional[float]
-    recover_ordered_pose_threshold: Optional[float]
-    recover_ordered_delta_threshold: Optional[float]
-    recover_ordered_ok: Optional[bool]
-    nominal_rejoin_score: Optional[float]
-    nominal_rejoin_available: Optional[bool]
-    nominal_rejoin_suppressed_reason: Optional[str]
-    nominal_rejoin_clearance: Optional[float]
-    nominal_rejoin_safe_prefix_len: Optional[int]
-    recover_task_progress_score: Optional[float]
-    recover_score_total: Optional[float]
-    recover_rejoin_weight_effective: Optional[float]
-    recover_step_since_deform: Optional[int]
-    cem_iterations_run: Optional[int]
-    cem_early_stopped: Optional[bool]
-    cem_max_iters: Optional[int]
-    cem_population: Optional[int]
-    yield_cem_iterations_run: Optional[int]
-    yield_cem_early_stopped: Optional[bool]
-    return_cem_iterations_run: Optional[int]
-    return_cem_early_stopped: Optional[bool]
-    nominal_rejoin_available_count: Optional[int]
-    nominal_rejoin_suppressed_count: Optional[int]
-    stale_nominal_rejoin_suppressed_count: Optional[int]
-    nominal_prefix_unsafe_suppressed_count: Optional[int]
-    recover_positive_projection_count: Optional[int]
-    recover_nonpositive_projection_count: Optional[int]
-    mean_recover_projection_on_nominal: Optional[float]
-    mean_recover_cosine_to_nominal: Optional[float]
-    mean_recover_direction_cosine: Optional[float]
-    mean_recover_direction_loss: Optional[float]
-    mean_recover_task_progress_score: Optional[float]
-    mean_recover_ordered_pose_loss: Optional[float]
-    mean_recover_ordered_delta_loss: Optional[float]
-    mean_recover_ordered_loss: Optional[float]
-    contact_during_hold: Optional[bool]
-    contact_during_brake: Optional[bool]
-    contact_during_deform: Optional[bool]
-    contact_during_recover: Optional[bool]
-    chosen_action_norm: Optional[float]
-    controlled_action_delta_norm: Optional[float]
-    arm_delta_norm: Optional[float]
-    gripper_latched: Optional[bool]
-    gripper_latch_dim: Optional[int]
-    safe_gripper_action: Optional[float]
-    raw_gripper_action: Optional[float]
-    phase_reanchor_steps_left: Optional[int]
-    phase_reanchor_base_cmd_xy: Optional[list[float]]
-    phase_reanchor_ee_error_xy: Optional[list[float]]
-    phase_reanchor_drawer_fraction: Optional[float]
-    phase_reanchor_ee_to_handle_dist: Optional[float]
-    post_recovery_task_guard_active: Optional[bool]
-    post_recovery_task_guard_steps_left: Optional[int]
-    post_recovery_task_guard_reason: Optional[str]
-    post_recovery_task_guard_best_progress: Optional[float]
-    post_recovery_progress_regression: Optional[float]
-    post_recovery_reanchor_started: Optional[bool]
-    hold_immediate_clearance: Optional[float]
-    hold_horizon_min_clearance: Optional[float]
-    hold_acceptance_type: Optional[str]
-    hold_rejected_reason: Optional[str]
-    hold_predicted_contact: Optional[bool]
-    human_prediction_available: Optional[bool]
-    human_velocity_toward_robot: Optional[float]
-    human_motion_prediction_enabled: Optional[bool]
-    human_motion_prediction_available: Optional[bool]
-    human_motion_prediction_speed: Optional[float]
-    human_motion_prediction_max_displacement: Optional[float]
-    emergency_deform_away: Optional[bool]
-    emergency_deform_away_steps: Optional[int]
-    emergency_deform_away_count: Optional[int]
-    hold_unsafe_count: Optional[int]
-    hold_predicted_contact_count: Optional[int]
-    contact_during_hold_count: Optional[int]
-    contact_during_brake_count: Optional[int]
-    contact_during_deform_count: Optional[int]
-    contact_during_recover_count: Optional[int]
-    mean_hold_horizon_min_clearance: Optional[float]
-    min_hold_horizon_min_clearance: Optional[float]
-
-    elapsed_wall_time_s: float
-    step_wall_time_s: float
-
-    filter_time_ms: float
-    monitor_time_ms: float
-    env_step_time_ms: float
-    policy_obs_adapt_time_ms: float
-    policy_action_time_ms: float
-    policy_obs_update_time_ms: float
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--condition",
-        choices=["act", "oscbf", "sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"],
-        required=True,
-        help=("act = monitor only; oscbf = single-action OSCBF; "
-              "sequential/sequential_oscbf = apply OSCBF across the ACT chunk; "
-              "chunk_deform = SafeChunk horizon deformation; "
-              "path_consistent_brake = standalone path-consistent braking filter."),
-    )
-    parser.add_argument(
-        "--path-consistent-brake-config",
-        type=str,
-        default=None,
-        help=(
-            "Optional YAML overlay for PathConsistentBrake parameters. Relative "
-            "names are resolved under robobase/cfgs/safety_filter."
-        ),
-    )
-
-    parser.add_argument(
-        "--snapshot",
-        required=True,
-        type=str,
-        help="Path to ACT snapshot, e.g. snapshots/latest_snapshot.pt.",
-    )
-
-    parser.add_argument(
-        "--env",
-        default="bigym/human_arm_drawer_top_open",
-        help="Evaluation env, e.g. bigym/human_arm_drawer_top_open.",
-    )
-
-    parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--steps", type=int, default=200)
-    parser.add_argument("--demos", type=int, default=1)
-    parser.add_argument(
-        "--robot-spawn-offset-xy",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("DX", "DY"),
-        help=(
-            "Eval-only offset added to the task default RESET_ROBOT_POS x/y "
-            "before each reset. Useful for spawn-location robustness sweeps."
-        ),
-    )
-    parser.add_argument(
-        "--normalization-source",
-        choices=["auto", "eval", "snapshot"],
-        default="auto",
-        help=(
-            "Where to compute demo-based action min/max and low-dim observation "
-            "normalization stats. 'auto' uses snapshot stats when the eval "
-            "task/manifest/demo source differs from the checkpoint training config."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=0)
-
-    parser.add_argument("--out", type=str, default="eval/act_oscbf_metrics.jsonl")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="eval_safety",
-        help=(
-            "Root output folder for step logs, summaries, and videos. "
-            "If unset, derives a folder from the --out file path."
-        ),
-    )
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--intervention-eps", type=float, default=1e-4)
-    parser.add_argument(
-        "--continue-after-success",
-        action="store_true",
-        help=(
-            "Stress-test mode: keep stepping/recording after task success until "
-            "termination, truncation, step limit, or video limit. Useful when the "
-            "collision window occurs just after the nominal task success trigger."
-        ),
-    )
-    parser.add_argument(
-        "--gripper-latch",
-        action="store_true",
-        help=(
-            "Eval-only helper: once the selected gripper command crosses the "
-            "trigger threshold, hold that gripper closed for the rest of the "
-            "episode. Useful for diagnosing drawer-pull slip failures."
-        ),
-    )
-    parser.add_argument(
-        "--gripper-latch-dim",
-        type=int,
-        default=-1,
-        help="Action dimension to latch. For BiGym DrawerTopOpen, -1 is the right gripper.",
-    )
-    parser.add_argument(
-        "--gripper-latch-trigger",
-        type=float,
-        default=0.5,
-        help="Latch activates when the selected normalized gripper action is >= this value.",
-    )
-    parser.add_argument(
-        "--gripper-latch-value",
-        type=float,
-        default=1.0,
-        help="Normalized action value to write to the latched gripper dimension.",
-    )
-    parser.add_argument(
-        "--gripper-latch-start-step",
-        type=int,
-        default=0,
-        help="Do not allow the latch to activate before this outer eval step.",
-    )
-    parser.add_argument(
-        "--disable-human-arm-collisions",
-        action="store_true",
-        help="Disable collision geoms for BiGym's cylinder human arm in the eval env.",
-    )
-    parser.add_argument(
-        "--enable-human-arm-collisions",
-        action="store_true",
-        help=(
-            "Force BiGym's cylinder human arm geoms to physical MuJoCo contact "
-            "masks in the eval env."
-        ),
-    )
-    parser.add_argument(
-        "--visual-only-human-arm",
-        action="store_true",
-        help=(
-            "Render and update the human arm, but disable its physical MuJoCo contact "
-            "response. Barrier/proximity metrics still provide the collision check."
-        ),
-    )
-    parser.add_argument(
-        "--freeze-human-arm",
-        action="store_true",
-        help="Freeze BiGym's cylinder human arm joints and carrier motion after reset.",
-    )
-    parser.add_argument(
-        "--human-arm-aggression",
-        type=float,
-        default=1.0,
-        help=(
-            "Eval-only multiplier for scripted human-arm speed/amplitude. "
-            "Values >1 make the arm more active; defaults to unchanged behavior."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-substeps",
-        type=int,
-        default=1,
-        help=(
-            "Number of scripted human-arm updates per outer eval step. "
-            "Use >1 to make the human move faster relative to the robot."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-zero-dwell",
-        action="store_true",
-        help="Remove most scripted human-arm dwell/pauses after reset.",
-    )
-    parser.add_argument(
-        "--human-arm-walk-radius",
-        type=float,
-        default=None,
-        help="Optional carrier walk radius override for the scripted human arm.",
-    )
-    parser.add_argument(
-        "--human-arm-goal-xy",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("X", "Y"),
-        help=(
-            "Optional carrier goal in the human-arm local XY walk disk. "
-            "When set, the aggressive eval keeps biasing the carrier toward this point."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-keepout-min-clear",
-        type=float,
-        default=None,
-        help=(
-            "Optional override for the human arm's internal carrier keepout MIN_CLEAR. "
-            "This keeps the aggressive arm near the robot without allowing deep penetration."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-disable-keepout",
-        action="store_true",
-        help=(
-            "Disable the scripted human arm's internal robot-avoidance keepout. "
-            "MuJoCo collisions remain enabled, so this is useful for contact stress tests."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-ee-obstruction",
-        action="store_true",
-        help=(
-            "During --human-arm-transient-obstruction, place the human-arm "
-            "carrier near the robot end-effector XY before releasing it."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-ee-side-sweep",
-        action="store_true",
-        help=(
-            "With --human-arm-ee-obstruction, sweep the human arm sideways "
-            "across the end-effector collision zone instead of parking it."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-drawer-obstruction",
-        action="store_true",
-        help=(
-            "During a transient obstruction, place the human-arm carrier between "
-            "the robot and drawer and move it locally, instead of anchoring "
-            "it to the robot end-effector."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-drawer-obstruction-xy",
-        type=float,
-        nargs=2,
-        default=[-0.50, 0.20],
-        metavar=("X", "Y"),
-        help="Carrier XY near the drawer area used by --human-arm-drawer-obstruction.",
-    )
-    parser.add_argument(
-        "--human-arm-drawer-obstruction-amp-xy",
-        type=float,
-        nargs=2,
-        default=[0.03, 0.16],
-        metavar=("AX", "AY"),
-        help=(
-            "Local carrier sweep around --human-arm-drawer-obstruction-xy "
-            "while the arm temporarily blocks the robot-to-drawer path."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-yaw-offset-deg",
-        type=float,
-        default=90.0,
-        help=(
-            "Extra shoulder-yaw offset for the scripted human arm in degrees. "
-            "Positive values rotate anticlockwise in the top-down view."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-ee-offset-xy",
-        type=float,
-        nargs=2,
-        default=[0.0, 0.0],
-        metavar=("DX", "DY"),
-        help="XY offset added to the robot end-effector obstruction anchor.",
-    )
-    parser.add_argument(
-        "--human-arm-ee-side-sweep-amp-xy",
-        type=float,
-        nargs=2,
-        default=[0.03, 0.30],
-        metavar=("AX", "AY"),
-        help="Sideways sweep amplitude around the end-effector obstruction anchor.",
-    )
-    parser.add_argument(
-        "--human-arm-ee-side-sweep-frequency",
-        type=float,
-        default=0.35,
-        help="Sideways sweep frequency in cycles per second.",
-    )
-    parser.add_argument(
-        "--human-arm-ee-side-sweep-phase",
-        type=float,
-        default=2.0,
-        help="Initial side-sweep phase in radians, used to enter the EE zone early at slow speed.",
-    )
-    parser.add_argument(
-        "--human-arm-force-carrier-xy",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("X", "Y"),
-        help=(
-            "Force the scripted human-arm carrier to this XY position after reset "
-            "and after each step. Useful for controlled contact stress tests."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-force-carrier-amp-xy",
-        type=float,
-        nargs=2,
-        default=None,
-        metavar=("AX", "AY"),
-        help=(
-            "Oscillation amplitude around --human-arm-force-carrier-xy. "
-            "Use with the forced carrier option to make contact tests move around."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-force-carrier-frequency",
-        type=float,
-        default=0.35,
-        help="Carrier oscillation frequency in cycles per second for forced contact tests.",
-    )
-    parser.add_argument(
-        "--human-arm-natural-contact-motion",
-        action="store_true",
-        help=(
-            "Override the human-arm joints with a bounded reach/sweep motion for contact tests, "
-            "avoiding unnatural shoulder/base spinning."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-natural-motion-frequency",
-        type=float,
-        default=0.45,
-        help="Natural contact joint-motion frequency in cycles per second.",
-    )
-    parser.add_argument(
-        "--human-arm-natural-motion-phase-offset-steps",
-        type=float,
-        default=50.0,
-        help=(
-            "Eval-only phase lead for --human-arm-natural-contact-motion. "
-            "Positive values make the arm reach the drawer lane earlier in the episode."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-natural-lateral-scale",
-        type=float,
-        default=0.35,
-        help=(
-            "Scale for side-raise / lateral shoulder motion in natural human-arm motion. "
-            "Lower values keep the upper arm more tucked."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-natural-return-curl-scale",
-        type=float,
-        default=1.0,
-        help=(
-            "Scale for elbow curl during the return/retraction phase of natural motion. "
-            "Higher values make the arm come back in a more human-like curled pose."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-transient-obstruction",
-        action="store_true",
-        help=(
-            "Start the human arm in the robot/drawer operation area, then move it "
-            "away after a short obstruction window so the robot can finish."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-release-after-steps",
-        type=int,
-        default=180,
-        help="For transient obstruction, begin moving the human arm away after this eval step.",
-    )
-    parser.add_argument(
-        "--human-arm-release-duration-steps",
-        type=int,
-        default=60,
-        help="For transient obstruction, number of eval steps used to move out of the contact zone.",
-    )
-    parser.add_argument(
-        "--human-arm-release-carrier-xy",
-        type=float,
-        nargs=2,
-        default=[-0.85, 0.55],
-        metavar=("X", "Y"),
-        help="Carrier XY target after the transient obstruction moves away.",
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-after-steps",
-        type=int,
-        default=-1,
-        help=(
-            "Eval-only late-phase override. When >= 0, begin moving the human "
-            "arm carrier and joints out of the robot/drawer collision zone at "
-            "this eval step."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-duration-steps",
-        type=int,
-        default=20,
-        help="Number of eval steps used by the late-phase human-arm clear override.",
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-trigger",
-        choices=["step", "carrier-y-peak"],
-        default="carrier-y-peak",
-        help=(
-            "Trigger the late clear at the fixed step, or at the first forced "
-            "carrier-Y local maximum after the obstruction sweep starts. "
-            "If no peak is observed, the fixed step is used as a fallback."
-        ),
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-max-carrier-speed",
-        type=float,
-        default=0.35,
-        help="Maximum carrier XY speed used by the late human-arm clear override.",
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-max-joint-speed",
-        type=float,
-        default=1.3,
-        help="Maximum joint-space speed used by the late human-arm clear override.",
-    )
-    parser.add_argument(
-        "--human-arm-final-clear-carrier-xy",
-        type=float,
-        nargs=2,
-        default=[-0.85, 0.55],
-        metavar=("X", "Y"),
-        help="Carrier XY target for --human-arm-final-clear-after-steps.",
-    )
-    parser.add_argument(
-        "--policy-env",
-        type=str,
-        default=None,
-        help=(
-            "Optional clean shadow env used only for ACT policy observations. "
-            "Actions still execute in --env, so safety/video/contacts use the real env. "
-            "For human-arm safety eval, prefer --hide-human-arm-policy-obs first."
-        ),
-    )
-    parser.add_argument(
-        "--safety-env",
-        type=str,
-        default=None,
-        help=(
-            "Optional human/safety mirror env. --env remains the task plant that "
-            "executes actions; this env receives mirrored robot/drawer state and is "
-            "used for OSCBF human capsules, contact counts, and video."
-        ),
-    )
-    parser.add_argument(
-        "--hide-human-arm-policy-obs",
-        action="store_true",
-        help=(
-            "Use the real eval env state, but hide cylinder-arm geoms while "
-            "rendering RGB observations for ACT. Video/safety still see the normal env."
-        ),
-    )
-    parser.add_argument(
-        "--no-record-video",
-        action="store_true",
-        help="Disable video recording.",
-    )
-    parser.add_argument(
-        "--save-frame-images",
-        action="store_true",
-        help="Save individual rendered PNG frames during eval.",
-    )
-    parser.add_argument(
-        "--frame-image-every",
-        type=int,
-        default=10,
-        help="Save one rendered frame every N env steps when --save-frame-images is set.",
-    )
-    parser.add_argument(
-        "--frame-image-dir",
-        type=str,
-        default=None,
-        help="Directory for rendered PNG frames. Defaults to <output-dir>/frames.",
-    )
-    parser.add_argument("--video-dir", type=str, default=None)
-    parser.add_argument(
-        "--record-policy-video",
-        action="store_true",
-        help=(
-            "Save a video of the RGB observations passed to ACT after any "
-            "policy-observation modifications, e.g. hidden human arm."
-        ),
-    )
-    parser.add_argument(
-        "--policy-video-every",
-        type=int,
-        default=1,
-        help="Record every N policy-observation frames when --record-policy-video is set.",
-    )
-    parser.add_argument(
-        "--stop-video-at",
-        type=str,
-        default="2:30",
-        help=(
-            "Stop each episode once the recorded video reaches this duration. "
-            "Use seconds, M:S, H:M:S, or 'none' to disable."
-        ),
-    )
-    parser.add_argument(
-        "--video-time-base",
-        choices=["sim", "wall"],
-        default="sim",
-        help=(
-            "Video timing. 'sim' saves fixed-FPS videos by env step, so slow filters "
-            "do not make playback look laggy. 'wall' preserves real evaluation latency."
-        ),
-    )
-    parser.add_argument(
-        "--stop-video-at-steps",
-        type=int,
-        default=None,
-        help=(
-            "Stop each episode after this many recorded env steps. Only used for "
-            "--video-time-base sim. If unset, --stop-video-at is converted to steps "
-            "using the video FPS."
-        ),
-    )
-    parser.add_argument(
-        "--plot-terminal",
-        action="store_true",
-        help="Render ASCII terminal plots for step metrics after each episode.",
-    )
-    parser.add_argument(
-        "--log-chunk-trajectories",
-        dest="log_chunk_trajectories",
-        action="store_true",
-        default=True,
-        help=(
-            "Log SafeChunk trajectory traces for intervention steps. Writes "
-            "JSONL traces plus interactive 3D HTML viewers under --output-dir."
-        ),
-    )
-    parser.add_argument(
-        "--no-log-chunk-trajectories",
-        dest="log_chunk_trajectories",
-        action="store_false",
-        help="Disable SafeChunk trajectory trace logging.",
-    )
-    parser.add_argument(
-        "--chunk-trajectory-max-events",
-        type=int,
-        default=300,
-        help="Maximum number of chunk trajectory intervention events to store.",
-    )
-    parser.add_argument(
-        "--chunk-trajectory-include-q-states",
-        dest="chunk_trajectory_include_q_states",
-        action="store_true",
-        default=True,
-        help="Include rolled-out q-state arrays in chunk_trajectory_traces.jsonl.",
-    )
-    parser.add_argument(
-        "--no-chunk-trajectory-q-states",
-        dest="chunk_trajectory_include_q_states",
-        action="store_false",
-        help="Only log 3D EE trajectories, not full rolled-out q-state arrays.",
-    )
-    parser.add_argument(
-        "--plot-chunk-trajectories-3d",
-        dest="plot_chunk_trajectories_3d",
-        action="store_true",
-        default=True,
-        help="Save per-episode interactive 3D HTML trajectory viewers.",
-    )
-    parser.add_argument(
-        "--no-plot-chunk-trajectories-3d",
-        dest="plot_chunk_trajectories_3d",
-        action="store_false",
-        help="Disable per-episode interactive 3D trajectory viewers.",
-    )
-    parser.add_argument(
-        "--chunk-trajectory-plot-max-events",
-        type=int,
-        default=25,
-        help="Maximum chunk intervention events drawn in each 3D trajectory plot.",
-    )
-    parser.add_argument(
-        "--human-arm-trajectory-stride",
-        type=int,
-        default=1,
-        help="Record every Nth human-arm trajectory sample for the graph/log.",
-    )
-    parser.add_argument(
-        "--no-progress",
-        action="store_true",
-        help="Disable tqdm progress bars for episodes and steps.",
-    )
-    parser.add_argument(
-        "--diagnostics",
-        dest="diagnostics_enabled",
-        action="store_true",
-        default=True,
-        help="Enable failure-diagnosis logging in step and summary JSON.",
-    )
-    parser.add_argument(
-        "--no-diagnostics",
-        dest="diagnostics_enabled",
-        action="store_false",
-        help="Disable failure-diagnosis logging fields.",
-    )
-    parser.add_argument("--diagnostics-large-arm-delta-threshold", type=float, default=3.0)
-    parser.add_argument("--diagnostics-large-base-delta-threshold", type=float, default=0.5)
-    parser.add_argument("--diagnostics-low-act-ratio-threshold", type=float, default=0.3)
-    parser.add_argument("--diagnostics-high-fallback-ratio-threshold", type=float, default=0.5)
-
-    parser.add_argument(
-        "--max-action-delta",
-        type=float,
-        default=None,
-        help="Optional max per-dimension OSCBF action edit.",
-    )
-    parser.add_argument(
-        "--oscbf-human-margin",
-        type=float,
-        default=0.08,
-        help="OSCBF human capsule inflation margin.",
-    )
-    parser.add_argument(
-        "--oscbf-alpha-gain",
-        type=float,
-        default=10.0,
-        help="OSCBF barrier gain; larger values react more aggressively.",
-    )
-    parser.add_argument(
-        "--oscbf-pelvis-velocity-limits",
-        type=float,
-        nargs=4,
-        default=[0.6, 0.6, 0.4, 1.5],
-        metavar=("VX", "VY", "VZ", "WYAW"),
-        help="Pelvis velocity limits for the augmented pelvis+arm OSCBF.",
-    )
-    parser.add_argument(
-        "--oscbf-pelvis-weight",
-        type=float,
-        default=0.5,
-        help="QP objective weight for pelvis controls in augmented OSCBF.",
-    )
-    parser.add_argument(
-        "--oscbf-arm-weight",
-        type=float,
-        default=1.0,
-        help="QP objective weight for arm controls in augmented OSCBF.",
-    )
-    parser.add_argument(
-        "--pause-on-unsafe",
-        action="store_true",
-        help=(
-            "If current/horizon clearance is unsafe, hold controlled arm joints "
-            "at current q. Gripper and non-arm action dimensions remain bypassed."
-        ),
-    )
-    parser.add_argument(
-        "--pause-clearance-threshold",
-        type=float,
-        default=0.0,
-        help="Pause fallback threshold on OSCBF clearance h. Use 0 for collision/violation only.",
-    )
-    parser.add_argument(
-        "--live-h-monitor",
-        dest="live_h_monitor",
-        action="store_true",
-        default=True,
-        help=(
-            "Run the standalone per-step OSCBF h monitor before filtering. "
-            "This preserves legacy h_violation metrics but can be expensive."
-        ),
-    )
-    parser.add_argument(
-        "--no-live-h-monitor",
-        dest="live_h_monitor",
-        action="store_false",
-        help=(
-            "Skip the standalone per-step OSCBF h monitor. Chunk/OSCBF filtering "
-            "still performs its own safety checks. For chunk/PACS filters, "
-            "min_h/h_violation are filled from horizon clearance instead."
-        ),
-    )
-    parser.add_argument(
-        "--no-pause-policy-step-on-brake",
-        action="store_false",
-        dest="pause_policy_step_on_brake",
-        help="Keep advancing the ACT policy step counter even when the robot arm is held/braked.",
-    )
-    parser.set_defaults(pause_policy_step_on_brake=True)
-    parser.add_argument(
-        "--reset-action-history-after-human-exit",
-        action="store_true",
-        help=(
-            "After a temporary human blocker reaches done and clears the robot, "
-            "reset receding-horizon action history so ACT resumes from fresh observations."
-        ),
-    )
-    parser.add_argument(
-        "--reset-action-history-after-recovery",
-        dest="reset_action_history_after_recovery",
-        action="store_true",
-        default=True,
-        help="Reset ACT temporal action history after committed SafeChunk recovery completes.",
-    )
-    parser.add_argument(
-        "--no-reset-action-history-after-recovery",
-        dest="reset_action_history_after_recovery",
-        action="store_false",
-        help="Do not clear ACT temporal action history after committed SafeChunk recovery.",
-    )
-    parser.add_argument(
-        "--pause-and-restart-on-human-blocker",
-        action="store_true",
-        help=(
-            "Ablation: hold controlled robot motion while the temporary human "
-            "blocker is in enter/hold/exit, then reset ACT/action-sequence "
-            "history after the blocker reaches done and clears."
-        ),
-    )
-    parser.add_argument(
-        "--initial-pause-restart-steps",
-        type=int,
-        default=0,
-        help=(
-            "Ablation: hold controlled robot motion for the first N eval steps, "
-            "then reset ACT/action-sequence history and continue. Use this to "
-            "test whether a pure delay breaks the trained ACT rollout."
-        ),
-    )
-    parser.add_argument(
-        "--pause-motion-scale",
-        type=float,
-        default=0.0,
-        help=(
-            "Ablation: during pause/restart holds, execute this fraction of the "
-            "ACT controlled motion instead of a hard hold. 0.0 is a full pause; "
-            "0.2 keeps 20 percent of the nominal motion."
-        ),
-    )
-    parser.add_argument(
-        "--resume-clearance-threshold",
-        type=float,
-        default=0.08,
-        help="Minimum robot-human distance before resetting action history after human exit.",
-    )
-    parser.add_argument(
-        "--resume-clear-steps",
-        type=int,
-        default=3,
-        help="Consecutive clear done-phase steps required before action-history reset.",
-    )
-    parser.add_argument(
-        "--phase-reanchor",
-        action="store_true",
-        help=(
-            "When drawer progress stalls, pause ACT, run a short handle-relative "
-            "base re-anchor primitive for the nearest useful task phase, then "
-            "reset ACT action history and resume."
-        ),
-    )
-    parser.add_argument(
-        "--phase-reanchor-check-after-steps",
-        type=int,
-        default=70,
-        help="Earliest eval step at which stalled drawer progress can trigger re-anchor.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-no-progress-window",
-        type=int,
-        default=20,
-        help="Recent step window used to decide whether drawer progress has stalled.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-min-drawer-progress",
-        type=float,
-        default=0.02,
-        help="Minimum drawer-open fraction increase over the stall window.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-steps",
-        type=int,
-        default=24,
-        help="Number of env steps to execute each re-anchor primitive.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-cooldown-steps",
-        type=int,
-        default=50,
-        help="Minimum steps after a re-anchor before another one can start.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-base-gain",
-        type=float,
-        default=0.45,
-        help="Proportional gain from hand-anchor XY error to floating-base XY command.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-max-base-step",
-        type=float,
-        default=0.012,
-        help="Raw per-step XY floating-base command limit during re-anchor.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-pregrasp-offset-xy",
-        type=float,
-        nargs=2,
-        default=[-0.12, -0.06],
-        metavar=("DX", "DY"),
-        help="Desired end-effector XY offset from the handle in pre-grasp phase.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-grasp-offset-xy",
-        type=float,
-        nargs=2,
-        default=[-0.03, 0.0],
-        metavar=("DX", "DY"),
-        help="Desired end-effector XY offset from the handle in grasp phase.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-pull-offset-xy",
-        type=float,
-        nargs=2,
-        default=[0.0, -0.10],
-        metavar=("DX", "DY"),
-        help="Desired end-effector XY offset from the handle once pulling has started.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-grasp-dist",
-        type=float,
-        default=0.12,
-        help="EE-handle XY distance below which the recovery phase is considered grasp.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-pull-open-threshold",
-        type=float,
-        default=0.15,
-        help="Drawer-open fraction above which the recovery phase is considered pull.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-done-threshold",
-        type=float,
-        default=0.90,
-        help="Drawer-open fraction above which no re-anchor is attempted.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-gripper-closed-threshold",
-        type=float,
-        default=0.5,
-        help="Raw gripper qpos threshold used by the phase classifier.",
-    )
-    parser.add_argument(
-        "--phase-reanchor-gripper-value",
-        type=float,
-        default=1.0,
-        help="Normalized gripper command used during grasp/pull re-anchor phases.",
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard",
-        action="store_true",
-        help=(
-            "After committed SafeChunk recovery completes, keep the gripper "
-            "closed and optionally run a short handle-relative re-anchor "
-            "before passing ACT through."
-        ),
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-steps",
-        type=int,
-        default=24,
-        help="Number of post-recovery steps protected by the task guard.",
-    )
-    parser.add_argument(
-        "--post-recovery-progress-tolerance",
-        type=float,
-        default=1e-5,
-        help=(
-            "Allowed task-progress drop before the post-recovery guard treats "
-            "the drawer as regressing and re-runs re-anchor."
-        ),
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-min-progress",
-        type=float,
-        default=1e-6,
-        help="Minimum task progress required to arm the post-recovery task guard.",
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-max-ee-distance",
-        type=float,
-        default=0.15,
-        help=(
-            "Also arm the post-recovery task guard when the EE-handle "
-            "distance is at or below this value. Non-positive disables this gate."
-        ),
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-reanchor-phases",
-        nargs="+",
-        default=["grasp"],
-        choices=["pre_grasp", "grasp", "pull"],
-        help=(
-            "Task phases where the post-recovery task guard may override ACT "
-            "with the base re-anchor primitive. The default avoids pre-grasp "
-            "and pull so a closed gripper does not reel the robot toward the drawer."
-        ),
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-check-safety",
-        dest="post_recovery_task_guard_check_safety",
-        action="store_true",
-        default=True,
-        help="Run SafeChunk horizon acceptance before executing post-recovery re-anchor actions.",
-    )
-    parser.add_argument(
-        "--no-post-recovery-task-guard-check-safety",
-        dest="post_recovery_task_guard_check_safety",
-        action="store_false",
-        help="Bypass SafeChunk acceptance for post-recovery re-anchor actions.",
-    )
-    parser.add_argument(
-        "--post-recovery-task-guard-force-gripper",
-        dest="post_recovery_task_guard_force_gripper",
-        action="store_true",
-        default=True,
-        help="Force the selected gripper command closed while the post-recovery task guard is active.",
-    )
-    parser.add_argument(
-        "--no-post-recovery-task-guard-force-gripper",
-        dest="post_recovery_task_guard_force_gripper",
-        action="store_false",
-        help="Do not force gripper closure during the post-recovery task guard.",
-    )
-    parser.add_argument("--horizon", type=int, default=16)
-    parser.add_argument(
-        "--brake-progress-threshold",
-        type=float,
-        default=0.05,
-        help="Minimum chunk progress before braking is treated as non-deadlocked.",
-    )
-    parser.add_argument(
-        "--deadlock-window",
-        type=int,
-        default=5,
-        help="Consecutive deadlocked brake steps before horizon deformation is allowed.",
-    )
-    parser.add_argument("--chunk-min-clearance", type=float, default=0.12)
-    parser.add_argument(
-        "--chunk-deformation-enabled",
-        dest="chunk_deformation_enabled",
-        action="store_true",
-        default=True,
-        help="Allow SafeChunk-Deform to replace unsafe chunks with deformed chunks.",
-    )
-    parser.add_argument(
-        "--no-chunk-deformation-enabled",
-        dest="chunk_deformation_enabled",
-        action="store_false",
-        help="Disable chunk deformation and use the configured brake/fallback behavior.",
-    )
-    parser.add_argument(
-        "--chunk-deformation-scales",
-        type=float,
-        nargs="+",
-        default=[0.0, 0.25, 0.5, 0.75],
-    )
-    parser.add_argument("--chunk-deformation-smoothing", type=int, default=1)
-    parser.add_argument(
-        "--unsafe-deformation-fallback",
-        choices=["brake", "best"],
-        default="brake",
-        help=(
-            "When no safe chunk deformation is found, either brake/hold the "
-            "controlled arm joints or keep the best unsafe deformed candidate."
-        ),
-    )
-    parser.add_argument(
-        "--deform-immediately-on-deadlock",
-        action="store_true",
-        help="Legacy behavior: allow deformation on the first deadlocked brake step.",
-    )
-    parser.add_argument(
-        "--sequential-oscbf-fallback",
-        action="store_true",
-        help="Allow chunk_deform to fall back to sequential OSCBF if no candidate is safe.",
-    )
-    parser.add_argument(
-        "--chunk-deform-mode",
-        choices=["candidate", "optimized"],
-        default="candidate",
-        help="SafeChunk deformation mode. Candidate preserves the original fixed-scale search.",
-    )
-    parser.add_argument("--chunk-opt-iters", type=int, default=20)
-    parser.add_argument("--chunk-opt-lr", type=float, default=0.03)
-    parser.add_argument("--chunk-lambda-safety", type=float, default=500.0)
-    parser.add_argument("--chunk-lambda-action", type=float, default=0.1)
-    parser.add_argument("--chunk-lambda-path", type=float, default=0.2)
-    parser.add_argument("--chunk-lambda-rejoin", type=float, default=0.5)
-    parser.add_argument("--chunk-lambda-smooth", type=float, default=0.1)
-    parser.add_argument(
-        "--chunk-rejoin-threshold",
-        type=float,
-        default=0.03,
-        help="Legacy optimized-deform rejoin threshold; q/EE thresholds are preferred.",
-    )
-    parser.add_argument("--chunk-min-rejoin-offset", type=int, default=2)
-    parser.add_argument(
-        "--chunk-inner-rejoin-metric",
-        choices=["q_state", "ee_pose"],
-        default="q_state",
-        help="Metric used inside the CEM objective. q_state is the fast default.",
-    )
-    parser.add_argument(
-        "--chunk-final-rejoin-metric",
-        choices=["none", "q_state", "ee_pose"],
-        default="q_state",
-        help="Optional post-optimization recoverability check metric.",
-    )
-    parser.add_argument("--chunk-q-rejoin-threshold", type=float, default=0.5)
-    parser.add_argument(
-        "--chunk-qd-rejoin-threshold",
-        type=float,
-        default=5.0,
-        help="Maximum terminal qdot distance allowed for recovery rejoin.",
-    )
-    parser.add_argument("--chunk-ee-rejoin-threshold", type=float, default=0.08)
-    parser.add_argument(
-        "--chunk-explicit-recovery",
-        "--chunk-explicit-return",
-        dest="chunk_explicit_return",
-        action="store_true",
-        default=True,
-        help="Use two-stage deform + recover optimized SafeChunk-Deform.",
-    )
-    parser.add_argument(
-        "--no-chunk-explicit-recovery",
-        "--no-chunk-explicit-return",
-        dest="chunk_explicit_return",
-        action="store_false",
-        help="Use the previous one-stage optimized recoverable deformation.",
-    )
-    parser.add_argument(
-        "--chunk-commit-accepted-chunks",
-        dest="chunk_commit_accepted_chunks",
-        action="store_true",
-        default=True,
-        help="Execute accepted explicit-recovery chunks from a persistent buffer.",
-    )
-    parser.add_argument(
-        "--no-chunk-commit-accepted-chunks",
-        dest="chunk_commit_accepted_chunks",
-        action="store_false",
-        help="Preserve legacy behavior: replan after the first accepted action.",
-    )
-    parser.add_argument(
-        "--chunk-committed-chunk-safety-check",
-        dest="chunk_committed_chunk_safety_check",
-        action="store_true",
-        default=True,
-        help="Run a cheap one-step safety check before serving committed recovery actions.",
-    )
-    parser.add_argument(
-        "--no-chunk-committed-chunk-safety-check",
-        dest="chunk_committed_chunk_safety_check",
-        action="store_false",
-    )
-    parser.add_argument("--chunk-committed-safety-tol", type=float, default=0.005)
-    parser.add_argument(
-        "--chunk-committed-abort-only-if-contact-risk",
-        dest="chunk_committed_abort_only_if_contact_risk",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-committed-abort-only-if-contact-risk",
-        dest="chunk_committed_abort_only_if_contact_risk",
-        action="store_false",
-    )
-    parser.add_argument("--chunk-committed-min-clearance-for-abort", type=float, default=0.08)
-    parser.add_argument(
-        "--chunk-repair-committed-action",
-        dest="chunk_repair_committed_action",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-repair-committed-action",
-        dest="chunk_repair_committed_action",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-monotonic-committed-repair",
-        dest="chunk_monotonic_committed_repair",
-        action="store_true",
-        default=True,
-        help="Reject committed-action repair candidates that reduce post-action clearance.",
-    )
-    parser.add_argument(
-        "--no-chunk-monotonic-committed-repair",
-        dest="chunk_monotonic_committed_repair",
-        action="store_false",
-        help="Legacy ablation: apply committed-action repair even if it worsens clearance.",
-    )
-    parser.add_argument("--chunk-committed-execution-margin", type=float, default=0.02)
-    parser.add_argument("--chunk-committed-state-error-threshold", type=float, default=0.25)
-    parser.add_argument(
-        "--chunk-committed-state-error-action",
-        choices=("replan", "abort_to_brake"),
-        default="replan",
-    )
-    parser.add_argument(
-        "--chunk-committed-state-mismatch-abort-requires-unsafe",
-        dest="chunk_committed_state_mismatch_abort_requires_unsafe",
-        action="store_true",
-        default=False,
-        help="Legacy ablation: keep replaying a state-mismatched committed chunk until it is also unsafe.",
-    )
-    parser.add_argument(
-        "--no-chunk-committed-state-mismatch-abort-requires-unsafe",
-        dest="chunk_committed_state_mismatch_abort_requires_unsafe",
-        action="store_false",
-        help="Replan immediately when committed replay state error exceeds the threshold.",
-    )
-    parser.add_argument(
-        "--chunk-temporary-blocker-enabled",
-        dest="chunk_temporary_blocker_enabled",
-        action="store_true",
-        default=True,
-        help="Prefer wait/brake before SafeChunk deformation for temporary blockers.",
-    )
-    parser.add_argument(
-        "--no-chunk-temporary-blocker-enabled",
-        dest="chunk_temporary_blocker_enabled",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-temporary-prefer-brake-before-deform",
-        dest="chunk_temporary_prefer_brake_before_deform",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-temporary-prefer-brake-before-deform",
-        dest="chunk_temporary_prefer_brake_before_deform",
-        action="store_false",
-    )
-    parser.add_argument("--chunk-temporary-min-unsafe-steps-before-deform", type=int, default=8)
-    parser.add_argument("--chunk-temporary-max-brake-steps-before-deform", type=int, default=12)
-    parser.add_argument(
-        "--chunk-temporary-reset-on-nominal-safe",
-        dest="chunk_temporary_reset_on_nominal_safe",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-temporary-reset-on-nominal-safe",
-        dest="chunk_temporary_reset_on_nominal_safe",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-temporary-require-progress-deadlock-before-deform",
-        dest="chunk_temporary_require_progress_deadlock_before_deform",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-temporary-require-progress-deadlock-before-deform",
-        dest="chunk_temporary_require_progress_deadlock_before_deform",
-        action="store_false",
-    )
-    parser.add_argument("--chunk-temporary-progress-window", type=int, default=10)
-    parser.add_argument("--chunk-temporary-min-progress-delta", type=float, default=0.001)
-    parser.add_argument(
-        "--chunk-temporary-recover-after-wait",
-        dest="chunk_temporary_recover_after_wait",
-        action="store_true",
-        default=False,
-        help="After temporary wait/brake becomes nominal-safe, run existing SafeChunk recovery before releasing ACT.",
-    )
-    parser.add_argument(
-        "--no-chunk-temporary-recover-after-wait",
-        dest="chunk_temporary_recover_after_wait",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-temporary-recover-after-wait-min-brake-steps",
-        type=int,
-        default=1,
-    )
-    parser.add_argument(
-        "--chunk-safechunk-replan-enabled",
-        dest="chunk_safechunk_replan_enabled",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-safechunk-replan-enabled",
-        dest="chunk_safechunk_replan_enabled",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-recovery-target-mode",
-        choices=("task_progress", "nominal"),
-        default="task_progress",
-    )
-    parser.add_argument("--chunk-max-recovery-failure-before-replan", type=int, default=1)
-    parser.add_argument("--chunk-acceptance-enabled", dest="chunk_acceptance_enabled", action="store_true", default=True)
-    parser.add_argument("--no-chunk-acceptance-enabled", dest="chunk_acceptance_enabled", action="store_false")
-    parser.add_argument("--chunk-acceptance-hard-min-clearance", type=float, default=0.02)
-    parser.add_argument("--chunk-acceptance-desired-min-clearance", type=float, default=0.08)
-    parser.add_argument("--chunk-acceptance-prefix-min-clearance", type=float, default=0.04)
-    parser.add_argument("--chunk-acceptance-min-safe-prefix-len", type=int, default=1)
-    parser.add_argument("--chunk-allow-safe-prefix-execution", dest="chunk_allow_safe_prefix_execution", action="store_true", default=True)
-    parser.add_argument("--no-chunk-allow-safe-prefix-execution", dest="chunk_allow_safe_prefix_execution", action="store_false")
-    parser.add_argument("--chunk-rolling-replan-on-prefix", dest="chunk_rolling_replan_on_prefix", action="store_true", default=True)
-    parser.add_argument("--no-chunk-rolling-replan-on-prefix", dest="chunk_rolling_replan_on_prefix", action="store_false")
-    parser.add_argument("--chunk-full-horizon-required-for-recover", dest="chunk_full_horizon_required_for_recover", action="store_true", default=False)
-    parser.add_argument("--chunk-full-horizon-required-for-deform", dest="chunk_full_horizon_required_for_deform", action="store_true", default=False)
-    parser.add_argument("--chunk-emergency-brake-if-immediate-below-hard-margin", dest="chunk_emergency_brake_if_immediate_below_hard_margin", action="store_true", default=True)
-    parser.add_argument("--no-chunk-emergency-brake-if-immediate-below-hard-margin", dest="chunk_emergency_brake_if_immediate_below_hard_margin", action="store_false")
-    parser.add_argument("--chunk-allow-candidate-fallback", dest="chunk_allow_candidate_fallback", action="store_true", default=False, help="Ablation/debug only: allow non-optimized candidate fallback inside optimized SafeChunk.")
-    parser.add_argument("--no-chunk-allow-candidate-fallback", dest="chunk_allow_candidate_fallback", action="store_false")
-    parser.add_argument("--chunk-candidate-fallback-after-any-optimized-result", dest="chunk_candidate_fallback_only_if_no_optimized_result", action="store_false", default=True)
-    parser.add_argument("--chunk-safechunk-recover-enabled", dest="chunk_safechunk_recover_enabled", action="store_true", default=True)
-    parser.add_argument("--no-chunk-safechunk-recover-enabled", dest="chunk_safechunk_recover_enabled", action="store_false")
-    parser.add_argument("--chunk-recover-rejoin-nominal-weight", type=float, default=5.0)
-    parser.add_argument("--chunk-recover-task-progress-weight", type=float, default=10.0)
-    parser.add_argument("--chunk-recover-safety-weight", type=float, default=100.0)
-    parser.add_argument("--chunk-recover-action-deviation-weight", type=float, default=0.2)
-    parser.add_argument("--chunk-recover-smoothness-weight", type=float, default=0.1)
-    parser.add_argument("--chunk-recover-require-nominal-prefix-safe", dest="chunk_recover_require_nominal_prefix_safe", action="store_true", default=True)
-    parser.add_argument("--no-chunk-recover-require-nominal-prefix-safe", dest="chunk_recover_require_nominal_prefix_safe", action="store_false")
-    parser.add_argument("--chunk-recover-nominal-rejoin-prefix-min-clearance", type=float, default=0.04)
-    parser.add_argument("--chunk-recover-use-latest-nominal", dest="chunk_recover_use_latest_nominal", action="store_true", default=True)
-    parser.add_argument("--no-chunk-recover-use-latest-nominal", dest="chunk_recover_use_latest_nominal", action="store_false")
-    parser.add_argument("--chunk-recover-suppress-stale-nominal", dest="chunk_recover_suppress_stale_nominal", action="store_true", default=True)
-    parser.add_argument("--no-chunk-recover-suppress-stale-nominal", dest="chunk_recover_suppress_stale_nominal", action="store_false")
-    parser.add_argument("--chunk-recover-rejoin-weight-schedule", choices=("ramp", "constant", "none"), default="ramp")
-    parser.add_argument("--chunk-recover-rejoin-ramp-steps", type=int, default=5)
-    parser.add_argument("--chunk-recover-retry-cooldown-steps", type=int, default=4)
-    parser.add_argument("--chunk-recover-max-attempts-per-unsafe-streak", type=int, default=3)
-    parser.add_argument("--chunk-active-safety-enabled", dest="chunk_active_safety_enabled", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-safety-enabled", dest="chunk_active_safety_enabled", action="store_false")
-    parser.add_argument("--chunk-active-check-hold-horizon-safety", dest="chunk_active_check_hold_horizon_safety", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-check-hold-horizon-safety", dest="chunk_active_check_hold_horizon_safety", action="store_false")
-    parser.add_argument("--chunk-active-predict-human-motion-for-hold", dest="chunk_active_predict_human_motion_for_hold", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-predict-human-motion-for-hold", dest="chunk_active_predict_human_motion_for_hold", action="store_false")
-    parser.add_argument("--chunk-horizon-predict-human-motion", dest="chunk_horizon_predict_human_motion", action="store_true", default=True, help="Propagate human-arm capsules with finite-difference velocity during SafeChunk horizon safety checks.")
-    parser.add_argument("--no-chunk-horizon-predict-human-motion", dest="chunk_horizon_predict_human_motion", action="store_false")
-    parser.add_argument("--chunk-human-motion-prediction-max-time", type=float, default=0.25, help="Maximum lookahead time, in seconds, for constant-velocity human capsule prediction. Non-positive disables the cap.")
-    parser.add_argument("--chunk-human-motion-prediction-max-speed", type=float, default=3.0, help="Maximum endpoint speed, in m/s, used to clip finite-difference human capsule velocities. Non-positive disables clipping.")
-    parser.add_argument("--chunk-active-hard-min-clearance", type=float, default=0.02)
-    parser.add_argument("--chunk-active-hold-prefix-min-clearance", type=float, default=0.04)
-    parser.add_argument("--chunk-active-hold-horizon-steps", type=int, default=4)
-    parser.add_argument("--chunk-active-emergency-deform-when-hold-unsafe", dest="chunk_active_emergency_deform_when_hold_unsafe", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-emergency-deform-when-hold-unsafe", dest="chunk_active_emergency_deform_when_hold_unsafe", action="store_false")
-    parser.add_argument("--chunk-active-optimize-when-hold-unsafe", dest="chunk_active_optimize_when_hold_unsafe", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-optimize-when-hold-unsafe", dest="chunk_active_optimize_when_hold_unsafe", action="store_false")
-    parser.add_argument("--chunk-active-emergency-deform-candidate-scales", type=float, nargs="+", default=[0.25, 0.5, 0.75, 1.0])
-    parser.add_argument("--chunk-active-prefer-last-safe-action", dest="chunk_active_prefer_last_safe_action", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-prefer-last-safe-action", dest="chunk_active_prefer_last_safe_action", action="store_false")
-    parser.add_argument("--chunk-active-prefer-last-safe-q-retract", dest="chunk_active_prefer_last_safe_q_retract", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-prefer-last-safe-q-retract", dest="chunk_active_prefer_last_safe_q_retract", action="store_false")
-    parser.add_argument("--chunk-active-emergency-deform-replan-next-step", dest="chunk_active_emergency_deform_replan_next_step", action="store_true", default=True)
-    parser.add_argument("--no-chunk-active-emergency-deform-replan-next-step", dest="chunk_active_emergency_deform_replan_next_step", action="store_false")
-    parser.add_argument("--chunk-recovery-corridor-enabled", dest="chunk_recovery_corridor_enabled", action="store_true", default=True)
-    parser.add_argument("--no-chunk-recovery-corridor-enabled", dest="chunk_recovery_corridor_enabled", action="store_false")
-    parser.add_argument("--chunk-require-recover-path-safe", dest="chunk_require_recover_path_safe", action="store_true", default=True)
-    parser.add_argument("--no-chunk-require-recover-path-safe", dest="chunk_require_recover_path_safe", action="store_false")
-    parser.add_argument("--chunk-recover-path-min-clearance", type=float, default=0.04)
-    parser.add_argument("--chunk-recover-immediate-hard-clearance", type=float, default=0.02)
-    parser.add_argument("--chunk-recover-prefix-min-clearance", type=float, default=0.04)
-    parser.add_argument("--chunk-enable-direct-rejoin", dest="chunk_enable_direct_rejoin", action="store_true", default=True)
-    parser.add_argument("--no-chunk-enable-direct-rejoin", dest="chunk_enable_direct_rejoin", action="store_false")
-    parser.add_argument("--chunk-enable-detour-rejoin", dest="chunk_enable_detour_rejoin", action="store_true", default=False)
-    parser.add_argument("--no-chunk-enable-detour-rejoin", dest="chunk_enable_detour_rejoin", action="store_false")
-    parser.add_argument("--chunk-enable-delayed-rejoin", dest="chunk_enable_delayed_rejoin", action="store_true", default=True)
-    parser.add_argument("--no-chunk-enable-delayed-rejoin", dest="chunk_enable_delayed_rejoin", action="store_false")
-    parser.add_argument("--chunk-suppress-repeated-unsafe-recovery", dest="chunk_suppress_repeated_unsafe_recovery", action="store_true", default=True)
-    parser.add_argument("--no-chunk-suppress-repeated-unsafe-recovery", dest="chunk_suppress_repeated_unsafe_recovery", action="store_false")
-    parser.add_argument("--chunk-unsafe-recovery-cooldown-steps", type=int, default=8)
-    parser.add_argument("--chunk-max-same-target-failures", type=int, default=2)
-    parser.add_argument("--chunk-detour-scales", type=float, nargs="+", default=[0.25, 0.5, 0.75, 1.0])
-    parser.add_argument("--chunk-detour-clearance-weight", type=float, default=100.0)
-    parser.add_argument("--chunk-detour-task-rejoin-weight", type=float, default=10.0)
-    parser.add_argument("--chunk-detour-action-norm-weight", type=float, default=0.2)
-    parser.add_argument("--chunk-delayed-rejoin-wait-steps", type=int, default=4)
-    parser.add_argument("--chunk-delayed-rejoin-requires-nominal-prefix-safe", dest="chunk_delayed_rejoin_requires_nominal_prefix_safe", action="store_true", default=True)
-    parser.add_argument("--no-chunk-delayed-rejoin-requires-nominal-prefix-safe", dest="chunk_delayed_rejoin_requires_nominal_prefix_safe", action="store_false")
-    parser.add_argument("--chunk-require-safe-corridor-for-recovery-complete", dest="chunk_require_safe_corridor_for_recovery_complete", action="store_true", default=True)
-    parser.add_argument("--no-chunk-require-safe-corridor-for-recovery-complete", dest="chunk_require_safe_corridor_for_recovery_complete", action="store_false")
-    parser.add_argument("--chunk-require-post-recovery-act-window", dest="chunk_require_post_recovery_act_window", action="store_true", default=True)
-    parser.add_argument("--no-chunk-require-post-recovery-act-window", dest="chunk_require_post_recovery_act_window", action="store_false")
-    parser.add_argument("--chunk-post-recovery-min-act-steps", type=int, default=5)
-    parser.add_argument("--chunk-acceptance-clearance-tol", type=float, default=0.005)
-    parser.add_argument("--chunk-lambda-deform-safety", "--chunk-lambda-yield-safety", dest="chunk_lambda_yield_safety", type=float, default=800.0)
-    parser.add_argument("--chunk-lambda-deform-action", "--chunk-lambda-yield-action", dest="chunk_lambda_yield_action", type=float, default=0.1)
-    parser.add_argument("--chunk-lambda-deform-smooth", "--chunk-lambda-yield-smooth", dest="chunk_lambda_yield_smooth", type=float, default=0.1)
-    parser.add_argument("--chunk-lambda-retreat", type=float, default=1.0)
-    parser.add_argument("--chunk-lambda-recover-safety", "--chunk-lambda-return-safety", dest="chunk_lambda_return_safety", type=float, default=500.0)
-    parser.add_argument("--chunk-lambda-recover-rejoin", "--chunk-lambda-return-rejoin", dest="chunk_lambda_return_rejoin", type=float, default=5.0)
-    parser.add_argument("--chunk-lambda-recover-smooth", "--chunk-lambda-return-smooth", dest="chunk_lambda_return_smooth", type=float, default=0.2)
-    parser.add_argument("--chunk-lambda-recover-action", "--chunk-lambda-return-action", dest="chunk_lambda_return_action", type=float, default=0.1)
-    parser.add_argument("--chunk-recover-direction-alignment-weight", type=float, default=5.0)
-    parser.add_argument("--chunk-recover-min-direction-cosine", type=float, default=0.05)
-    parser.add_argument("--chunk-require-recover-direction-alignment", dest="chunk_require_recover_direction_alignment", action="store_true", default=True)
-    parser.add_argument("--no-chunk-require-recover-direction-alignment", dest="chunk_require_recover_direction_alignment", action="store_false")
-    parser.add_argument("--chunk-recover-direction-alignment-margin", type=float, default=0.0)
-    parser.add_argument("--chunk-recover-ordered-pose-weight", type=float, default=2.0)
-    parser.add_argument("--chunk-recover-ordered-delta-weight", type=float, default=1.0)
-    parser.add_argument("--chunk-recover-ordered-pose-threshold", type=float, default=0.02)
-    parser.add_argument("--chunk-recover-ordered-delta-threshold", type=float, default=0.005)
-    parser.add_argument("--chunk-require-recover-ordered-path", dest="chunk_require_recover_ordered_path", action="store_true", default=True)
-    parser.add_argument("--no-chunk-require-recover-ordered-path", dest="chunk_require_recover_ordered_path", action="store_false")
-    parser.add_argument("--chunk-deform-horizon", "--chunk-yield-horizon", dest="chunk_yield_horizon", type=int, default=4)
-    parser.add_argument("--chunk-recover-horizon", "--chunk-return-horizon", dest="chunk_return_horizon", type=int, default=8)
-    parser.add_argument("--chunk-max-recover-retries", "--chunk-max-return-retries", dest="chunk_max_return_retries", type=int, default=3)
-    parser.add_argument(
-        "--chunk-use-ee-final-check",
-        dest="chunk_use_ee_final_check",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument(
-        "--no-chunk-use-ee-final-check",
-        dest="chunk_use_ee_final_check",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-cache-nominal-ee",
-        dest="chunk_cache_nominal_ee",
-        action="store_true",
-        default=False,
-        help="Precompute nominal EE poses once per ACT chunk when needed.",
-    )
-    parser.add_argument(
-        "--no-chunk-cache-nominal-ee",
-        dest="chunk_cache_nominal_ee",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-ee-rejoin-in-inner-loop",
-        dest="chunk_ee_rejoin_in_inner_loop",
-        action="store_true",
-        default=False,
-        help="Legacy slow mode: run EE FK inside the inner optimization loop.",
-    )
-    parser.add_argument(
-        "--chunk-debug-safety-feasibility",
-        dest="chunk_debug_safety_feasibility",
-        action="store_true",
-        default=True,
-        help="Skip EE final checks and log optimizer safety feasibility diagnostics.",
-    )
-    parser.add_argument(
-        "--no-chunk-debug-safety-feasibility",
-        dest="chunk_debug_safety_feasibility",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--no-chunk-ee-rejoin-in-inner-loop",
-        dest="chunk_ee_rejoin_in_inner_loop",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-recoverable-deform",
-        dest="chunk_recoverable_deform_enabled",
-        action="store_true",
-        default=True,
-        help="Add rejoin loss and recoverability rejection to optimized deformation.",
-    )
-    parser.add_argument(
-        "--no-chunk-recoverable-deform",
-        dest="chunk_recoverable_deform_enabled",
-        action="store_false",
-        help="Disable optimized-deform recovery terms and preserve legacy optimized behavior.",
-    )
-    parser.add_argument(
-        "--chunk-brake-if-unrecoverable",
-        dest="chunk_brake_if_unrecoverable",
-        action="store_true",
-        default=True,
-        help="Use the existing brake/hold chunk when optimized deformation is unsafe or unrecoverable.",
-    )
-    parser.add_argument(
-        "--no-chunk-brake-if-unrecoverable",
-        dest="chunk_brake_if_unrecoverable",
-        action="store_false",
-        help="Use --chunk-optimized-fallback when optimized deformation is rejected.",
-    )
-    parser.add_argument(
-        "--chunk-optimized-fallback",
-        choices=["candidate", "brake"],
-        default="brake",
-        help="Fallback used when optimized deformation is unsafe or unrecoverable. Use candidate only for ablation.",
-    )
-    parser.add_argument("--chunk-opt-population", type=int, default=32)
-    parser.add_argument("--chunk-opt-elite-frac", type=float, default=0.25)
-    parser.add_argument("--chunk-opt-seed", type=int, default=0)
-    parser.add_argument(
-        "--chunk-detach-passthrough-dims",
-        dest="chunk_detach_passthrough_dims",
-        action="store_true",
-        default=True,
-    )
-    parser.add_argument(
-        "--no-chunk-detach-passthrough-dims",
-        dest="chunk_detach_passthrough_dims",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-use-ee-pose-rejoin",
-        dest="chunk_use_ee_pose_rejoin",
-        action="store_true",
-        default=False,
-        help="Legacy alias for enabling EE-pose inner-loop rejoin when combined with --chunk-ee-rejoin-in-inner-loop.",
-    )
-    parser.add_argument(
-        "--no-chunk-use-ee-pose-rejoin",
-        dest="chunk_use_ee_pose_rejoin",
-        action="store_false",
-    )
-    parser.add_argument(
-        "--chunk-use-object-state-rejoin",
-        action="store_true",
-        default=False,
-    )
-
-    parser.add_argument(
-        "--save-actions",
-        type=str,
-        default=None,
-        help="Save normalized action chunks sent to env.step() as an NPZ file.",
-    )
-    parser.add_argument(
-        "--replay-actions",
-        type=str,
-        default=None,
-        help="Replay normalized action chunks from an NPZ file instead of querying ACT.",
-    )
-
-    parser.add_argument(
-        "--override",
-        action="append",
-        default=[],
-        help="Extra Hydra override. Can be used multiple times.",
-    )
-
-    args = parser.parse_args()
-    args.record_video = not args.no_record_video
-    if args.frame_image_every <= 0:
-        parser.error("--frame-image-every must be positive.")
-    if args.save_actions is not None and args.replay_actions is not None:
-        parser.error("Use either --save-actions or --replay-actions, not both.")
-    if args.enable_human_arm_collisions and (
-        args.disable_human_arm_collisions or args.visual_only_human_arm
-    ):
-        parser.error(
-            "--enable-human-arm-collisions cannot be combined with "
-            "--disable-human-arm-collisions or --visual-only-human-arm"
-        )
-    if args.policy_video_every < 1:
-        parser.error("--policy-video-every must be >= 1")
-    if args.human_arm_aggression <= 0:
-        parser.error("--human-arm-aggression must be > 0")
-    if args.human_arm_substeps < 1:
-        parser.error("--human-arm-substeps must be >= 1")
-    if args.human_arm_force_carrier_frequency <= 0:
-        parser.error("--human-arm-force-carrier-frequency must be > 0")
-    if args.human_arm_ee_obstruction and args.human_arm_drawer_obstruction:
-        parser.error(
-            "Use either --human-arm-ee-obstruction or "
-            "--human-arm-drawer-obstruction, not both."
-        )
-    if (
-        args.human_arm_force_carrier_amp_xy is not None
-        and args.human_arm_force_carrier_xy is None
-        and not args.human_arm_ee_obstruction
-        and not args.human_arm_drawer_obstruction
-    ):
-        parser.error(
-            "--human-arm-force-carrier-amp-xy requires --human-arm-force-carrier-xy "
-            "unless an obstruction mode is set"
-        )
-    if args.human_arm_natural_motion_frequency <= 0:
-        parser.error("--human-arm-natural-motion-frequency must be > 0")
-    if args.human_arm_natural_lateral_scale < 0:
-        parser.error("--human-arm-natural-lateral-scale must be >= 0")
-    if args.human_arm_natural_return_curl_scale < 0:
-        parser.error("--human-arm-natural-return-curl-scale must be >= 0")
-    if args.human_arm_transient_obstruction:
-        if args.human_arm_release_after_steps < 0:
-            parser.error("--human-arm-release-after-steps must be >= 0")
-        if args.human_arm_release_duration_steps < 1:
-            parser.error("--human-arm-release-duration-steps must be >= 1")
-    if args.human_arm_final_clear_after_steps >= 0:
-        if args.human_arm_final_clear_duration_steps < 1:
-            parser.error("--human-arm-final-clear-duration-steps must be >= 1")
-    if args.stop_video_at_steps is not None and args.stop_video_at_steps <= 0:
-        parser.error("--stop-video-at-steps must be > 0")
-    if args.resume_clear_steps < 1:
-        parser.error("--resume-clear-steps must be >= 1")
-    if args.resume_clearance_threshold < 0:
-        parser.error("--resume-clearance-threshold must be >= 0")
-    if args.phase_reanchor_check_after_steps < 0:
-        parser.error("--phase-reanchor-check-after-steps must be >= 0")
-    if args.phase_reanchor_no_progress_window < 1:
-        parser.error("--phase-reanchor-no-progress-window must be >= 1")
-    if args.phase_reanchor_steps < 1:
-        parser.error("--phase-reanchor-steps must be >= 1")
-    if args.phase_reanchor_cooldown_steps < 0:
-        parser.error("--phase-reanchor-cooldown-steps must be >= 0")
-    if args.phase_reanchor_max_base_step <= 0:
-        parser.error("--phase-reanchor-max-base-step must be > 0")
-    if args.phase_reanchor_base_gain < 0:
-        parser.error("--phase-reanchor-base-gain must be >= 0")
-    if args.phase_reanchor_grasp_dist < 0:
-        parser.error("--phase-reanchor-grasp-dist must be >= 0")
-    if args.post_recovery_task_guard_steps < 1:
-        parser.error("--post-recovery-task-guard-steps must be >= 1")
-    if args.post_recovery_progress_tolerance < 0:
-        parser.error("--post-recovery-progress-tolerance must be >= 0")
-    if args.post_recovery_task_guard_min_progress < 0:
-        parser.error("--post-recovery-task-guard-min-progress must be >= 0")
-    try:
-        args.stop_video_at_seconds = _parse_duration_seconds(args.stop_video_at)
-    except argparse.ArgumentTypeError as exc:
-        parser.error(str(exc))
-    return args
-
-
-def _parse_duration_seconds(value: str) -> Optional[float]:
-    value = value.strip().lower()
-    if value in {"", "none", "off", "false", "0"}:
-        return None
-
-    parts = value.split(":")
-    try:
-        if len(parts) == 1:
-            seconds = float(parts[0])
-        elif len(parts) == 2:
-            minutes, seconds_part = parts
-            seconds = int(minutes) * 60 + float(seconds_part)
-        elif len(parts) == 3:
-            hours, minutes, seconds_part = parts
-            seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds_part)
-        else:
-            raise ValueError
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            f"Invalid --stop-video-at duration: {value!r}"
-        ) from exc
-
-    if seconds <= 0:
-        return None
-    return seconds
-
-
-def _video_duration_seconds(video_recorder) -> float:
-    timestamps = getattr(video_recorder, "timestamps", [])
-    if len(timestamps) < 2:
-        return 0.0
-    return max(0.0, float(timestamps[-1] - timestamps[0]))
-
-
-def _video_recorded_steps(video_recorder) -> int:
-    frames = getattr(video_recorder, "frames", [])
-    if len(frames) > 0:
-        return max(0, len(frames) - 1)
-    states = getattr(video_recorder, "_states", [])
-    return max(0, len(states) - 1)
-
-
-def _resolve_video_stop_steps(args, video_recorder) -> Optional[int]:
-    if not args.record_video or args.video_time_base != "sim":
-        return None
-    if args.stop_video_at_steps is not None:
-        return int(args.stop_video_at_steps)
-    if args.stop_video_at_seconds is None:
-        return None
-    fps = float(getattr(video_recorder, "fps", 20))
-    return max(1, int(round(args.stop_video_at_seconds * fps)))
-
-
-def _load_snapshot_normalization_cfg(snapshot_path: Path):
-    cfg_path = snapshot_path.parent.parent / ".hydra" / "config.yaml"
-    if not cfg_path.is_file():
-        raise FileNotFoundError(
-            "Could not load normalization stats from snapshot because the Hydra "
-            f"config is missing: {cfg_path}"
-        )
-    return OmegaConf.load(cfg_path)
-
-
-def _make_eval_env_with_normalization(cfg, normalization_cfg=None):
-    if normalization_cfg is None:
-        return make_eval_env(cfg)
-
-    stats_factory = BiGymEnvFactory()
-    stats_factory.collect_or_fetch_demos(
-        normalization_cfg,
-        normalization_cfg.demos,
-    )
-
-    env_factory = BiGymEnvFactory()
-    env_factory._action_stats = copy.deepcopy(stats_factory._action_stats)
-    env_factory._obs_stats = copy.deepcopy(stats_factory._obs_stats)
-    return env_factory.make_eval_env(cfg)
-
-
-def _normalization_context(cfg):
-    manifest = cfg.env.get("manifest", None)
-    return (
-        str(cfg.env.task_name),
-        None if manifest is None else str(manifest),
-        str(cfg.demos),
-    )
-
-
-def _resolve_normalization_cfg(args, cfg, snapshot_path: Path):
-    if args.normalization_source == "eval":
-        return "eval", None
-
-    snapshot_cfg = _load_snapshot_normalization_cfg(snapshot_path)
-    if args.normalization_source == "snapshot":
-        return "snapshot", snapshot_cfg
-
-    eval_context = _normalization_context(cfg)
-    snapshot_context = _normalization_context(snapshot_cfg)
-    if eval_context != snapshot_context:
-        return "snapshot(auto)", snapshot_cfg
-    return "eval(auto)", None
-
-
-def _print_normalization_source(name: str, cfg):
-    manifest = cfg.env.get("manifest", None)
-    print("normalization_source:", name)
-    print("normalization_task:", cfg.env.task_name)
-    print("normalization_demos:", cfg.demos)
-    print(
-        "normalization_manifest:",
-        manifest if manifest is not None else "<DemoStore/default>",
-    )
-
-
-def _normalize_rgb_frame(frame):
-    frame = np.asarray(frame)
-    if frame.ndim != 3:
-        return None
-
-    if frame.shape[0] in (1, 3, 4) and frame.shape[-1] not in (1, 3, 4):
-        frame = np.moveaxis(frame, 0, -1)
-
-    if frame.shape[-1] == 1:
-        frame = np.repeat(frame, 3, axis=-1)
-    elif frame.shape[-1] > 3:
-        frame = frame[..., :3]
-
-    if frame.dtype != np.uint8:
-        frame = frame.astype(np.float32)
-        if frame.size and np.nanmax(frame) <= 1.0:
-            frame = frame * 255.0
-        frame = np.clip(frame, 0, 255).astype(np.uint8)
-    return frame
-
-
-def _policy_obs_rgb_frame(policy_obs):
-    frames = []
-    for key in sorted(k for k in policy_obs if k.startswith("rgb_")):
-        value = np.asarray(policy_obs[key])
-        if value.ndim == 4:
-            frame = value[-1]
-        elif value.ndim == 3:
-            frame = value
-        else:
-            continue
-
-        frame = _normalize_rgb_frame(frame)
-        if frame is not None:
-            frames.append(frame)
-
-    if not frames:
-        return None
-
-    height = min(frame.shape[0] for frame in frames)
-    frames = [frame[:height] for frame in frames]
-    return np.concatenate(frames, axis=1)
-
-
-def _save_policy_obs_video(frames, timestamps, path: Path, default_fps=20):
-    if not frames:
-        return
-    fps = default_fps
-    if len(timestamps) > 1:
-        duration = timestamps[-1] - timestamps[0]
-        if duration > 0:
-            fps = len(frames) / duration
-    imageio.mimsave(str(path), np.asarray(frames), fps=fps)
-
-
-def _raw_scaled_first_action(env, action):
-    rescale_wrapper = _find_wrapped_env_with_attr(env, "action_stats")
-    if rescale_wrapper is None or not hasattr(rescale_wrapper, "action"):
-        return None
-    return np.asarray(rescale_wrapper.action(np.asarray(action, dtype=np.float32)), dtype=np.float32)
-
-
-def _raw_action_to_normalized(env, raw_action):
-    rescale_wrapper = _find_wrapped_env_with_attr(env, "action_stats")
-    if rescale_wrapper is None:
-        return None
-    action_stats = getattr(rescale_wrapper, "action_stats", None)
-    if action_stats is None or "min" not in action_stats or "max" not in action_stats:
-        return None
-
-    action_min = np.asarray(action_stats["min"], dtype=np.float32)
-    action_max = np.asarray(action_stats["max"], dtype=np.float32)
-    margin = float(getattr(rescale_wrapper, "min_max_margin", 0.0))
-    action_min = action_min - np.fabs(action_min) * margin
-    action_max = action_max + np.fabs(action_max) * margin
-
-    raw = np.asarray(raw_action, dtype=np.float32)
-    normalized = (raw - action_min) / (action_max - action_min + 1e-8)
-    normalized = normalized * 2.0 - 1.0
-    return np.clip(normalized, -1.0, 1.0).astype(np.float32, copy=False)
-
-
-def _env_chain(env):
-    seen = set()
-    cur = env
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        yield cur
-        cur = getattr(cur, "env", None)
-
-
-def _has_direct_attr(obj, attr_name):
-    if attr_name in getattr(obj, "__dict__", {}):
+def _is_brake_or_fallback_execution(safety_info) -> bool:
+    mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
+    source = _safe_info_get(safety_info, "deformation_source")
+    if bool(_safe_info_get(safety_info, "fallback_used")):
         return True
-    return any(attr_name in cls.__dict__ for cls in type(obj).mro())
-
-
-def _find_wrapped_attr(env, attr_name):
-    for candidate in _env_chain(env):
-        if _has_direct_attr(candidate, attr_name):
-            return getattr(candidate, attr_name)
-    return None
-
-
-def _find_wrapped_env_with_attr(env, attr_name):
-    for candidate in _env_chain(env):
-        if _has_direct_attr(candidate, attr_name):
-            return candidate
-    return None
-
-
-def _apply_robot_spawn_offset_xy(env, offset_xy) -> Optional[dict[str, list[float]]]:
-    if offset_xy is None:
-        return None
-
-    task = _find_wrapped_env_with_attr(env, "RESET_ROBOT_POS")
-    if task is None:
-        raise RuntimeError("Could not find raw BiGym env with RESET_ROBOT_POS.")
-
-    if hasattr(task, "_eval_default_reset_robot_pos"):
-        default_pos = np.asarray(
-            task._eval_default_reset_robot_pos, dtype=np.float64
-        ).copy()
-    else:
-        default_pos = np.asarray(task.RESET_ROBOT_POS, dtype=np.float64).copy()
-        task._eval_default_reset_robot_pos = default_pos.copy()
-
-    offset = np.asarray(offset_xy, dtype=np.float64).reshape(2)
-    spawn_pos = default_pos.copy()
-    spawn_pos[:2] = spawn_pos[:2] + offset
-    task.RESET_ROBOT_POS = spawn_pos
-
-    return {
-        "default_pos": default_pos.astype(float).tolist(),
-        "offset_xy": offset.astype(float).tolist(),
-        "spawn_pos": spawn_pos.astype(float).tolist(),
+    return mode in {
+        "horizon_brake",
+        "horizon_brake_intended_step",
+        "path_consistent_brake",
+        "path_consistent_brake_intended_step",
+        "pause_on_unsafe",
+        "pause_and_restart",
+        "stop",
+        "verified_failsafe",
+        "unverified_emergency_failsafe",
+    } or source in {
+        "horizon_brake",
+        "path_consistent_brake",
+        "path_consistent_brake_slowdown",
     }
-
-
-def _reset_action_sequence_history(env) -> int:
-    reset_count = 0
-    for candidate in _env_chain(env):
-        reset = getattr(candidate, "_init_action_history", None)
-        if callable(reset):
-            reset()
-            reset_count += 1
-    return reset_count
-
 
 def _is_safety_intervention_mode(safety_info) -> bool:
     mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
@@ -2602,7 +206,6 @@ def _is_safety_intervention_mode(safety_info) -> bool:
         return True
     return source in {"chunk_deform", "sequential_oscbf", "sequential_oscbf_fallback"}
 
-
 def _should_hold_policy_step(safety_info, first_action, safe_first_action, arm_idx, eps) -> bool:
     mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
     if mode not in {"horizon_brake", "path_consistent_brake", "pause_on_unsafe", "stop"}:
@@ -2618,888 +221,6 @@ def _should_hold_policy_step(safety_info, first_action, safe_first_action, arm_i
     delta = np.linalg.norm(safe_first_action[arm_idx[valid]] - first_action[arm_idx[valid]])
     return bool(delta > float(eps))
 
-
-def _disable_human_arm_collisions(env) -> int:
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    base_env = _find_wrapped_env_with_attr(env, "mojo")
-    if not humanarms or base_env is None:
-        return 0
-
-    import mujoco
-
-    model = base_env.mojo.physics.model.ptr
-    disabled = 0
-    for name in ["cylinder_arm/upperarm_geom", "cylinder_arm/forearm_geom"]:
-        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        if gid < 0:
-            continue
-        model.geom_contype[gid] = 0
-        model.geom_conaffinity[gid] = 0
-        model.geom_margin[gid] = 0.0
-        disabled += 1
-    base_env.mojo.physics.forward()
-    return disabled
-
-
-def _enable_human_arm_collisions(env) -> int:
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    base_env = _find_wrapped_env_with_attr(env, "mojo")
-    if not humanarms or base_env is None:
-        return 0
-
-    import mujoco
-
-    model = base_env.mojo.physics.model.ptr
-    enabled = 0
-    for name in ["cylinder_arm/upperarm_geom", "cylinder_arm/forearm_geom"]:
-        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        if gid < 0:
-            continue
-        model.geom_contype[gid] = 2
-        model.geom_conaffinity[gid] = 1
-        model.geom_margin[gid] = max(float(model.geom_margin[gid]), 0.01)
-        enabled += 1
-    base_env.mojo.physics.forward()
-    return enabled
-
-
-def _freeze_human_arm(env) -> int:
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-
-    frozen = 0
-    for human in humanarms:
-        state = human.get_state()
-        # set_qpos_target also switches HumanArm out of scripted mode and into
-        # position mode, so scripted primitives stop advancing.
-        human.set_qpos_target(state["qpos"])
-        if hasattr(human, "_qpos_filt"):
-            human._qpos_filt = state["qpos"].copy()
-        if hasattr(human, "_qvel_filt"):
-            human._qvel_filt[:] = 0.0
-        if hasattr(human, "_walk_enable"):
-            human._walk_enable = False
-        if hasattr(human, "_walk_v"):
-            human._walk_v[:] = 0.0
-        if hasattr(human, "_carrier_dwell"):
-            human._carrier_dwell = 1e9
-        frozen += 1
-    return frozen
-
-
-def _update_temporary_human_blocker_if_present(env) -> Optional[dict]:
-    blocker = _find_wrapped_attr(env, "_temporary_human_blocker")
-    if blocker is None:
-        return None
-    task = _find_wrapped_env_with_attr(env, "get_dt")
-    if task is None:
-        return None
-    info = dict(blocker.update(task.get_dt()))
-    if hasattr(task, "_temporary_human_blocker_info"):
-        task._temporary_human_blocker_info = dict(info)
-    return info
-
-
-def _configure_human_arm_challenge(env, args) -> int:
-    _reset_human_arm_final_clear_state(args)
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-
-    aggression = float(np.clip(args.human_arm_aggression, 0.1, 3.0))
-    configured = 0
-    for human in humanarms:
-        if hasattr(human, "_style_speed"):
-            human._style_speed = float(np.clip(human._style_speed * aggression, 0.1, 3.0))
-        if hasattr(human, "_style_amp"):
-            human._style_amp = float(np.clip(human._style_amp * aggression, 0.1, 1.75))
-        if hasattr(human, "_style_dwell") and args.human_arm_zero_dwell:
-            human._style_dwell = min(float(human._style_dwell), 0.2)
-        if hasattr(human, "_carrier_dwell") and args.human_arm_zero_dwell:
-            human._carrier_dwell = 0.0
-        if args.human_arm_walk_radius is not None and hasattr(human, "_walk_radius"):
-            human._walk_radius = float(max(0.0, args.human_arm_walk_radius))
-        if args.human_arm_keepout_min_clear is not None and hasattr(human, "MIN_CLEAR"):
-            min_clear = float(max(0.0, args.human_arm_keepout_min_clear))
-            human.MIN_CLEAR = min_clear
-            if hasattr(human, "KEEP_SOFT"):
-                human.KEEP_SOFT = max(float(human.KEEP_SOFT), min_clear + 0.01)
-            if hasattr(human, "KEEP_HARD"):
-                human.KEEP_HARD = min(float(human.KEEP_HARD), max(0.0, min_clear * 0.4))
-        if args.human_arm_disable_keepout:
-            _disable_human_arm_internal_keepout(human)
-        _bias_human_arm_goal(human, args.human_arm_goal_xy)
-        configured += 1
-    _force_human_arm_carrier_xy(env, _forced_human_arm_carrier_xy(args, step=0), args=args)
-    _apply_natural_human_arm_contact_motion(env, args, step=0)
-    _force_human_arm_carrier_xy(env, _forced_human_arm_carrier_xy(args, step=0), args=args)
-    return configured
-
-
-def _disable_human_arm_internal_keepout(human) -> None:
-    if hasattr(human, "_robot_geom_ids"):
-        human._robot_geom_ids = np.asarray([], dtype=np.int32)
-    if hasattr(human, "_robot_keepout_r"):
-        human._robot_keepout_r = np.asarray([], dtype=np.float64)
-    if hasattr(human, "MIN_CLEAR"):
-        human.MIN_CLEAR = -1.0
-    if hasattr(human, "KEEP_SOFT"):
-        human.KEEP_SOFT = -1.0
-    if hasattr(human, "KEEP_HARD"):
-        human.KEEP_HARD = -1.0
-    if hasattr(human, "_debug_keepout_clear"):
-        human._debug_keepout_clear = float("inf")
-    if hasattr(human, "_debug_keepout_active"):
-        human._debug_keepout_active = False
-
-
-def _bias_human_arm_goal(human, goal_xy) -> bool:
-    if goal_xy is None or not hasattr(human, "_walk_goal_xy"):
-        return False
-    goal = np.asarray(goal_xy, dtype=np.float64).reshape(2)
-    radius = float(getattr(human, "_walk_radius", np.linalg.norm(goal)))
-    norm = float(np.linalg.norm(goal))
-    if radius > 0.0 and norm > radius:
-        goal = goal / (norm + 1e-12) * radius
-    human._walk_goal_xy = goal
-    if hasattr(human, "_carrier_dwell"):
-        human._carrier_dwell = 0.0
-    return True
-
-
-
-def _transient_human_arm_alpha(args, step: int) -> float:
-    if not args.human_arm_transient_obstruction:
-        return 0.0
-    start = int(args.human_arm_release_after_steps)
-    duration = max(1, int(args.human_arm_release_duration_steps))
-    return float(np.clip((int(step) - start) / duration, 0.0, 1.0))
-
-
-def _smoothstep(x: float) -> float:
-    x = float(np.clip(x, 0.0, 1.0))
-    return x * x * (3.0 - 2.0 * x)
-
-
-def _human_arm_retracted_q(human):
-    q = np.array(
-        [
-            np.deg2rad(-8.0),
-            np.deg2rad(4.0),
-            np.deg2rad(8.0),
-            np.deg2rad(92.0),
-        ],
-        dtype=np.float64,
-    )
-    if hasattr(human, "_clip_joint_vec"):
-        q = human._clip_joint_vec(q)
-    return q
-
-def _apply_human_arm_yaw_offset(
-    human, args, q: np.ndarray, *, current_state: bool = False
-) -> np.ndarray:
-    q = np.asarray(q, dtype=np.float64).copy()
-    offset = np.deg2rad(float(getattr(args, "human_arm_yaw_offset_deg", 0.0)))
-    if q.shape[0] > 1:
-        if current_state:
-            previous = float(getattr(human, "_eval_human_arm_yaw_offset_rad", 0.0))
-            q[1] += offset - previous
-        else:
-            q[1] += offset
-    setattr(human, "_eval_human_arm_yaw_offset_rad", float(offset))
-    if hasattr(human, "_clip_joint_vec"):
-        q = human._clip_joint_vec(q)
-    return q
-
-
-def _natural_human_arm_contact_q(human, args, step: int = 0, dt: float = 0.05):
-    phase_step = float(step) + float(getattr(args, "human_arm_natural_motion_phase_offset_steps", 0.0))
-    phase = 2.0 * np.pi * float(args.human_arm_natural_motion_frequency) * phase_step * float(dt)
-    reach = 0.5 * (1.0 - np.cos(phase))
-    sweep = np.sin(phase)
-    settle = np.sin(0.5 * phase + 0.35)
-    lateral_scale = float(max(0.0, getattr(args, "human_arm_natural_lateral_scale", 1.0)))
-    curl_scale = float(max(0.0, getattr(args, "human_arm_natural_return_curl_scale", 0.0)))
-    return_phase = float(np.clip(-sweep, 0.0, 1.0))
-
-    q = np.array(
-        [
-            np.deg2rad(1.0) + lateral_scale * np.deg2rad(4.0) * settle,
-            np.deg2rad(0.0) + lateral_scale * np.deg2rad(7.0) * sweep,
-            np.deg2rad(-30.0) - np.deg2rad(30.0) * reach + np.deg2rad(2.0) * settle + np.deg2rad(8.0) * curl_scale * return_phase,
-            np.deg2rad(66.0) - np.deg2rad(30.0) * reach + np.deg2rad(4.0) * np.sin(phase + 0.8) + np.deg2rad(28.0) * curl_scale * return_phase,
-        ],
-        dtype=np.float64,
-    )
-    if hasattr(human, "_clip_joint_vec"):
-        q = human._clip_joint_vec(q)
-    return q
-
-
-def _apply_natural_human_arm_contact_motion(env, args, step: int = 0, dt: float = 0.05) -> int:
-    if not args.human_arm_natural_contact_motion:
-        return 0
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-    applied = 0
-    for human in humanarms:
-        if not hasattr(human, "_set_kinematic_state"):
-            continue
-        q = _natural_human_arm_contact_q(human, args, step=step, dt=dt)
-        alpha = _smoothstep(_transient_human_arm_alpha(args, step))
-        if alpha > 0.0:
-            q = (1.0 - alpha) * q + alpha * _human_arm_retracted_q(human)
-        q = _apply_human_arm_yaw_offset(human, args, q)
-        if hasattr(human, "_qpos_filt"):
-            human._qpos_filt = q.copy()
-        if hasattr(human, "_qvel_filt"):
-            human._qvel_filt[:] = 0.0
-        if hasattr(human, "_qpos_target"):
-            human._qpos_target[:] = q
-        if hasattr(human, "_walk_xy"):
-            xy = np.asarray(human._walk_xy, dtype=np.float64).copy()
-        else:
-            state = human.get_state()
-            xy = np.zeros(2, dtype=np.float64)
-        human._set_kinematic_state(xy, q)
-        applied += 1
-    return applied
-
-
-
-def _robot_ee_world_xy(oscbf, q_full: np.ndarray, qd_full: np.ndarray, offset_xy=None):
-    if oscbf is None or oscbf.robot_model is None:
-        return None
-    q_urdf, _, _, _ = oscbf._build_urdf_surrogate_state_from_bigym(q_full, qd_full)
-    ee_urdf = np.asarray(
-        oscbf.robot_model.ee_position(jnp.asarray(q_urdf, dtype=jnp.float32)),
-        dtype=np.float32,
-    ).reshape(3)
-    t_world_urdf = oscbf._get_world_T_urdf_from_bigym_state(q_full)
-    ee_world = np.asarray(
-        oscbf._transform_points_homogeneous(t_world_urdf, ee_urdf),
-        dtype=np.float64,
-    ).reshape(-1)
-    xy = ee_world[:2].copy()
-    if offset_xy is not None:
-        xy = xy + np.asarray(offset_xy, dtype=np.float64).reshape(2)
-    return xy
-
-def _robot_gripper_geom_world_xy(env, offset_xy=None):
-    try:
-        task = get_bigym_task(env)
-        model = task._mojo.model
-        data = task._mojo.data
-    except Exception:  # noqa: BLE001
-        return None
-
-    priority_patterns = (
-        ("robotiq_2f85_right", "finger"),
-        ("robotiq_2f85_right", "pad"),
-        ("robotiq_2f85_right", "driver"),
-        ("robotiq_2f85_right",),
-        ("right_wrist",),
-        ("wrist",),
-    )
-    exclude_patterns = ("visual", "camera", "left")
-
-    for patterns in priority_patterns:
-        points = []
-        for geom_id in range(model.ngeom):
-            name = (model.geom(geom_id).name or "").lower()
-            if not name:
-                continue
-            if any(excluded in name for excluded in exclude_patterns):
-                continue
-            if all(pattern in name for pattern in patterns):
-                points.append(np.asarray(data.geom_xpos[geom_id], dtype=np.float64).reshape(3))
-        if points:
-            xy = np.mean(np.stack(points, axis=0), axis=0)[:2]
-            if offset_xy is not None:
-                xy = xy + np.asarray(offset_xy, dtype=np.float64).reshape(2)
-            return xy
-
-    return None
-
-
-def _drawer_obstruction_carrier_xy(args, step: int = 0, dt: float = 0.05):
-    xy = np.asarray(args.human_arm_drawer_obstruction_xy, dtype=np.float64).reshape(2)
-    amp = np.asarray(args.human_arm_drawer_obstruction_amp_xy, dtype=np.float64).reshape(2)
-    phase = 2.0 * np.pi * float(args.human_arm_force_carrier_frequency) * float(step) * float(dt)
-    # Move locally around the drawer area without anchoring to the robot EE.
-    offset = np.array(
-        [
-            0.55 * np.sin(phase + 0.4) + 0.20 * np.sin(1.9 * phase),
-            0.45 * np.sin(phase + 1.7) + 0.15 * np.sin(1.4 * phase + 0.8),
-        ],
-        dtype=np.float64,
-    )
-    alpha = _smoothstep(_transient_human_arm_alpha(args, step))
-    return xy + (1.0 - alpha) * amp * offset
-
-
-def _ee_side_sweep_carrier_xy(args, anchor_xy, step: int = 0, dt: float = 0.05):
-    xy = np.asarray(anchor_xy, dtype=np.float64).reshape(2)
-    amp = np.asarray(args.human_arm_ee_side_sweep_amp_xy, dtype=np.float64).reshape(2)
-    phase = (
-        2.0 * np.pi * float(args.human_arm_ee_side_sweep_frequency) * float(step) * float(dt)
-        + float(getattr(args, "human_arm_ee_side_sweep_phase", 0.0))
-    )
-    offset = np.array(
-        [
-            0.35 * np.sin(0.5 * phase + 0.3),
-            np.sin(phase),
-        ],
-        dtype=np.float64,
-    )
-    alpha = _smoothstep(_transient_human_arm_alpha(args, step))
-    return xy + (1.0 - alpha) * amp * offset
-
-
-def _forced_human_arm_carrier_xy(args, step: int = 0, dt: float = 0.05, anchor_xy=None):
-    if (
-        anchor_xy is None
-        and args.human_arm_force_carrier_xy is None
-        and not args.human_arm_transient_obstruction
-        and not args.human_arm_drawer_obstruction
-    ):
-        return None
-    if anchor_xy is not None:
-        if args.human_arm_ee_side_sweep:
-            xy = _ee_side_sweep_carrier_xy(args, anchor_xy, step=step, dt=dt)
-        else:
-            xy = np.asarray(anchor_xy, dtype=np.float64).reshape(2)
-    elif args.human_arm_drawer_obstruction:
-        xy = _drawer_obstruction_carrier_xy(args, step=step, dt=dt)
-    elif args.human_arm_force_carrier_xy is None:
-        xy = np.asarray([-0.5, 0.2], dtype=np.float64)
-    else:
-        xy = np.asarray(args.human_arm_force_carrier_xy, dtype=np.float64).reshape(2)
-
-    if args.human_arm_force_carrier_amp_xy is not None:
-        amp = np.asarray(args.human_arm_force_carrier_amp_xy, dtype=np.float64).reshape(2)
-        phase = 2.0 * np.pi * float(args.human_arm_force_carrier_frequency) * float(step) * float(dt)
-        offset = np.array([np.sin(phase), np.sin(phase + 0.5 * np.pi)], dtype=np.float64)
-        alpha = _smoothstep(_transient_human_arm_alpha(args, step))
-        xy = xy + (1.0 - alpha) * amp * offset
-
-    alpha = _smoothstep(_transient_human_arm_alpha(args, step))
-    if alpha > 0.0:
-        release_xy = np.asarray(args.human_arm_release_carrier_xy, dtype=np.float64).reshape(2)
-        xy = (1.0 - alpha) * xy + alpha * release_xy
-    return xy
-
-
-def _force_human_arm_carrier_xy(env, carrier_xy, args=None) -> int:
-    if carrier_xy is None:
-        return 0
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-    xy = np.asarray(carrier_xy, dtype=np.float64).reshape(2)
-    forced = 0
-    for human in humanarms:
-        if not hasattr(human, "_set_kinematic_state"):
-            continue
-        if hasattr(human, "_qpos_filt"):
-            joint_q = np.asarray(human._qpos_filt, dtype=np.float64).copy()
-        else:
-            joint_q = np.asarray(human.get_state()["qpos"], dtype=np.float64).copy()
-        joint_q = _apply_human_arm_yaw_offset(human, args, joint_q, current_state=True) if args is not None else joint_q
-        human._set_kinematic_state(xy, joint_q)
-        try:
-            task = get_bigym_task(env)
-            task._mojo.physics.forward()
-        except Exception:  # noqa: BLE001
-            pass
-        if hasattr(human, "_walk_xy"):
-            human._walk_xy = xy.copy()
-        if hasattr(human, "_walk_goal_xy"):
-            human._walk_goal_xy = xy.copy()
-        if hasattr(human, "_walk_v"):
-            human._walk_v[:] = 0.0
-        forced += 1
-    return forced
-
-
-
-def _reset_human_arm_final_clear_state(args) -> None:
-    for name in (
-        "_human_arm_final_clear_y_last",
-        "_human_arm_final_clear_y_prev_delta",
-        "_human_arm_final_clear_y_peak_step",
-    ):
-        if hasattr(args, name):
-            delattr(args, name)
-
-
-def _human_arm_final_clear_start_step(args) -> int:
-    configured_start = int(getattr(args, "human_arm_final_clear_after_steps", -1))
-    if configured_start < 0:
-        return -1
-    trigger = str(getattr(args, "human_arm_final_clear_trigger", "step"))
-    peak_step = getattr(args, "_human_arm_final_clear_y_peak_step", None)
-    if trigger == "carrier-y-peak" and peak_step is not None:
-        return int(peak_step)
-    return configured_start
-
-
-def _human_arm_final_clear_alpha(args, step: int) -> float:
-    start = _human_arm_final_clear_start_step(args)
-    if start < 0:
-        return 0.0
-    duration = max(1, int(getattr(args, "human_arm_final_clear_duration_steps", 20)))
-    return _smoothstep(float(np.clip((int(step) - start) / duration, 0.0, 1.0)))
-
-
-def _update_human_arm_final_clear_y_peak_trigger(args, step: int, carrier_xy) -> None:
-    if int(getattr(args, "human_arm_final_clear_after_steps", -1)) < 0:
-        return
-    if str(getattr(args, "human_arm_final_clear_trigger", "step")) != "carrier-y-peak":
-        return
-    if getattr(args, "_human_arm_final_clear_y_peak_step", None) is not None:
-        return
-    if carrier_xy is None:
-        return
-    y = float(np.asarray(carrier_xy, dtype=np.float64).reshape(2)[1])
-    last_y = getattr(args, "_human_arm_final_clear_y_last", None)
-    prev_delta = getattr(args, "_human_arm_final_clear_y_prev_delta", None)
-    if last_y is not None:
-        delta = y - float(last_y)
-        eps = 1e-5
-        if prev_delta is not None and float(prev_delta) > eps and delta <= eps:
-            setattr(args, "_human_arm_final_clear_y_peak_step", int(step))
-        setattr(args, "_human_arm_final_clear_y_prev_delta", float(delta))
-    setattr(args, "_human_arm_final_clear_y_last", y)
-
-
-def _limited_step_toward(current, target, max_step: float) -> np.ndarray:
-    current = np.asarray(current, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    delta = target - current
-    norm = float(np.linalg.norm(delta))
-    if norm <= max_step or norm <= 1e-12:
-        return target.copy()
-    return current + delta * (float(max_step) / norm)
-
-
-def _apply_final_human_arm_clearance(env, args, step: int, dt: float = 0.05) -> int:
-    alpha = _human_arm_final_clear_alpha(args, step)
-    if alpha <= 0.0:
-        return 0
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-
-    start_step = _human_arm_final_clear_start_step(args)
-    dt = max(float(dt), 1e-9)
-    max_carrier_step = float(args.human_arm_final_clear_max_carrier_speed) * dt
-    max_joint_step = float(args.human_arm_final_clear_max_joint_speed) * dt
-    target_xy = np.asarray(
-        getattr(args, "human_arm_final_clear_carrier_xy", [-0.85, 0.55]),
-        dtype=np.float64,
-    ).reshape(2)
-    applied = 0
-    for human in humanarms:
-        if not hasattr(human, "_set_kinematic_state"):
-            continue
-        if hasattr(human, "_walk_xy"):
-            current_xy = np.asarray(human._walk_xy, dtype=np.float64).reshape(2)
-        elif hasattr(human, "_carrier_qpos_adr") and hasattr(human, "_physics"):
-            current_xy = np.asarray(
-                human._physics.data.qpos[human._carrier_qpos_adr],
-                dtype=np.float64,
-            ).reshape(2)
-        else:
-            current_xy = target_xy.copy()
-
-        if hasattr(human, "_qpos_filt"):
-            current_q = np.asarray(human._qpos_filt, dtype=np.float64).copy()
-        else:
-            current_q = np.asarray(human.get_state()["qpos"], dtype=np.float64).copy()
-        if getattr(human, "_eval_final_clear_start_step", None) != start_step:
-            human._eval_final_clear_start_step = start_step
-            human._eval_final_clear_start_xy = current_xy.copy()
-            human._eval_final_clear_start_q = current_q.copy()
-
-        start_xy = np.asarray(human._eval_final_clear_start_xy, dtype=np.float64).reshape(2)
-        start_q = np.asarray(human._eval_final_clear_start_q, dtype=np.float64).copy()
-        target_q = _apply_human_arm_yaw_offset(
-            human,
-            args,
-            _human_arm_retracted_q(human),
-        )
-        desired_xy = (1.0 - alpha) * start_xy + alpha * target_xy
-        desired_q = (1.0 - alpha) * start_q + alpha * target_q
-        xy = _limited_step_toward(current_xy, desired_xy, max_carrier_step)
-        q = _limited_step_toward(current_q, desired_q, max_joint_step)
-        if hasattr(human, "_clip_joint_vec"):
-            q = human._clip_joint_vec(q)
-
-        if hasattr(human, "_qpos_filt"):
-            human._qpos_filt = q.copy()
-        if hasattr(human, "_qvel_filt"):
-            human._qvel_filt[:] = (q - current_q) / dt
-        if hasattr(human, "_qpos_target"):
-            human._qpos_target[:] = q
-        if hasattr(human, "_walk_xy"):
-            human._walk_xy = xy.copy()
-        if hasattr(human, "_walk_goal_xy"):
-            human._walk_goal_xy = target_xy.copy()
-        if hasattr(human, "_walk_v"):
-            human._walk_v[:] = 0.0
-        if hasattr(human, "_carrier_dwell"):
-            human._carrier_dwell = 0.0
-        human._set_kinematic_state(xy, q)
-        applied += 1
-
-    try:
-        task = get_bigym_task(env)
-        task._mojo.physics.forward()
-    except Exception:  # noqa: BLE001
-        pass
-    return applied
-
-
-def _human_arm_contact_geom_center_xy(env):
-    try:
-        import mujoco
-
-        task = get_bigym_task(env)
-        model = task._mojo.model
-        data = task._mojo.data
-        centers = []
-        humanarms = getattr(task, "humanarms", [])
-        for human in humanarms:
-            for geom_name in ("forearm_geom", "upperarm_geom"):
-                gid = mujoco.mj_name2id(
-                    model,
-                    mujoco.mjtObj.mjOBJ_GEOM,
-                    human._pref(geom_name),
-                )
-                if gid >= 0:
-                    centers.append(np.asarray(data.geom_xpos[gid], dtype=np.float64).reshape(3))
-        if not centers:
-            return None
-        return np.mean(np.stack(centers, axis=0), axis=0)[:2]
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _align_human_arm_contact_geoms_to_xy(env, target_xy) -> bool:
-    if target_xy is None:
-        return False
-    center_xy = _human_arm_contact_geom_center_xy(env)
-    if center_xy is None:
-        return False
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return False
-    target_xy = np.asarray(target_xy, dtype=np.float64).reshape(2)
-    shifted = False
-    for human in humanarms:
-        if not hasattr(human, "_set_kinematic_state"):
-            continue
-        if hasattr(human, "_walk_xy"):
-            current_xy = np.asarray(human._walk_xy, dtype=np.float64).reshape(2)
-        else:
-            state = human.get_state()
-            current_xy = np.asarray(state.get("walk_xy", [0.0, 0.0]), dtype=np.float64).reshape(2)
-        shifted_xy = current_xy + (target_xy - center_xy)
-        _force_human_arm_carrier_xy(env, shifted_xy)
-        shifted = True
-    return shifted
-
-
-def _bias_human_arm_goals(env, goal_xy) -> int:
-    if goal_xy is None:
-        return 0
-    humanarms = _find_wrapped_attr(env, "humanarms")
-    if not humanarms:
-        return 0
-    return sum(1 for human in humanarms if _bias_human_arm_goal(human, goal_xy))
-
-
-def _make_policy_env_cfg(cfg, policy_env: str):
-    if not policy_env.startswith("bigym/"):
-        raise ValueError(
-            "--policy-env currently expects a BiGym env name like "
-            f"'bigym/drawer_top_open', got {policy_env!r}."
-        )
-    policy_cfg = copy.deepcopy(cfg)
-    policy_cfg.env.task_name = policy_env.split("/", 1)[1]
-    return policy_cfg
-
-
-def _joint_qpos_qvel_dims(model, joint_id):
-    import mujoco
-
-    joint_type = model.jnt_type[joint_id]
-    if joint_type == mujoco.mjtJoint.mjJNT_FREE:
-        return 7, 6
-    if joint_type == mujoco.mjtJoint.mjJNT_BALL:
-        return 4, 3
-    return 1, 1
-
-
-def _sync_named_mujoco_state(source_env, target_env) -> dict[str, int]:
-    source_task = _find_wrapped_env_with_attr(source_env, "mojo")
-    target_task = _find_wrapped_env_with_attr(target_env, "mojo")
-    if source_task is None or target_task is None:
-        raise RuntimeError("Could not find source/target BiGym envs for state mirroring.")
-
-    import mujoco
-
-    src_model = source_task.mojo.physics.model.ptr
-    src_data = source_task.mojo.physics.data
-    dst_model = target_task.mojo.physics.model.ptr
-    dst_data = target_task.mojo.physics.data
-
-    dst_data.time = src_data.time
-
-    copied_joints = 0
-    for src_jid in range(src_model.njnt):
-        name = mujoco.mj_id2name(src_model, mujoco.mjtObj.mjOBJ_JOINT, src_jid)
-        if not name:
-            continue
-        dst_jid = mujoco.mj_name2id(dst_model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if dst_jid < 0:
-            continue
-
-        src_nq, src_nv = _joint_qpos_qvel_dims(src_model, src_jid)
-        dst_nq, dst_nv = _joint_qpos_qvel_dims(dst_model, dst_jid)
-        if src_nq != dst_nq or src_nv != dst_nv:
-            continue
-
-        src_qadr = src_model.jnt_qposadr[src_jid]
-        dst_qadr = dst_model.jnt_qposadr[dst_jid]
-        src_dadr = src_model.jnt_dofadr[src_jid]
-        dst_dadr = dst_model.jnt_dofadr[dst_jid]
-        dst_data.qpos[dst_qadr : dst_qadr + dst_nq] = src_data.qpos[src_qadr : src_qadr + src_nq]
-        dst_data.qvel[dst_dadr : dst_dadr + dst_nv] = src_data.qvel[src_dadr : src_dadr + src_nv]
-        copied_joints += 1
-
-    copied_actuators = 0
-    for src_aid in range(src_model.nu):
-        name = mujoco.mj_id2name(src_model, mujoco.mjtObj.mjOBJ_ACTUATOR, src_aid)
-        if not name:
-            continue
-        dst_aid = mujoco.mj_name2id(dst_model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-        if dst_aid < 0:
-            continue
-        dst_data.ctrl[dst_aid] = src_data.ctrl[src_aid]
-        copied_actuators += 1
-
-    target_task.mojo.physics.forward()
-    return {"joints": copied_joints, "actuators": copied_actuators}
-
-
-def _sync_animated_legs(env, is_moving: bool = True) -> bool:
-    task = _find_wrapped_env_with_attr(env, "_robot")
-    if task is None:
-        return False
-    floating_base = getattr(task._robot, "floating_base", None)
-    if floating_base is None:
-        return False
-    animated_legs = getattr(floating_base, "_animated_legs", None)
-    if animated_legs is None:
-        return False
-    animated_legs.step(floating_base._pelvis_z, is_moving=is_moving)
-    task.mojo.physics.forward()
-    return True
-
-
-def _update_scripted_human_arm_pose(env, args, step: int, anchor_xy=None) -> int:
-    if env is None or args.freeze_human_arm:
-        return 0
-    runtime = env.unwrapped if hasattr(env, "unwrapped") else env
-    human_motion_dt = runtime.dt if hasattr(runtime, "dt") else 0.05
-    forced_xy = _forced_human_arm_carrier_xy(
-        args,
-        step=step,
-        dt=human_motion_dt,
-        anchor_xy=anchor_xy,
-    )
-    _update_human_arm_final_clear_y_peak_trigger(args, step, forced_xy)
-    final_clear_active = _human_arm_final_clear_alpha(args, step) > 0.0
-    advanced = 0
-    if not final_clear_active:
-        advanced = _advance_human_arm_only(
-            env,
-            substeps=args.human_arm_substeps,
-            goal_xy=args.human_arm_goal_xy,
-        )
-        _force_human_arm_carrier_xy(env, forced_xy, args=args)
-        _apply_natural_human_arm_contact_motion(
-            env,
-            args,
-            step=step,
-            dt=human_motion_dt,
-        )
-        _force_human_arm_carrier_xy(env, forced_xy, args=args)
-        if anchor_xy is not None and forced_xy is not None:
-            _align_human_arm_contact_geoms_to_xy(env, forced_xy)
-    _apply_final_human_arm_clearance(env, args, step, dt=human_motion_dt)
-    _sync_animated_legs(env, is_moving=True)
-    return advanced
-
-
-def _advance_human_arm_only(env, substeps: int = 1, goal_xy=None) -> int:
-    task = _find_wrapped_env_with_attr(env, "humanarms")
-    if task is None:
-        return 0
-    dt = task.get_dt() if hasattr(task, "get_dt") else 0.05
-    substeps = max(1, int(substeps))
-    advanced = 0
-    for _ in range(substeps):
-        for human in task.humanarms:
-            _bias_human_arm_goal(human, goal_xy)
-            human._on_step(dt)
-            advanced += 1
-    task.mojo.physics.forward()
-    return advanced
-
-
-def _human_arm_geom_ids(env) -> list[int]:
-    base_env = _find_wrapped_env_with_attr(env, "mojo")
-    if base_env is None:
-        return []
-
-    import mujoco
-
-    model = base_env.mojo.physics.model.ptr
-    geom_ids = []
-    for gid in range(model.ngeom):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
-        if name.startswith("cylinder_arm/"):
-            geom_ids.append(gid)
-    return geom_ids
-
-
-def _render_visual_obs_with_hidden_human_arm(env) -> dict[str, np.ndarray]:
-    base_env = _find_wrapped_env_with_attr(env, "_get_visual_obs")
-    if base_env is None or not hasattr(base_env, "mojo"):
-        raise RuntimeError("Could not find underlying BiGym env for clean policy rendering.")
-
-    geom_ids = _human_arm_geom_ids(env)
-    if not geom_ids:
-        return base_env._get_visual_obs()
-
-    model = base_env.mojo.physics.model.ptr
-    old_rgba = model.geom_rgba[geom_ids].copy()
-    try:
-        model.geom_rgba[geom_ids, 3] = 0.0
-        return base_env._get_visual_obs()
-    finally:
-        model.geom_rgba[geom_ids] = old_rgba
-
-
-def _policy_obs_with_hidden_human_arm(env, obs, prev_policy_obs=None):
-    policy_obs = copy.deepcopy(obs)
-    visual_obs = _render_visual_obs_with_hidden_human_arm(env)
-
-    for key, clean_frame in visual_obs.items():
-        if not key.startswith("rgb_") or key not in policy_obs:
-            continue
-
-        current = np.asarray(policy_obs[key])
-        clean_frame = np.asarray(clean_frame, dtype=current.dtype)
-
-        if current.ndim == clean_frame.ndim + 1:
-            if prev_policy_obs is None or key not in prev_policy_obs:
-                policy_obs[key] = np.repeat(clean_frame[None], current.shape[0], axis=0)
-            else:
-                previous = np.asarray(prev_policy_obs[key], dtype=current.dtype)
-                policy_obs[key] = np.concatenate([previous[1:], clean_frame[None]], axis=0)
-        elif current.shape == clean_frame.shape:
-            policy_obs[key] = clean_frame
-        else:
-            raise ValueError(
-                f"Cannot replace policy RGB observation {key}: "
-                f"wrapped shape={current.shape}, clean frame shape={clean_frame.shape}."
-            )
-
-    return policy_obs
-
-
-def _adapt_policy_obs_to_space(policy_obs, observation_space):
-    if observation_space is None or not isinstance(policy_obs, dict):
-        return policy_obs
-
-    adapted = dict(policy_obs)
-    for key, space in observation_space.items():
-        if key not in adapted or not hasattr(space, "shape"):
-            continue
-        expected_shape = tuple(int(x) for x in space.shape)
-        value = np.asarray(adapted[key])
-        if value.shape == expected_shape:
-            continue
-
-        if (
-            key == "low_dim_state"
-            and value.ndim == len(expected_shape)
-            and value.shape[:-1] == expected_shape[:-1]
-            and value.shape[-1] >= expected_shape[-1]
-        ):
-            adapted[key] = value[..., : expected_shape[-1]].astype(value.dtype, copy=False)
-            continue
-
-        if key == "low_dim_state" and value.size >= int(np.prod(expected_shape)):
-            flat = value.reshape(-1)[: int(np.prod(expected_shape))]
-            adapted[key] = flat.reshape(expected_shape).astype(value.dtype, copy=False)
-            continue
-
-        raise ValueError(
-            f"Policy observation {key!r} has shape {value.shape}, "
-            f"but the loaded policy expects {expected_shape}."
-        )
-    return adapted
-
-
-def _downsample(values, width):
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0 or values.size <= width:
-        return values
-    x = np.linspace(0, values.size - 1, num=values.size)
-    xp = np.linspace(0, values.size - 1, num=width)
-    return np.interp(xp, x, values)
-
-
-def _ascii_plot_lines(title, values, width=80, height=10):
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0:
-        return []
-    finite = np.isfinite(values)
-    if not finite.any():
-        return []
-    values = np.where(finite, values, np.nan)
-    values = _downsample(values, min(width, max(1, len(values))))
-    min_v = float(np.nanmin(values))
-    max_v = float(np.nanmax(values))
-    if max_v == min_v:
-        min_v -= 0.5
-        max_v += 0.5
-    span = max_v - min_v
-
-    lines = [f"{title} (steps={len(values)}): {min_v:.4g} .. {max_v:.4g}"]
-    for row in range(height, 0, -1):
-        threshold = min_v + (row - 1) / (height - 1) * span
-        line = "".join(
-            "*" if (not np.isnan(v) and v >= threshold) else " "
-            for v in values
-        )
-        lines.append(line)
-    lines.append("-" * len(values))
-    return lines
-
-
-def _ascii_plot(title, values, width=80, height=10):
-    for line in _ascii_plot_lines(title, values, width=width, height=height):
-        print(line)
-
-
 def _make_progress_bar(*args, **kwargs):
     if tqdm is None:
         return None
@@ -3510,838 +231,190 @@ def _make_progress_bar(*args, **kwargs):
         **kwargs,
     )
 
-
-def _plot_episode_metrics(episode, episode_metrics):
-    reward_values = [m.reward for m in episode_metrics]
-    min_h_values = [float("nan") if m.min_h is None else m.min_h for m in episode_metrics]
-    arm_delta_values = [m.arm_delta for m in episode_metrics]
-    non_arm_delta_values = [m.non_arm_delta for m in episode_metrics]
-    contact_values = [m.contact_count for m in episode_metrics]
-
-    _ascii_plot(f"Episode {episode:03d} reward", reward_values)
-    _ascii_plot(f"Episode {episode:03d} min_h", min_h_values)
-    _ascii_plot(f"Episode {episode:03d} arm_delta", arm_delta_values)
-    _ascii_plot(f"Episode {episode:03d} non_arm_delta", non_arm_delta_values)
-    _ascii_plot(f"Episode {episode:03d} contact_count", contact_values)
-
-
-def _plot_episode_metrics_lines(episode, episode_metrics, width=80, height=10):
-    reward_values = [m.reward for m in episode_metrics]
-    min_h_values = [float("nan") if m.min_h is None else m.min_h for m in episode_metrics]
-    arm_delta_values = [m.arm_delta for m in episode_metrics]
-    non_arm_delta_values = [m.non_arm_delta for m in episode_metrics]
-    contact_values = [m.contact_count for m in episode_metrics]
-
-    lines = []
-    lines.extend(_ascii_plot_lines(f"Episode {episode:03d} reward", reward_values, width=width, height=height))
-    lines.extend(_ascii_plot_lines(f"Episode {episode:03d} min_h", min_h_values, width=width, height=height))
-    lines.extend(_ascii_plot_lines(f"Episode {episode:03d} arm_delta", arm_delta_values, width=width, height=height))
-    lines.extend(_ascii_plot_lines(f"Episode {episode:03d} non_arm_delta", non_arm_delta_values, width=width, height=height))
-    lines.extend(_ascii_plot_lines(f"Episode {episode:03d} contact_count", contact_values, width=width, height=height))
-    return lines
-
-
 def make_oscbf_filter(args) -> OSCBFFilter:
+    eager_cbf_conditions = {
+        "oscbf",
+        "sequential",
+        "sequential_oscbf",
+        "chunk_deform",
+        "path_consistent_brake",
+    }
+    sf = _args_safety_filter(args)
+    oscbf_cfg = _safety_filter_section(args, "oscbf_operator") or sf
+    urdf_path = oscbf_cfg.get("urdf_path") or H1_URDF
     return OSCBFFilter(
-        urdf_path=str(H1_URDF),
-        debug=args.debug,
-        use_dummy_filter=False,
-        dummy_scale=0.5,
-        control_type="absolute",
-        max_action_delta=args.max_action_delta,
-        human_margin=args.oscbf_human_margin,
-        alpha_gain=args.oscbf_alpha_gain,
-        pelvis_velocity_limits=args.oscbf_pelvis_velocity_limits,
-        pelvis_cbf_weight=args.oscbf_pelvis_weight,
-        arm_cbf_weight=args.oscbf_arm_weight,
+        urdf_path=str(urdf_path),
+        debug=bool(sf.get("debug", oscbf_cfg.get("debug", getattr(args, "debug", False)))),
+        use_dummy_filter=bool(sf.get("use_dummy_filter", oscbf_cfg.get("use_dummy_filter", False))),
+        dummy_scale=float(sf.get("dummy_scale", oscbf_cfg.get("dummy_scale", 0.5))),
+        control_type=str(sf.get("control_type", oscbf_cfg.get("control_type", "absolute"))),
+        max_action_delta=sf.get("max_action_delta", oscbf_cfg.get("max_action_delta")),
+        human_margin=float(sf.get("human_margin", oscbf_cfg.get("human_margin", 0.08))),
+        alpha_gain=float(sf.get("alpha_gain", oscbf_cfg.get("alpha_gain", 10.0))),
+        pelvis_velocity_limits=sf.get(
+            "pelvis_velocity_limits",
+            oscbf_cfg.get(
+                "pelvis_velocity_limits",
+                DEFAULT_EVAL_ARGS.get("oscbf_pelvis_velocity_limits"),
+            ),
+        ),
+        pelvis_cbf_weight=float(
+            sf.get(
+                "pelvis_cbf_weight",
+                oscbf_cfg.get(
+                    "pelvis_cbf_weight",
+                    DEFAULT_EVAL_ARGS.get("oscbf_pelvis_weight", 1.0),
+                ),
+            )
+        ),
+        arm_cbf_weight=float(
+            sf.get(
+                "arm_cbf_weight",
+                oscbf_cfg.get(
+                    "arm_cbf_weight",
+                    DEFAULT_EVAL_ARGS.get("oscbf_arm_weight", 1.0),
+                ),
+            )
+        ),
+        build_cbf_eagerly=args.condition in eager_cbf_conditions,
     )
 
+def _nested_safechunk_cfg_from_eval(
+    args,
+    operator: HorizonOSCBFOperator,
+    oscbf: Optional[OSCBFFilter] = None,
+) -> dict[str, Any]:
+    """Map eval configs/overrides into SafeChunkDeformFilter's nested cfg."""
+    sf = _args_safety_filter(args)
+    nested = copy.deepcopy(sf.get("cfg", {})) if isinstance(sf.get("cfg"), dict) else {}
+    filter_cfg = nested.setdefault("safety_filter", {})
+    intervention_cfg = nested.setdefault("intervention", {})
+    brake_cfg = intervention_cfg.setdefault("brake", {})
+    deform_cfg = intervention_cfg.setdefault("deform", {})
+    recovery_cfg = intervention_cfg.setdefault("recovery", {})
 
-
-class HorizonOSCBFOperator:
-    def __init__(
-        self,
-        oscbf: OSCBFFilter,
-        min_clearance: float,
-        dt: float = 0.05,
-        predict_human_motion: bool = True,
-        human_prediction_max_time: Optional[float] = 0.25,
-        human_prediction_max_speed: Optional[float] = 3.0,
-    ):
-        self.oscbf = oscbf
-        self.min_clearance = float(min_clearance)
-        self.dt = float(dt)
-        self.predict_human_motion = bool(predict_human_motion)
-        self.human_prediction_max_time = (
-            None
-            if human_prediction_max_time is None or human_prediction_max_time <= 0
-            else float(human_prediction_max_time)
-        )
-        self.human_prediction_max_speed = (
-            None
-            if human_prediction_max_speed is None or human_prediction_max_speed <= 0
-            else float(human_prediction_max_speed)
-        )
-        self.env = None
-        self.obs = None
-        self.q_full = None
-        self.qd_full = None
-        self._prev_capsule_a_world = None
-        self._prev_capsule_b_world = None
-        self._prev_capsule_radii = None
-        self._capsule_a_velocity_world = None
-        self._capsule_b_velocity_world = None
-        self._human_motion_prediction_available = False
-        self._human_motion_prediction_speed = 0.0
-        self._human_obstacles_cache = None
-        self._human_rollout_cache = {}
-        self._human_obstacle_extract_time_ms = 0.0
-        self._human_obstacle_cache_hits = 0
-        self._human_obstacle_cache_misses = 0
-        self._batched_h_fn = jax.jit(
-            jax.vmap(
-                lambda q, capsule_a, capsule_b, capsule_radii: self.oscbf.oscbf_config.h_1(
-                    q,
-                    capsule_a=capsule_a,
-                    capsule_b=capsule_b,
-                    capsule_radii=capsule_radii,
-                ),
-                in_axes=(0, 0, 0, None),
-            )
-        )
-        self._chunk_filter_fns = {}
-
-    def set_context(self, env, obs, q_full: np.ndarray, qd_full: np.ndarray):
-        self.env = env
-        self.obs = obs
-        self.q_full = np.asarray(q_full, dtype=np.float32).reshape(-1)
-        self.qd_full = np.asarray(qd_full, dtype=np.float32).reshape(-1)
-        self._human_obstacles_cache = None
-        self._human_rollout_cache = {}
-        self._human_obstacle_extract_time_ms = 0.0
-        self._human_obstacle_cache_hits = 0
-        self._human_obstacle_cache_misses = 0
-        self._update_human_capsule_velocity()
-
-    def reset_human_motion_prediction(self):
-        self._prev_capsule_a_world = None
-        self._prev_capsule_b_world = None
-        self._prev_capsule_radii = None
-        self._capsule_a_velocity_world = None
-        self._capsule_b_velocity_world = None
-        self._human_motion_prediction_available = False
-        self._human_motion_prediction_speed = 0.0
-        self._human_obstacles_cache = None
-        self._human_rollout_cache = {}
-        self._human_obstacle_extract_time_ms = 0.0
-        self._human_obstacle_cache_hits = 0
-        self._human_obstacle_cache_misses = 0
-
-    def _limit_capsule_velocity(self, velocity):
-        if self.human_prediction_max_speed is None:
-            return velocity
-        velocity = np.asarray(velocity, dtype=np.float32)
-        norm = np.linalg.norm(velocity, axis=-1, keepdims=True)
-        scale = np.minimum(
-            1.0,
-            self.human_prediction_max_speed / np.maximum(norm, 1e-9),
-        )
-        return velocity * scale
-
-    def _update_human_capsule_velocity(self):
-        self._human_motion_prediction_available = False
-        self._human_motion_prediction_speed = 0.0
-        if self.env is None:
-            return
-        try:
-            t0 = time.perf_counter()
-            human_obstacles = self.oscbf._extract_human_obstacles(self.env, self.obs)
-            self._human_obstacle_extract_time_ms = 1000.0 * (time.perf_counter() - t0)
-            capsule_a = np.asarray(human_obstacles["capsule_a"], dtype=np.float32)
-            capsule_b = np.asarray(human_obstacles["capsule_b"], dtype=np.float32)
-            capsule_radii = np.asarray(
-                human_obstacles["capsule_radii"],
-                dtype=np.float32,
-            )
-            self._human_obstacles_cache = {
-                "capsule_a": capsule_a.copy(),
-                "capsule_b": capsule_b.copy(),
-                "capsule_radii": capsule_radii.copy(),
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Human capsule velocity update failed: %s", exc)
-            return
-
-        if not self.predict_human_motion:
-            self._prev_capsule_a_world = capsule_a.copy()
-            self._prev_capsule_b_world = capsule_b.copy()
-            self._prev_capsule_radii = capsule_radii.copy()
-            return
-
-        if (
-            self._prev_capsule_a_world is not None
-            and self._prev_capsule_b_world is not None
-            and self._prev_capsule_radii is not None
-            and capsule_a.shape == self._prev_capsule_a_world.shape
-            and capsule_b.shape == self._prev_capsule_b_world.shape
-            and capsule_radii.shape == self._prev_capsule_radii.shape
-        ):
-            dt = max(float(self.dt), 1e-6)
-            a_velocity = (capsule_a - self._prev_capsule_a_world) / dt
-            b_velocity = (capsule_b - self._prev_capsule_b_world) / dt
-            a_velocity = self._limit_capsule_velocity(a_velocity)
-            b_velocity = self._limit_capsule_velocity(b_velocity)
-            self._capsule_a_velocity_world = a_velocity.astype(np.float32)
-            self._capsule_b_velocity_world = b_velocity.astype(np.float32)
-            endpoint_speeds = np.concatenate(
-                [
-                    np.linalg.norm(a_velocity, axis=-1),
-                    np.linalg.norm(b_velocity, axis=-1),
-                ]
-            )
-            self._human_motion_prediction_speed = float(np.max(endpoint_speeds))
-            self._human_motion_prediction_available = bool(
-                np.isfinite(self._human_motion_prediction_speed)
-                and self._human_motion_prediction_speed > 1e-9
-            )
-        else:
-            self._capsule_a_velocity_world = None
-            self._capsule_b_velocity_world = None
-
-        self._prev_capsule_a_world = capsule_a.copy()
-        self._prev_capsule_b_world = capsule_b.copy()
-        self._prev_capsule_radii = capsule_radii.copy()
-
-    def _current_human_obstacles(self, obs=None):
-        if self._human_obstacles_cache is not None:
-            self._human_obstacle_cache_hits += 1
-            return self._human_obstacles_cache, True
-        self._human_obstacle_cache_misses += 1
-        t0 = time.perf_counter()
-        human_obstacles = self.oscbf._extract_human_obstacles(
-            self.env,
-            self.obs if obs is None else obs,
-        )
-        self._human_obstacle_extract_time_ms += 1000.0 * (time.perf_counter() - t0)
-        capsule_a = np.asarray(human_obstacles["capsule_a"], dtype=np.float32)
-        capsule_b = np.asarray(human_obstacles["capsule_b"], dtype=np.float32)
-        capsule_radii = np.asarray(human_obstacles["capsule_radii"], dtype=np.float32)
-        self._human_obstacles_cache = {
-            "capsule_a": capsule_a.copy(),
-            "capsule_b": capsule_b.copy(),
-            "capsule_radii": capsule_radii.copy(),
-        }
-        return self._human_obstacles_cache, False
-
-    def _human_capsule_rollout_cached(self, obs, horizon):
-        horizon = int(horizon)
-        cached = self._human_rollout_cache.get(horizon)
-        if cached is not None:
-            a_seq, b_seq, radii, info = cached
-            info = dict(info)
-            info.update(
-                {
-                    "human_obstacles_cached": True,
-                    "human_rollout_cached": True,
-                    "human_obstacle_cache_hits": int(self._human_obstacle_cache_hits),
-                    "human_obstacle_cache_misses": int(self._human_obstacle_cache_misses),
-                    "human_obstacle_extract_time_ms": float(self._human_obstacle_extract_time_ms),
-                }
-            )
-            return a_seq, b_seq, radii, info
-
-        human_obstacles, obstacle_cached = self._current_human_obstacles(obs)
-        a_seq, b_seq, radii, info = self._human_capsule_rollout(
-            human_obstacles["capsule_a"],
-            human_obstacles["capsule_b"],
-            human_obstacles["capsule_radii"],
-            horizon,
-        )
-        info = dict(info)
-        info.update(
-            {
-                "human_obstacles_cached": bool(obstacle_cached),
-                "human_rollout_cached": False,
-                "human_obstacle_cache_hits": int(self._human_obstacle_cache_hits),
-                "human_obstacle_cache_misses": int(self._human_obstacle_cache_misses),
-                "human_obstacle_extract_time_ms": float(self._human_obstacle_extract_time_ms),
-            }
-        )
-        self._human_rollout_cache[horizon] = (
-            np.asarray(a_seq, dtype=np.float32).copy(),
-            np.asarray(b_seq, dtype=np.float32).copy(),
-            np.asarray(radii, dtype=np.float32).copy(),
-            dict(info),
-        )
-        return a_seq, b_seq, radii, info
-
-    def _human_capsule_rollout(self, capsule_a_world, capsule_b_world, capsule_radii, horizon):
-        capsule_a_world = np.asarray(capsule_a_world, dtype=np.float32)
-        capsule_b_world = np.asarray(capsule_b_world, dtype=np.float32)
-        capsule_radii = np.asarray(capsule_radii, dtype=np.float32)
-        current_a = np.broadcast_to(
-            capsule_a_world[None, :, :],
-            (horizon,) + capsule_a_world.shape,
-        ).copy()
-        current_b = np.broadcast_to(
-            capsule_b_world[None, :, :],
-            (horizon,) + capsule_b_world.shape,
-        ).copy()
-
-        info = {
-            "human_motion_prediction_enabled": bool(self.predict_human_motion),
-            "human_motion_prediction_available": False,
-            "human_motion_prediction_dt": float(self.dt),
-            "human_motion_prediction_max_time": self.human_prediction_max_time,
-            "human_motion_prediction_max_speed": self.human_prediction_max_speed,
-            "human_motion_prediction_speed": float(self._human_motion_prediction_speed),
-            "human_motion_prediction_max_displacement": 0.0,
-        }
-        if (
-            not self.predict_human_motion
-            or not self._human_motion_prediction_available
-            or self._capsule_a_velocity_world is None
-            or self._capsule_b_velocity_world is None
-            or self._capsule_a_velocity_world.shape != capsule_a_world.shape
-            or self._capsule_b_velocity_world.shape != capsule_b_world.shape
-        ):
-            return current_a, current_b, capsule_radii, info
-
-        times = (np.arange(horizon, dtype=np.float32) + 1.0) * float(self.dt)
-        if self.human_prediction_max_time is not None:
-            times = np.minimum(times, float(self.human_prediction_max_time))
-        predicted_a = (
-            capsule_a_world[None, :, :]
-            + times[:, None, None] * self._capsule_a_velocity_world[None, :, :]
-        )
-        predicted_b = (
-            capsule_b_world[None, :, :]
-            + times[:, None, None] * self._capsule_b_velocity_world[None, :, :]
-        )
-        capsule_a_seq = np.concatenate([current_a, predicted_a], axis=1)
-        capsule_b_seq = np.concatenate([current_b, predicted_b], axis=1)
-        capsule_radii_pred = np.concatenate([capsule_radii, capsule_radii], axis=0)
-        info.update(
-            {
-                "human_motion_prediction_available": True,
-                "human_motion_prediction_max_displacement": float(
-                    self._human_motion_prediction_speed * float(np.max(times))
-                ),
-            }
-        )
-        return capsule_a_seq, capsule_b_seq, capsule_radii_pred, info
-
-    def __call__(self, action, obs=None, **kwargs):
-        return self.oscbf(
-            action=action,
-            env=kwargs.pop("env", self.env),
-            observations=kwargs.pop("observations", obs if obs is not None else self.obs),
-            q_full=kwargs.pop("q_full", self.q_full),
-            qd_full=kwargs.pop("qd_full", self.qd_full),
-            **kwargs,
-        )
-
-    def _ensure_chunk_filter_fn(self, use_pelvis_cbf: bool):
-        key = "pelvis" if use_pelvis_cbf else "arm"
-        cached = self._chunk_filter_fns.get(key)
-        if cached is not None:
-            return cached
-
-        cbf = (
-            self.oscbf._ensure_pelvis_cbf()
-            if use_pelvis_cbf
-            else self.oscbf._ensure_cbf()
-        )
-
-        @jax.jit
-        def _filter_chunk(
-            action_chunk,
-            q0_bigym,
-            capsule_a_world_seq,
-            capsule_b_world_seq,
-            capsule_radii,
-            bigym_action_base_indices,
-            bigym_action_arm_indices,
-            bigym_action_clip_indices,
-            bigym_state_base_indices,
-            bigym_state_arm_indices,
-            urdf_arm_joint_indices,
-            rollout_state_indices,
-            rollout_action_indices,
-            rollout_mode_ids,
-            arm_sign,
-            arm_offset,
-            urdf_neutral_q,
-            t_pelvis_urdf,
-            dt,
-            control_mode_id,
-            max_action_delta,
-        ):
-            r_pelvis_urdf = t_pelvis_urdf[:3, :3]
-            t_pelvis_urdf_vec = t_pelvis_urdf[:3, 3]
-
-            def urdf_state_and_world_pose(q_bigym):
-                q_arm_bigym = q_bigym[bigym_state_arm_indices]
-                q_arm_urdf = arm_sign * q_arm_bigym + arm_offset
-                q_urdf = urdf_neutral_q.at[urdf_arm_joint_indices].set(q_arm_urdf)
-
-                yaw = q_bigym[3]
-                cy = jnp.cos(yaw)
-                sy = jnp.sin(yaw)
-                zeros = jnp.asarray(0.0, dtype=q_bigym.dtype)
-                one = jnp.asarray(1.0, dtype=q_bigym.dtype)
-                r_world_pelvis = jnp.stack(
-                    (
-                        jnp.stack((cy, -sy, zeros)),
-                        jnp.stack((sy, cy, zeros)),
-                        jnp.stack((zeros, zeros, one)),
+    def move_flat(keys, section):
+        for key in keys:
+            if key not in sf:
+                continue
+            value = copy.deepcopy(sf[key])
+            if isinstance(value, dict) and isinstance(section.get(key), dict):
+                section[key] = OmegaConf.to_container(
+                    OmegaConf.merge(
+                        OmegaConf.create(section[key]),
+                        OmegaConf.create(value),
                     ),
-                    axis=0,
+                    resolve=True,
                 )
-                r_world_urdf = r_world_pelvis @ r_pelvis_urdf
-                t_world_urdf = q_bigym[:3] + r_world_pelvis @ t_pelvis_urdf_vec
-                return q_urdf, q_arm_bigym, q_arm_urdf, r_world_urdf, t_world_urdf
+            else:
+                section[key] = value
 
-            def arm_action_to_urdf_velocity(action, q_arm_urdf):
-                a_arm_bigym = action[bigym_action_arm_indices]
-                a_arm_urdf = arm_sign * a_arm_bigym + arm_offset
-                u_abs = (a_arm_urdf - q_arm_urdf) / dt
-                u_delta = arm_sign * a_arm_bigym / dt
-                u_velocity = arm_sign * a_arm_bigym
-                return jnp.where(
-                    control_mode_id == 0,
-                    u_abs,
-                    jnp.where(control_mode_id == 1, u_delta, u_velocity),
-                )
-
-            def urdf_velocity_to_arm_action(q_arm_urdf, u_arm_urdf):
-                a_abs = arm_sign * (q_arm_urdf + u_arm_urdf * dt - arm_offset)
-                a_delta = arm_sign * (u_arm_urdf * dt)
-                a_velocity = arm_sign * u_arm_urdf
-                return jnp.where(
-                    control_mode_id == 0,
-                    a_abs,
-                    jnp.where(control_mode_id == 1, a_delta, a_velocity),
-                )
-
-            def base_action_to_velocity(action):
-                a_base = action[bigym_action_base_indices]
-                u_delta = a_base / dt
-                return jnp.where(control_mode_id == 2, a_base, u_delta)
-
-            def base_velocity_to_action(u_base):
-                return jnp.where(control_mode_id == 2, u_base, u_base * dt)
-
-            def rollout_step(q_bigym, action):
-                selected = action[rollout_action_indices]
-                current = q_bigym[rollout_state_indices]
-                updated = jnp.where(
-                    rollout_mode_ids == 0,
-                    selected,
-                    jnp.where(
-                        rollout_mode_ids == 1,
-                        current + selected,
-                        current + dt * selected,
-                    ),
-                )
-                return q_bigym.at[rollout_state_indices].set(updated)
-
-            def step(q_bigym, step_inputs):
-                action, capsule_a_world, capsule_b_world = step_inputs
-                q_urdf, q_arm_bigym, q_arm_urdf, r_world_urdf, t_world_urdf = (
-                    urdf_state_and_world_pose(q_bigym)
-                )
-                del q_arm_bigym
-
-                if use_pelvis_cbf:
-                    z = jnp.concatenate((q_bigym[bigym_state_base_indices], q_urdf), axis=0)
-                    u_base_nom = base_action_to_velocity(action)
-                    u_arm_nom = arm_action_to_urdf_velocity(action, q_arm_urdf)
-                    u_aug_nom = jnp.concatenate((u_base_nom, u_arm_nom), axis=0)
-                    u_aug_safe = cbf.safety_filter(
-                        z,
-                        u_aug_nom,
-                        capsule_a_world,
-                        capsule_b_world,
-                        capsule_radii,
-                    )
-                    u_base_safe = u_aug_safe[: bigym_action_base_indices.shape[0]]
-                    u_arm_safe = u_aug_safe[bigym_action_base_indices.shape[0] :]
-                    safe_action = action
-                    safe_action = safe_action.at[bigym_action_base_indices].set(
-                        base_velocity_to_action(u_base_safe)
-                    )
-                    safe_action = safe_action.at[bigym_action_arm_indices].set(
-                        urdf_velocity_to_arm_action(q_arm_urdf, u_arm_safe)
-                    )
-                else:
-                    capsule_a_urdf = (capsule_a_world - t_world_urdf[None, :]) @ r_world_urdf
-                    capsule_b_urdf = (capsule_b_world - t_world_urdf[None, :]) @ r_world_urdf
-                    u_arm_nom = arm_action_to_urdf_velocity(action, q_arm_urdf)
-                    u_arm_safe = cbf.safety_filter(
-                        q_urdf,
-                        u_arm_nom,
-                        capsule_a_urdf,
-                        capsule_b_urdf,
-                        capsule_radii,
-                    )
-                    safe_action = action.at[bigym_action_arm_indices].set(
-                        urdf_velocity_to_arm_action(q_arm_urdf, u_arm_safe)
-                    )
-
-                delta = safe_action[bigym_action_clip_indices] - action[bigym_action_clip_indices]
-                clipped_delta = jnp.clip(delta, -max_action_delta, max_action_delta)
-                safe_action = safe_action.at[bigym_action_clip_indices].set(
-                    action[bigym_action_clip_indices] + clipped_delta
-                )
-                q_next = rollout_step(q_bigym, safe_action)
-                return q_next, safe_action
-
-            _, safe_actions = jax.lax.scan(
-                step,
-                q0_bigym,
-                (action_chunk, capsule_a_world_seq, capsule_b_world_seq),
-            )
-            return safe_actions
-
-        self._chunk_filter_fns[key] = _filter_chunk
-        return _filter_chunk
-
-    def _control_mode_id(self):
-        if self.oscbf.control_type == "absolute":
-            return 0
-        if self.oscbf.control_type == "delta":
-            return 1
-        return 2
-
-    def _chunk_rollout_mode_ids(self, state_indices):
-        state_indices = np.asarray(state_indices, dtype=np.int64).reshape(-1)
-        modes = np.full(state_indices.shape, self._control_mode_id(), dtype=np.int32)
-        modes[state_indices < 4] = 1
-        return modes
-
-    def filter_chunk(self, action_chunk=None, obs=None, observations=None, **kwargs):
-        if action_chunk is None:
-            action_chunk = kwargs.pop("chunk", None)
-        if action_chunk is None:
-            raise ValueError("action_chunk must be provided")
-        chunk = np.asarray(action_chunk, dtype=np.float32)
-        if chunk.ndim != 2:
-            raise ValueError(f"Expected action_chunk shape (H, A), got {chunk.shape}")
-        if not self.oscbf.enabled:
-            return chunk.copy(), {"jax_sequential_oscbf_used": False, "sequential_oscbf_passthrough": True}
-        if self.oscbf.use_dummy_filter:
-            raise RuntimeError("JAX chunk OSCBF is not used for dummy OSCBF filters")
-
-        obs_eval = observations if observations is not None else (obs if obs is not None else self.obs)
-        q_full = np.asarray(kwargs.pop("q_full", self.q_full), dtype=np.float32).reshape(-1)
-        _ = np.asarray(kwargs.pop("qd_full", self.qd_full), dtype=np.float32).reshape(-1)
-        if q_full.shape[0] != self.oscbf.expected_motion_dim:
-            raise ValueError(
-                f"Expected q_full dim {self.oscbf.expected_motion_dim}, got {q_full.shape[0]}"
-            )
-
-        use_pelvis_cbf = bool(
-            getattr(self.oscbf, "enable_pelvis_cbf", False)
-            and getattr(self.oscbf, "pelvis_oscbf_config", None) is not None
-        )
-        if use_pelvis_cbf:
-            self.oscbf._ensure_pelvis_cbf()
-            clip_indices = self.oscbf.bigym_action_safety_indices
-        else:
-            self.oscbf._ensure_cbf()
-            clip_indices = self.oscbf.bigym_action_arm_indices
-
+    move_flat(
         (
-            capsule_a_world_seq,
-            capsule_b_world_seq,
-            capsule_radii_eval,
-            prediction_info,
-        ) = self._human_capsule_rollout_cached(obs_eval, chunk.shape[0])
+            "horizon",
+            "dt",
+            "action_dim",
+            "expected_motion_dim",
+            "control_type",
+            "controlled_action_indices",
+            "controlled_state_indices",
+            "min_clearance",
+            "diagnostics",
+            "rollout_model",
+            "rollout_mismatch",
+            "debug",
+            "enabled",
+        ),
+        filter_cfg,
+    )
+    move_flat(
+        (
+            "brake_progress_threshold",
+            "deadlock_window",
+            "temporary_blocker",
+            "safechunk_active_safety",
+        ),
+        brake_cfg,
+    )
+    move_flat(
+        (
+            "deformation_enabled",
+            "mode",
+            "chunk_deformation_scales",
+            "chunk_deformation_smoothing",
+            "sequential_oscbf_fallback",
+            "deform_after_deadlock_window",
+            "unsafe_deformation_fallback",
+            "optimized_fallback",
+            "detach_passthrough_dims",
+            "opt_iters",
+            "opt_lr",
+            "opt_population",
+            "opt_elite_frac",
+            "opt_seed",
+            "lambda_safety",
+            "lambda_action",
+            "lambda_path",
+            "lambda_smooth",
+            "optimized_deform",
+            "safechunk_acceptance",
+            "debug_safety_feasibility",
+            "action_low",
+            "action_high",
+            "max_action_delta",
+        ),
+        deform_cfg,
+    )
+    move_flat(
+        (
+            "recoverable_deform",
+            "explicit_recovery",
+            "safechunk_replan",
+            "safechunk_recover",
+            "safechunk_recovery_corridor",
+            "lambda_rejoin",
+            "rejoin_threshold",
+            "min_rejoin_offset",
+            "use_ee_pose_rejoin",
+            "use_object_state_rejoin",
+            "brake_if_unrecoverable",
+        ),
+        recovery_cfg,
+    )
 
-        valid = (
-            (self.oscbf.bigym_state_safety_indices < q_full.shape[0])
-            & (self.oscbf.bigym_action_safety_indices < chunk.shape[1])
+    controlled_action_indices = filter_cfg.get("controlled_action_indices")
+    controlled_state_indices = filter_cfg.get("controlled_state_indices")
+    if oscbf is not None and controlled_action_indices is None:
+        controlled_action_indices = getattr(
+            oscbf, "bigym_action_safety_indices", controlled_action_indices
         )
-        rollout_state_indices = self.oscbf.bigym_state_safety_indices[valid].astype(np.int32)
-        rollout_action_indices = self.oscbf.bigym_action_safety_indices[valid].astype(np.int32)
-        if rollout_state_indices.size == 0:
-            raise ValueError("No valid state/action indices for sequential OSCBF rollout")
-
-        max_action_delta = (
-            np.inf
-            if self.oscbf.max_action_delta is None
-            else float(self.oscbf.max_action_delta)
+    if oscbf is not None and controlled_state_indices is None:
+        controlled_state_indices = getattr(
+            oscbf, "bigym_state_safety_indices", controlled_state_indices
         )
-        filter_fn = self._ensure_chunk_filter_fn(use_pelvis_cbf)
-        t0 = time.perf_counter()
-        safe_chunk = np.asarray(
-            filter_fn(
-                jnp.asarray(chunk, dtype=jnp.float32),
-                jnp.asarray(q_full, dtype=jnp.float32),
-                jnp.asarray(capsule_a_world_seq, dtype=jnp.float32),
-                jnp.asarray(capsule_b_world_seq, dtype=jnp.float32),
-                jnp.asarray(capsule_radii_eval, dtype=jnp.float32),
-                jnp.asarray(self.oscbf.bigym_action_base_indices, dtype=jnp.int32),
-                jnp.asarray(self.oscbf.bigym_action_arm_indices, dtype=jnp.int32),
-                jnp.asarray(clip_indices, dtype=jnp.int32),
-                jnp.asarray(self.oscbf.bigym_state_base_indices, dtype=jnp.int32),
-                jnp.asarray(self.oscbf.bigym_state_arm_indices, dtype=jnp.int32),
-                jnp.asarray(self.oscbf.urdf_arm_joint_indices, dtype=jnp.int32),
-                jnp.asarray(rollout_state_indices, dtype=jnp.int32),
-                jnp.asarray(rollout_action_indices, dtype=jnp.int32),
-                jnp.asarray(
-                    self._chunk_rollout_mode_ids(rollout_state_indices),
-                    dtype=jnp.int32,
-                ),
-                jnp.asarray(self.oscbf.arm_sign, dtype=jnp.float32),
-                jnp.asarray(self.oscbf.arm_offset, dtype=jnp.float32),
-                jnp.asarray(self.oscbf.urdf_neutral_q, dtype=jnp.float32),
-                jnp.asarray(self.oscbf.T_pelvis_urdf, dtype=jnp.float32),
-                jnp.asarray(float(self.oscbf.dt), dtype=jnp.float32),
-                jnp.asarray(self._control_mode_id(), dtype=jnp.int32),
-                jnp.asarray(max_action_delta, dtype=jnp.float32),
-            ),
-            dtype=np.float32,
+    filter_cfg["oscbf_operator"] = operator
+    filter_cfg["controlled_action_indices"] = controlled_action_indices
+    filter_cfg["controlled_state_indices"] = controlled_state_indices
+    filter_cfg["debug"] = _safety_filter_debug(args)
+    safechunk_recover_cfg = recovery_cfg.setdefault("safechunk_recover", {})
+    if isinstance(safechunk_recover_cfg, dict):
+        frame_stack = getattr(args, "frame_stack", None)
+        if frame_stack is not None:
+            safechunk_recover_cfg["act_frame_stack"] = max(1, int(frame_stack))
+
+    deform_cfg["deformation_enabled"] = bool(deform_cfg.get("deformation_enabled", True))
+    deform_cfg["sequential_oscbf_fallback"] = bool(
+        deform_cfg.get("sequential_oscbf_fallback", False)
+    )
+
+    optimized_deform = copy.deepcopy(deform_cfg.get("optimized_deform", {}) or {})
+    if optimized_deform.get("gradient_eps") is None:
+        optimized_deform["gradient_eps"] = max(
+            1e-4,
+            float(deform_cfg.get("opt_lr", filter_cfg.get("opt_lr", 0.03))) * 0.5,
         )
-        elapsed_ms = 1000.0 * (time.perf_counter() - t0)
-        info = dict(prediction_info)
-        info.update(
-            {
-                "jax_sequential_oscbf_used": True,
-                "jax_sequential_oscbf_use_pelvis_cbf": bool(use_pelvis_cbf),
-                "jax_sequential_oscbf_time_ms": float(elapsed_ms),
-            }
-        )
-        return safe_chunk, info
-
-    def evaluate_safety(self, obs, q_seq):
-        if self.oscbf.oscbf_config is None or self.env is None:
-            return self._unavailable(q_seq)
-        q_seq = np.asarray(q_seq, dtype=np.float32)
-        try:
-            (
-                capsule_a_world_seq,
-                capsule_b_world_seq,
-                capsule_radii_eval,
-                prediction_info,
-            ) = self._human_capsule_rollout_cached(obs, q_seq.shape[0])
-            qd_seq = np.zeros_like(q_seq, dtype=np.float32)
-            q_urdf_seq = []
-            capsule_a_urdf_seq = []
-            capsule_b_urdf_seq = []
-            for k, (q_bigym, qd_bigym) in enumerate(zip(q_seq, qd_seq)):
-                q_urdf, _, _, _ = self.oscbf._build_urdf_surrogate_state_from_bigym(q_bigym, qd_bigym)
-                t_world_urdf = self.oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
-                t_urdf_world = np.linalg.inv(t_world_urdf)
-                capsule_a_urdf = self.oscbf._transform_points(
-                    t_urdf_world,
-                    capsule_a_world_seq[k],
-                )
-                capsule_b_urdf = self.oscbf._transform_points(
-                    t_urdf_world,
-                    capsule_b_world_seq[k],
-                )
-                self.oscbf._validate_capsules(
-                    capsule_a_urdf,
-                    capsule_b_urdf,
-                    capsule_radii_eval,
-                )
-                q_urdf_seq.append(q_urdf)
-                capsule_a_urdf_seq.append(capsule_a_urdf)
-                capsule_b_urdf_seq.append(capsule_b_urdf)
-
-            h_values = np.asarray(
-                self._batched_h_fn(
-                    jnp.asarray(q_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_a_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_b_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_radii_eval, dtype=jnp.float32),
-                ),
-                dtype=np.float32,
-            )
-            min_clearances = np.min(h_values, axis=1).astype(np.float32)
-            unsafe = np.flatnonzero(min_clearances < self.min_clearance)
-            info = {
-                "horizon_safe": bool(unsafe.size == 0),
-                "min_clearance": float(np.min(min_clearances)),
-                "min_clearances": min_clearances,
-                "first_violation": int(unsafe[0]) if unsafe.size else None,
-                "unsafe_count": int(unsafe.size),
-                "safety_eval_available": True,
-            }
-            info.update(prediction_info)
-            return info
-        except Exception as exc:
-            logger.warning("Chunk horizon OSCBF monitor failed: %s", exc)
-            return self._unavailable(q_seq)
-
-    def evaluate_safety_batch(self, obs, q_seq_batch):
-        q_seq_batch = np.asarray(q_seq_batch, dtype=np.float32)
-        if q_seq_batch.ndim == 2:
-            q_seq_batch = q_seq_batch[None, :, :]
-        if q_seq_batch.ndim != 3:
-            raise ValueError(
-                "Expected q_seq_batch with shape (B, H, Q), "
-                f"got {q_seq_batch.shape}"
-            )
-        if self.oscbf.oscbf_config is None or self.env is None:
-            return self._unavailable_batch(q_seq_batch)
-        batch, horizon = q_seq_batch.shape[:2]
-        try:
-            (
-                capsule_a_world_seq,
-                capsule_b_world_seq,
-                capsule_radii_eval,
-                prediction_info,
-            ) = self._human_capsule_rollout_cached(obs, horizon)
-
-            q_bigym_flat = q_seq_batch.reshape(batch * horizon, q_seq_batch.shape[-1])
-            capsule_a_world_flat = np.broadcast_to(
-                capsule_a_world_seq[None, :, :, :],
-                (batch,) + capsule_a_world_seq.shape,
-            ).reshape(batch * horizon, capsule_a_world_seq.shape[1], 3)
-            capsule_b_world_flat = np.broadcast_to(
-                capsule_b_world_seq[None, :, :, :],
-                (batch,) + capsule_b_world_seq.shape,
-            ).reshape(batch * horizon, capsule_b_world_seq.shape[1], 3)
-
-            jax_prep_used = False
-            prep_t0 = time.perf_counter()
-            try:
-                q_urdf_seq, capsule_a_urdf_seq, capsule_b_urdf_seq = (
-                    _jax_prepare_horizon_clearance_inputs(
-                        jnp.asarray(q_bigym_flat, dtype=jnp.float32),
-                        jnp.asarray(capsule_a_world_flat, dtype=jnp.float32),
-                        jnp.asarray(capsule_b_world_flat, dtype=jnp.float32),
-                        jnp.asarray(self.oscbf.bigym_state_arm_indices, dtype=jnp.int32),
-                        jnp.asarray(self.oscbf.urdf_arm_joint_indices, dtype=jnp.int32),
-                        jnp.asarray(self.oscbf.arm_sign, dtype=jnp.float32),
-                        jnp.asarray(self.oscbf.arm_offset, dtype=jnp.float32),
-                        jnp.asarray(self.oscbf.urdf_neutral_q, dtype=jnp.float32),
-                        jnp.asarray(self.oscbf.T_pelvis_urdf, dtype=jnp.float32),
-                    )
-                )
-                jax_prep_used = True
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "JAX horizon clearance input preparation failed; using Python preparation: %s",
-                    exc,
-                )
-                q_urdf_seq = []
-                capsule_a_urdf_seq = []
-                capsule_b_urdf_seq = []
-                qd_zero = np.zeros(q_seq_batch.shape[-1], dtype=np.float32)
-                for candidate_q_seq in q_seq_batch:
-                    for k, q_bigym in enumerate(candidate_q_seq):
-                        q_urdf, _, _, _ = self.oscbf._build_urdf_surrogate_state_from_bigym(
-                            q_bigym,
-                            qd_zero,
-                        )
-                        t_world_urdf = self.oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
-                        t_urdf_world = np.linalg.inv(t_world_urdf)
-                        capsule_a_urdf = self.oscbf._transform_points(
-                            t_urdf_world,
-                            capsule_a_world_seq[k],
-                        )
-                        capsule_b_urdf = self.oscbf._transform_points(
-                            t_urdf_world,
-                            capsule_b_world_seq[k],
-                        )
-                        self.oscbf._validate_capsules(
-                            capsule_a_urdf,
-                            capsule_b_urdf,
-                            capsule_radii_eval,
-                        )
-                        q_urdf_seq.append(q_urdf)
-                        capsule_a_urdf_seq.append(capsule_a_urdf)
-                        capsule_b_urdf_seq.append(capsule_b_urdf)
-            prep_time_ms = 1000.0 * (time.perf_counter() - prep_t0)
-
-            h_t0 = time.perf_counter()
-            h_values = np.asarray(
-                self._batched_h_fn(
-                    jnp.asarray(q_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_a_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_b_urdf_seq, dtype=jnp.float32),
-                    jnp.asarray(capsule_radii_eval, dtype=jnp.float32),
-                ),
-                dtype=np.float32,
-            ).reshape(batch, horizon, -1)
-            h_eval_time_ms = 1000.0 * (time.perf_counter() - h_t0)
-            min_clearances = np.min(h_values, axis=2).astype(np.float32)
-            unsafe = min_clearances < self.min_clearance
-            unsafe_any = np.any(unsafe, axis=1)
-            first_violation = np.full(batch, -1, dtype=np.int32)
-            if np.any(unsafe_any):
-                first_violation[unsafe_any] = np.argmax(unsafe[unsafe_any], axis=1)
-            info = {
-                "horizon_safe": ~unsafe_any,
-                "min_clearance": np.min(min_clearances, axis=1).astype(np.float32),
-                "min_clearances": min_clearances,
-                "first_violation": first_violation,
-                "unsafe_count": np.count_nonzero(unsafe, axis=1).astype(np.int32),
-                "safety_eval_available": True,
-                "jax_clearance_prep_used": bool(jax_prep_used),
-                "jax_clearance_prep_time_ms": float(prep_time_ms),
-                "jax_h_eval_time_ms": float(h_eval_time_ms),
-            }
-            info.update(prediction_info)
-            return info
-        except Exception as exc:
-            logger.warning("Batched chunk horizon OSCBF monitor failed: %s", exc)
-            return self._unavailable_batch(q_seq_batch)
-
-    def ee_pose(self, q):
-        ee_seq = self.ee_pose_sequence(np.asarray(q, dtype=np.float32).reshape(1, -1))
-        if ee_seq is None or ee_seq.shape[0] == 0:
-            return None
-        return ee_seq[0]
-
-    def ee_pose_sequence(self, q_seq):
-        if self.oscbf.robot_model is None:
-            return None
-        q_seq = np.asarray(q_seq, dtype=np.float32)
-        qd_seq = np.zeros_like(q_seq, dtype=np.float32)
-        ee_seq = []
-        for q_bigym, qd_bigym in zip(q_seq, qd_seq):
-            q_urdf, _, _, _ = self.oscbf._build_urdf_surrogate_state_from_bigym(
-                q_bigym, qd_bigym
-            )
-            ee_urdf = np.asarray(
-                self.oscbf.robot_model.ee_position(jnp.asarray(q_urdf, dtype=jnp.float32)),
-                dtype=np.float32,
-            ).reshape(-1, 3)
-            t_world_urdf = self.oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
-            ee_world = self.oscbf._transform_points_homogeneous(t_world_urdf, ee_urdf)
-            ee_seq.append(np.asarray(ee_world, dtype=np.float32).reshape(-1))
-        return np.stack(ee_seq, axis=0).astype(np.float32)
-
-    def _unavailable(self, q_seq):
-        h = int(np.asarray(q_seq).shape[0])
-        return {
-            "horizon_safe": True,
-            "min_clearance": float("inf"),
-            "min_clearances": np.full(h, np.inf, dtype=np.float32),
-            "first_violation": None,
-            "unsafe_count": 0,
-            "safety_eval_available": False,
-        }
-
-    def _unavailable_batch(self, q_seq_batch):
-        q_seq_batch = np.asarray(q_seq_batch)
-        if q_seq_batch.ndim == 2:
-            q_seq_batch = q_seq_batch[None, :, :]
-        batch = int(q_seq_batch.shape[0])
-        horizon = int(q_seq_batch.shape[1])
-        return {
-            "horizon_safe": np.ones(batch, dtype=np.bool_),
-            "min_clearance": np.full(batch, np.inf, dtype=np.float32),
-            "min_clearances": np.full((batch, horizon), np.inf, dtype=np.float32),
-            "first_violation": np.full(batch, -1, dtype=np.int32),
-            "unsafe_count": np.zeros(batch, dtype=np.int32),
-            "safety_eval_available": False,
-        }
+    deform_cfg["optimized_deform"] = optimized_deform
+    return nested
 
 
 def make_safechunk_filter(
@@ -4349,227 +422,349 @@ def make_safechunk_filter(
     operator: HorizonOSCBFOperator,
     oscbf: Optional[OSCBFFilter] = None,
 ) -> SafeChunkDeformFilter:
-    controlled_action_indices = None
-    controlled_state_indices = None
-    if oscbf is not None:
-        controlled_action_indices = getattr(oscbf, "bigym_action_safety_indices", None)
-        controlled_state_indices = getattr(oscbf, "bigym_state_safety_indices", None)
-
-    filter_cls = (
-        PathConsistentBrakeFilter
-        if args.condition == "path_consistent_brake"
-        else SafeChunkDeformFilter
-    )
-    path_consistent_brake_config = {}
-    path_consistent_brake_kwargs = {}
+    sf = _args_safety_filter(args)
     if args.condition == "path_consistent_brake":
-        path_consistent_brake_config = _load_path_consistent_brake_filter_config(
-            getattr(args, "path_consistent_brake_config", None)
+        controlled_action_indices = sf.get("controlled_action_indices")
+        controlled_state_indices = sf.get("controlled_state_indices")
+        if oscbf is not None and controlled_action_indices is None:
+            controlled_action_indices = getattr(
+                oscbf, "bigym_action_safety_indices", controlled_action_indices
+            )
+        if oscbf is not None and controlled_state_indices is None:
+            controlled_state_indices = getattr(
+                oscbf, "bigym_state_safety_indices", controlled_state_indices
+            )
+        path_consistent_brake_kwargs = _path_consistent_brake_kwargs_from_config(args, sf)
+        return PathConsistentBrakeFilter(
+            oscbf_operator=operator,
+            horizon=int(sf.get("horizon", 16)),
+            dt=float(sf.get("dt", 0.05)),
+            action_dim=int(sf.get("action_dim", 16)),
+            expected_motion_dim=int(sf.get("expected_motion_dim", 14)),
+            control_type=str(sf.get("control_type", "absolute")),
+            controlled_action_indices=controlled_action_indices,
+            controlled_state_indices=controlled_state_indices,
+            min_clearance=float(sf.get("min_clearance", 0.12)),
+            brake_progress_threshold=float(sf.get("brake_progress_threshold", 0.05)),
+            deadlock_window=int(sf.get("deadlock_window", 5)),
+            deformation_enabled=False,
+            mode=str(sf.get("mode", "candidate")),
+            chunk_deformation_scales=sf.get("chunk_deformation_scales", [0.0, 0.25, 0.5, 0.75]),
+            chunk_deformation_smoothing=int(sf.get("chunk_deformation_smoothing", 1)),
+            sequential_oscbf_fallback=False,
+            deform_after_deadlock_window=bool(sf.get("deform_after_deadlock_window", True)),
+            unsafe_deformation_fallback=str(sf.get("unsafe_deformation_fallback", "brake")),
+            opt_iters=int(sf.get("opt_iters", 20)),
+            opt_lr=float(sf.get("opt_lr", 0.03)),
+            lambda_safety=float(sf.get("lambda_safety", 500.0)),
+            lambda_action=float(sf.get("lambda_action", 0.1)),
+            lambda_path=float(sf.get("lambda_path", 0.2)),
+            lambda_smooth=float(sf.get("lambda_smooth", 0.1)),
+            optimized_fallback=str(sf.get("optimized_fallback", "brake")),
+            detach_passthrough_dims=bool(sf.get("detach_passthrough_dims", True)),
+            recoverable_deform=_safety_filter_section(args, "recoverable_deform"),
+            optimized_deform=_safety_filter_section(args, "optimized_deform"),
+            deform_envelope=_safety_filter_section(args, "deform_envelope"),
+            explicit_recovery=_safety_filter_section(args, "explicit_recovery"),
+            temporary_blocker=_safety_filter_section(args, "temporary_blocker"),
+            safechunk_replan=_safety_filter_section(args, "safechunk_replan"),
+            safechunk_acceptance=_safety_filter_section(args, "safechunk_acceptance"),
+            safechunk_recover=_safety_filter_section(args, "safechunk_recover"),
+            safechunk_active_safety=_safety_filter_section(args, "safechunk_active_safety"),
+            safechunk_recovery_corridor=_safety_filter_section(args, "safechunk_recovery_corridor"),
+            diagnostics=_safety_filter_section(args, "diagnostics"),
+            opt_population=int(sf.get("opt_population", 32)),
+            opt_elite_frac=float(sf.get("opt_elite_frac", 0.25)),
+            opt_seed=sf.get("opt_seed", 0),
+            max_action_delta=sf.get("max_action_delta"),
+            **path_consistent_brake_kwargs,
+            debug=_safety_filter_debug(args),
         )
-        path_consistent_brake_kwargs = _path_consistent_brake_kwargs_from_config(
-            args,
-            path_consistent_brake_config,
+
+    return SafeChunkDeformFilter(cfg=_nested_safechunk_cfg_from_eval(args, operator, oscbf=oscbf))
+
+def _parse_h_pair_label(label: Optional[str]) -> tuple[Optional[str], Optional[str], Optional[int], Optional[int]]:
+    if not isinstance(label, str):
+        return None, None, None, None
+    if ":" not in label:
+        return None, None, None, None
+    robot_raw, human_raw = label.split(":", 1)
+    robot_raw = robot_raw.strip()
+    human_raw = human_raw.strip()
+
+    if not human_raw.startswith("human_capsule_"):
+        return _normalize_h_robot_part(robot_raw), None, None, None
+
+    robot_part = _normalize_h_robot_part(robot_raw)
+    if not human_raw.replace("human_capsule_", "", 1).isdigit():
+        return robot_part, None, None, None
+    human_capsule_index = int(human_raw.replace("human_capsule_", "", 1))
+    if human_capsule_index < 0 or len(_H_HUMAN_CAPSULE_PARTS) <= 0:
+        return robot_part, None, human_capsule_index, None
+    human_part = _H_HUMAN_CAPSULE_PARTS[human_capsule_index % len(_H_HUMAN_CAPSULE_PARTS)]
+    human_arm_index = human_capsule_index // len(_H_HUMAN_CAPSULE_PARTS)
+    return robot_part, human_part, int(human_capsule_index), int(human_arm_index)
+
+def _h_pair_label_metadata(label: Optional[str]) -> dict[str, Any]:
+    robot_part, human_part, human_capsule_index, human_arm_index = _parse_h_pair_label(label)
+    return {
+        "h_argmin_robot_part": robot_part,
+        "h_argmin_human_part": human_part,
+        "h_argmin_human_capsule_index": human_capsule_index,
+        "h_argmin_human_arm_index": human_arm_index,
+    }
+
+
+def _first_rollout_state(q_seq: Any) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(q_seq, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 1:
+        return arr.reshape(-1).copy()
+    return arr.reshape(arr.shape[0], -1)[0].copy()
+
+
+def _rollout_projection_for_prediction(
+    q_full: Any,
+    pred_q: Any,
+    state_indices: Any,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    pred = np.asarray(pred_q, dtype=np.float32).reshape(-1)
+    full = np.asarray(q_full, dtype=np.float32).reshape(-1)
+    idx = np.asarray(state_indices, dtype=np.int64).reshape(-1)
+    if pred.size == full.size:
+        return pred, full.astype(np.float32), "full_q"
+    if idx.size >= pred.size and pred.size > 0:
+        selected = idx[: pred.size]
+        if selected.size and int(np.max(selected)) < full.size and int(np.min(selected)) >= 0:
+            return pred, full[selected].astype(np.float32), "controlled_state_indices"
+    n = min(pred.size, full.size)
+    return pred[:n], full[:n].astype(np.float32), "prefix_fallback"
+
+
+def _rollout_error_payload(
+    prefix: str,
+    pred_q: Any,
+    actual_q_full: Any,
+    state_indices: Any,
+) -> dict[str, Any]:
+    if pred_q is None or actual_q_full is None:
+        return {
+            f"{prefix}_prediction_available": False,
+        }
+    pred, actual, projection = _rollout_projection_for_prediction(
+        actual_q_full,
+        pred_q,
+        state_indices,
+    )
+    if pred.size == 0 or actual.size == 0:
+        return {
+            f"{prefix}_prediction_available": False,
+            f"{prefix}_projection": projection,
+        }
+    err = actual - pred
+    base_n = min(4, err.size)
+    arm_start = min(4, err.size)
+    arm_err = err[arm_start:]
+    out = {
+        f"{prefix}_prediction_available": True,
+        f"{prefix}_projection": projection,
+        f"{prefix}_q_dim": int(err.size),
+        f"{prefix}_pred_q_next": pred.astype(float).tolist(),
+        f"{prefix}_actual_q_next": actual.astype(float).tolist(),
+        f"{prefix}_q_error": err.astype(float).tolist(),
+        f"{prefix}_q_l2": float(np.linalg.norm(err)),
+        f"{prefix}_q_max_abs": float(np.max(np.abs(err))),
+        f"{prefix}_base_l2": float(np.linalg.norm(err[:base_n])) if base_n > 0 else None,
+        f"{prefix}_arm_l2": float(np.linalg.norm(arm_err)) if arm_err.size > 0 else None,
+    }
+    return out
+
+
+def _rollout_residual_feedback(
+    pred_q: Any,
+    actual_q_full: Any,
+    state_indices: Any,
+) -> dict[str, Any] | None:
+    if pred_q is None or actual_q_full is None:
+        return None
+    try:
+        pred, actual, projection = _rollout_projection_for_prediction(
+            actual_q_full,
+            pred_q,
+            state_indices,
         )
-    min_clearance = (
-        path_consistent_brake_config.get("min_clearance", args.chunk_min_clearance)
-        if args.condition == "path_consistent_brake"
-        else args.chunk_min_clearance
-    )
-
-    return filter_cls(
-        oscbf_operator=operator,
-        horizon=args.horizon,
-        dt=0.05,
-        action_dim=16,
-        expected_motion_dim=14,
-        control_type="absolute",
-        controlled_action_indices=controlled_action_indices,
-        controlled_state_indices=controlled_state_indices,
-        min_clearance=min_clearance,
-        brake_progress_threshold=args.brake_progress_threshold,
-        deadlock_window=args.deadlock_window,
-        deformation_enabled=(
-            False
-            if args.condition == "path_consistent_brake"
-            else args.chunk_deformation_enabled
-        ),
-        mode=args.chunk_deform_mode,
-        chunk_deformation_scales=args.chunk_deformation_scales,
-        chunk_deformation_smoothing=args.chunk_deformation_smoothing,
-        sequential_oscbf_fallback=(
-            False
-            if args.condition == "path_consistent_brake"
-            else args.sequential_oscbf_fallback
-        ),
-        deform_after_deadlock_window=not args.deform_immediately_on_deadlock,
-        unsafe_deformation_fallback=args.unsafe_deformation_fallback,
-        opt_iters=args.chunk_opt_iters,
-        opt_lr=args.chunk_opt_lr,
-        lambda_safety=args.chunk_lambda_safety,
-        lambda_action=args.chunk_lambda_action,
-        lambda_path=args.chunk_lambda_path,
-        lambda_smooth=args.chunk_lambda_smooth,
-        optimized_fallback=args.chunk_optimized_fallback,
-        detach_passthrough_dims=args.chunk_detach_passthrough_dims,
-        recoverable_deform={
-            "enabled": args.chunk_recoverable_deform_enabled,
-            "lambda_rejoin": args.chunk_lambda_rejoin,
-            "rejoin_threshold": args.chunk_rejoin_threshold,
-            "q_rejoin_threshold": args.chunk_q_rejoin_threshold,
-            "qd_rejoin_threshold": args.chunk_qd_rejoin_threshold,
-            "ee_rejoin_threshold": args.chunk_ee_rejoin_threshold,
-            "explicit_recovery": args.chunk_explicit_return,
-            "acceptance_clearance_tol": args.chunk_acceptance_clearance_tol,
-            "lambda_deform_safety": args.chunk_lambda_yield_safety,
-            "lambda_deform_action": args.chunk_lambda_yield_action,
-            "lambda_deform_smooth": args.chunk_lambda_yield_smooth,
-            "lambda_retreat": args.chunk_lambda_retreat,
-            "lambda_recover_safety": args.chunk_lambda_return_safety,
-            "lambda_recover_rejoin": args.chunk_lambda_return_rejoin,
-            "lambda_recover_smooth": args.chunk_lambda_return_smooth,
-            "lambda_recover_action": args.chunk_lambda_return_action,
-            "deform_horizon": args.chunk_yield_horizon,
-            "recover_horizon": args.chunk_return_horizon,
-            "max_recover_retries": args.chunk_max_return_retries,
-            "use_ee_final_check": args.chunk_use_ee_final_check,
-            "min_rejoin_offset": args.chunk_min_rejoin_offset,
-            "inner_rejoin_metric": args.chunk_inner_rejoin_metric,
-            "final_rejoin_metric": args.chunk_final_rejoin_metric,
-            "cache_nominal_ee": args.chunk_cache_nominal_ee,
-            "ee_rejoin_in_inner_loop": args.chunk_ee_rejoin_in_inner_loop,
-            "use_ee_pose_rejoin": args.chunk_use_ee_pose_rejoin,
-            "use_object_state_rejoin": args.chunk_use_object_state_rejoin,
-            "brake_if_unrecoverable": args.chunk_brake_if_unrecoverable,
-        },
-        optimized_deform={
-            "debug_safety_feasibility": args.chunk_debug_safety_feasibility,
-        },
-        explicit_recovery={
-            "commit_accepted_chunks": args.chunk_commit_accepted_chunks,
-            "committed_chunk_safety_check": args.chunk_committed_chunk_safety_check,
-            "committed_safety_tol": args.chunk_committed_safety_tol,
-            "committed_abort_only_if_contact_risk": args.chunk_committed_abort_only_if_contact_risk,
-            "committed_min_clearance_for_abort": args.chunk_committed_min_clearance_for_abort,
-            "repair_committed_action": args.chunk_repair_committed_action,
-            "monotonic_committed_repair": args.chunk_monotonic_committed_repair,
-            "committed_execution_margin": args.chunk_committed_execution_margin,
-            "committed_state_error_threshold": args.chunk_committed_state_error_threshold,
-            "committed_state_error_action": args.chunk_committed_state_error_action,
-            "committed_state_mismatch_abort_requires_unsafe": args.chunk_committed_state_mismatch_abort_requires_unsafe,
-        },
-        temporary_blocker={
-            "enabled": args.chunk_temporary_blocker_enabled,
-            "prefer_brake_before_deform": args.chunk_temporary_prefer_brake_before_deform,
-            "min_unsafe_steps_before_deform": args.chunk_temporary_min_unsafe_steps_before_deform,
-            "max_brake_steps_before_deform": args.chunk_temporary_max_brake_steps_before_deform,
-            "reset_on_nominal_safe": args.chunk_temporary_reset_on_nominal_safe,
-            "require_progress_deadlock_before_deform": args.chunk_temporary_require_progress_deadlock_before_deform,
-            "progress_window": args.chunk_temporary_progress_window,
-            "min_progress_delta": args.chunk_temporary_min_progress_delta,
-            "recover_after_wait": args.chunk_temporary_recover_after_wait,
-            "recover_after_wait_min_brake_steps": args.chunk_temporary_recover_after_wait_min_brake_steps,
-        },
-        safechunk_replan={
-            "enabled": args.chunk_safechunk_replan_enabled,
-            "replan_deform_from_current_state": True,
-            "replan_recovery_from_current_state": True,
-            "suppress_stale_return": True,
-            "max_recovery_failure_before_replan": args.chunk_max_recovery_failure_before_replan,
-            "allow_recovery_to_nominal_only_if_feasible": True,
-            "recovery_target_mode": args.chunk_recovery_target_mode,
-            "clear_failed_recovery_on_nominal_safe": True,
-        },
-        safechunk_acceptance={
-            "enabled": args.chunk_acceptance_enabled,
-            "hard_min_clearance": args.chunk_acceptance_hard_min_clearance,
-            "desired_min_clearance": args.chunk_acceptance_desired_min_clearance,
-            "allow_safe_prefix_execution": args.chunk_allow_safe_prefix_execution,
-            "min_safe_prefix_len": args.chunk_acceptance_min_safe_prefix_len,
-            "prefix_min_clearance": args.chunk_acceptance_prefix_min_clearance,
-            "rolling_replan_on_prefix": args.chunk_rolling_replan_on_prefix,
-            "full_horizon_required_for_recover": args.chunk_full_horizon_required_for_recover,
-            "full_horizon_required_for_deform": args.chunk_full_horizon_required_for_deform,
-            "emergency_brake_if_immediate_below_hard_margin": args.chunk_emergency_brake_if_immediate_below_hard_margin,
-            "allow_candidate_fallback": args.chunk_allow_candidate_fallback,
-            "candidate_fallback_only_if_no_optimized_result": args.chunk_candidate_fallback_only_if_no_optimized_result,
-        },
-        safechunk_recover={
-            "enabled": args.chunk_safechunk_recover_enabled,
-            "rejoin_nominal_weight": args.chunk_recover_rejoin_nominal_weight,
-            "task_progress_weight": args.chunk_recover_task_progress_weight,
-            "direction_alignment_weight": args.chunk_recover_direction_alignment_weight,
-            "min_direction_cosine": args.chunk_recover_min_direction_cosine,
-            "require_direction_alignment": args.chunk_require_recover_direction_alignment,
-            "direction_alignment_margin": args.chunk_recover_direction_alignment_margin,
-            "ordered_pose_weight": args.chunk_recover_ordered_pose_weight,
-            "ordered_delta_weight": args.chunk_recover_ordered_delta_weight,
-            "ordered_pose_threshold": args.chunk_recover_ordered_pose_threshold,
-            "ordered_delta_threshold": args.chunk_recover_ordered_delta_threshold,
-            "require_ordered_path": args.chunk_require_recover_ordered_path,
-            "safety_weight": args.chunk_recover_safety_weight,
-            "action_deviation_weight": args.chunk_recover_action_deviation_weight,
-            "smoothness_weight": args.chunk_recover_smoothness_weight,
-            "require_nominal_prefix_safe_for_rejoin": args.chunk_recover_require_nominal_prefix_safe,
-            "nominal_rejoin_prefix_min_clearance": args.chunk_recover_nominal_rejoin_prefix_min_clearance,
-            "use_latest_nominal_for_rejoin": args.chunk_recover_use_latest_nominal,
-            "suppress_stale_nominal_rejoin": args.chunk_recover_suppress_stale_nominal,
-            "rejoin_weight_schedule": args.chunk_recover_rejoin_weight_schedule,
-            "rejoin_ramp_steps": args.chunk_recover_rejoin_ramp_steps,
-            "retry_cooldown_steps": args.chunk_recover_retry_cooldown_steps,
-            "max_attempts_per_unsafe_streak": args.chunk_recover_max_attempts_per_unsafe_streak,
-        },
-        safechunk_active_safety={
-            "enabled": args.chunk_active_safety_enabled,
-            "check_hold_horizon_safety": args.chunk_active_check_hold_horizon_safety,
-            "predict_human_motion_for_hold": args.chunk_active_predict_human_motion_for_hold,
-            "hard_min_clearance": args.chunk_active_hard_min_clearance,
-            "hold_prefix_min_clearance": args.chunk_active_hold_prefix_min_clearance,
-            "hold_horizon_steps": args.chunk_active_hold_horizon_steps,
-            "emergency_deform_when_hold_unsafe": args.chunk_active_emergency_deform_when_hold_unsafe,
-            "optimize_when_hold_unsafe": args.chunk_active_optimize_when_hold_unsafe,
-            "emergency_deform_candidate_scales": args.chunk_active_emergency_deform_candidate_scales,
-            "prefer_last_safe_action": args.chunk_active_prefer_last_safe_action,
-            "prefer_last_safe_q_retract": args.chunk_active_prefer_last_safe_q_retract,
-            "emergency_deform_replan_next_step": args.chunk_active_emergency_deform_replan_next_step,
-        },
-        safechunk_recovery_corridor={
-            "enabled": args.chunk_recovery_corridor_enabled,
-            "require_recover_path_safe": args.chunk_require_recover_path_safe,
-            "recover_path_min_clearance": args.chunk_recover_path_min_clearance,
-            "recover_immediate_hard_clearance": args.chunk_recover_immediate_hard_clearance,
-            "recover_prefix_min_clearance": args.chunk_recover_prefix_min_clearance,
-            "enable_direct_rejoin": args.chunk_enable_direct_rejoin,
-            "enable_detour_rejoin": args.chunk_enable_detour_rejoin,
-            "enable_delayed_rejoin": args.chunk_enable_delayed_rejoin,
-            "suppress_repeated_unsafe_recovery": args.chunk_suppress_repeated_unsafe_recovery,
-            "unsafe_recovery_cooldown_steps": args.chunk_unsafe_recovery_cooldown_steps,
-            "max_same_target_failures": args.chunk_max_same_target_failures,
-            "detour_scales": args.chunk_detour_scales,
-            "detour_clearance_weight": args.chunk_detour_clearance_weight,
-            "detour_task_rejoin_weight": args.chunk_detour_task_rejoin_weight,
-            "detour_action_norm_weight": args.chunk_detour_action_norm_weight,
-            "delayed_rejoin_wait_steps": args.chunk_delayed_rejoin_wait_steps,
-            "delayed_rejoin_requires_nominal_prefix_safe": args.chunk_delayed_rejoin_requires_nominal_prefix_safe,
-            "require_safe_corridor_for_recovery_complete": args.chunk_require_safe_corridor_for_recovery_complete,
-            "require_post_recovery_act_window": args.chunk_require_post_recovery_act_window,
-            "post_recovery_min_act_steps": args.chunk_post_recovery_min_act_steps,
-        },
-        diagnostics={
-            "enabled": args.diagnostics_enabled,
-            "large_arm_delta_threshold": args.diagnostics_large_arm_delta_threshold,
-            "large_base_delta_threshold": args.diagnostics_large_base_delta_threshold,
-            "low_act_ratio_threshold": args.diagnostics_low_act_ratio_threshold,
-            "high_fallback_ratio_threshold": args.diagnostics_high_fallback_ratio_threshold,
-        },
-        opt_population=args.chunk_opt_population,
-        opt_elite_frac=args.chunk_opt_elite_frac,
-        opt_seed=args.chunk_opt_seed,
-        max_action_delta=args.max_action_delta,
-        **path_consistent_brake_kwargs,
-        debug=args.debug,
-    )
+    except Exception:  # noqa: BLE001
+        return None
+    if pred.size == 0 or actual.size == 0:
+        return None
+    residual = actual - pred
+    if residual.size == 0:
+        return None
+    base_n = min(4, residual.size)
+    arm_residual = residual[4:] if residual.size > 4 else np.asarray([], dtype=np.float32)
+    residual_l2 = float(np.linalg.norm(residual))
+    residual_max_abs = float(np.max(np.abs(residual)))
+    return {
+        "rollout_residual_projection": projection,
+        "rollout_residual_state": residual.astype(float).tolist(),
+        "rollout_residual_l2": residual_l2,
+        "rollout_residual_max_abs": residual_max_abs,
+        "rollout_residual_base_l2": float(np.linalg.norm(residual[:base_n])) if base_n > 0 else None,
+        "rollout_residual_arm_l2": float(np.linalg.norm(arm_residual)) if arm_residual.size > 0 else None,
+        "rollout_prediction_untrusted": bool(residual_l2 >= 0.75 or residual_max_abs >= 0.35),
+    }
 
 
+def _nominal_rollout_error_summary(records: list[dict]) -> dict[str, Any]:
+    def values(key: str) -> list[float]:
+        out = []
+        for record in records:
+            value = record.get(key)
+            if isinstance(value, (int, float)) and np.isfinite(float(value)):
+                out.append(float(value))
+        return out
+
+    summary: dict[str, Any] = {
+        "nominal_rollout_diagnostic_events": int(len(records)),
+    }
+    for prefix in ("nominal", "safe"):
+        for metric in ("q_l2", "q_max_abs", "base_l2", "arm_l2"):
+            vals = values(f"{prefix}_{metric}")
+            if vals:
+                summary[f"nominal_rollout_diagnostic_mean_{prefix}_{metric}"] = float(np.mean(vals))
+                summary[f"nominal_rollout_diagnostic_max_{prefix}_{metric}"] = float(np.max(vals))
+    pass_through_vals = [
+        float(record["nominal_q_l2"])
+        for record in records
+        if bool(record.get("act_step"))
+        and isinstance(record.get("nominal_q_l2"), (int, float))
+        and np.isfinite(float(record.get("nominal_q_l2")))
+    ]
+    if pass_through_vals:
+        summary["nominal_rollout_diagnostic_mean_pass_through_nominal_q_l2"] = float(np.mean(pass_through_vals))
+        summary["nominal_rollout_diagnostic_max_pass_through_nominal_q_l2"] = float(np.max(pass_through_vals))
+    return summary
+
+def _full_arm_h_pair_labels(oscbf, human_capsule_count: int) -> list[str]:
+    cfg = getattr(oscbf, "oscbf_config", None)
+    if cfg is None:
+        return []
+    if int(human_capsule_count) <= 0:
+        return []
+
+    if hasattr(cfg, "_right_arm_capsules"):
+        robot_names = ("right_shoulder_upper", "right_upperarm", "right_forearm")
+        has_gripper = hasattr(cfg, "_right_gripper_sphere")
+    elif hasattr(cfg, "h_1"):
+        robot_names = ("right_shoulder_upper", "right_upperarm", "right_forearm")
+        has_gripper = False
+    else:
+        return []
+
+    labels: list[str] = []
+    for robot_name in robot_names:
+        for h_idx in range(int(human_capsule_count)):
+            labels.append(f"{robot_name}:human_capsule_{int(h_idx)}")
+    if has_gripper:
+        for h_idx in range(int(human_capsule_count)):
+            labels.append(f"right_wrist:human_capsule_{int(h_idx)}")
+    return labels
+
+def _compute_full_arm_horizon_h_values(
+    horizon_operator,
+    obs,
+    q_seq: np.ndarray,
+) -> Optional[tuple[np.ndarray, list[str]]]:
+    try:
+        oscbf = horizon_operator.oscbf
+        if oscbf is None or oscbf.oscbf_config is None or oscbf.robot_model is None:
+            return None
+
+        q_seq = np.asarray(q_seq, dtype=np.float32)
+        if q_seq.ndim != 2 or q_seq.shape[0] == 0:
+            return None
+        qd_zero = np.zeros_like(q_seq[0])
+
+        (
+            capsule_a_world_seq,
+            capsule_b_world_seq,
+            capsule_radii_eval,
+            _,
+        ) = horizon_operator._human_capsule_rollout_cached(obs, q_seq.shape[0])
+
+        human_capsule_count = int(np.asarray(capsule_radii_eval).shape[0])
+        pair_labels = _full_arm_h_pair_labels(oscbf, human_capsule_count)
+        if not pair_labels:
+            return None
+
+        q_urdf_seq = []
+        capsule_a_urdf_seq = []
+        capsule_b_urdf_seq = []
+
+        for step_idx, q_bigym in enumerate(q_seq):
+            qd_bigym = qd_zero
+            q_urdf, _, _, _ = oscbf._build_urdf_surrogate_state_from_bigym(
+                q_bigym,
+                qd_bigym,
+            )
+            t_world_urdf = oscbf._get_world_T_urdf_from_bigym_state(q_bigym)
+            t_urdf_world = np.linalg.inv(t_world_urdf)
+            capsule_a_urdf = oscbf._transform_points(
+                t_urdf_world,
+                capsule_a_world_seq[step_idx],
+            )
+            capsule_b_urdf = oscbf._transform_points(
+                t_urdf_world,
+                capsule_b_world_seq[step_idx],
+            )
+            oscbf._validate_capsules(
+                capsule_a_urdf,
+                capsule_b_urdf,
+                capsule_radii_eval,
+            )
+            q_urdf_seq.append(q_urdf)
+            capsule_a_urdf_seq.append(capsule_a_urdf)
+            capsule_b_urdf_seq.append(capsule_b_urdf)
+
+        if not q_urdf_seq:
+            return None
+
+        h_values = np.asarray(
+            horizon_operator._batched_h_fn(
+                jnp.asarray(q_urdf_seq, dtype=jnp.float32),
+                jnp.asarray(capsule_a_urdf_seq, dtype=jnp.float32),
+                jnp.asarray(capsule_b_urdf_seq, dtype=jnp.float32),
+                jnp.asarray(capsule_radii_eval, dtype=jnp.float32),
+            ),
+            dtype=np.float32,
+        )
+        return h_values, pair_labels
+    except Exception:  # noqa: BLE001
+        return None
+
+def _parts_from_horizon_h_values(
+    h_values: np.ndarray,
+    h_pair_labels: Sequence[str],
+) -> set[str]:
+    if h_values is None:
+        return set()
+    values = np.asarray(h_values, dtype=np.float32)
+    if values.size == 0 or values.ndim != 2:
+        return set()
+    if len(h_pair_labels) != values.shape[1]:
+        return set()
+
+    violating_indices = np.flatnonzero(np.any(values < 0.0, axis=0))
+    parts: set[str] = set()
+    for idx in violating_indices:
+        robot_part, _, _, _ = _parse_h_pair_label(h_pair_labels[int(idx)])
+        if robot_part is not None:
+            parts.add(robot_part)
+    return parts
 
 def _controlled_pause_anchor(q_full, action_indices, state_indices, dtype=np.float32):
     q = np.asarray(q_full, dtype=np.float32).reshape(-1)
@@ -4584,7 +779,6 @@ def _controlled_pause_anchor(q_full, action_indices, state_indices, dtype=np.flo
         anchor[absolute] = q[state_idx[absolute]].astype(dtype, copy=False)
     return action_idx, anchor
 
-
 def _pause_arm_at_current_q(action, q_full, action_indices, state_indices):
     safe = np.asarray(action, dtype=np.float32).copy()
     action_idx, anchor = _controlled_pause_anchor(
@@ -4597,30 +791,6 @@ def _pause_arm_at_current_q(action, q_full, action_indices, state_indices):
     else:
         raise ValueError(f"Unsupported action shape for pause fallback: {safe.shape}")
     return safe
-
-
-def _scale_controlled_motion_from_current_q(
-    action, q_full, action_indices, state_indices, scale: float
-):
-    scale = float(np.clip(scale, 0.0, 1.0))
-    if scale <= 0.0:
-        return _pause_arm_at_current_q(action, q_full, action_indices, state_indices)
-    safe = np.asarray(action, dtype=np.float32).copy()
-    action_idx, anchor = _controlled_pause_anchor(
-        q_full, action_indices, state_indices, dtype=safe.dtype
-    )
-    if action_idx.size == 0:
-        return safe
-    if safe.ndim == 1:
-        safe[action_idx] = anchor + scale * (safe[action_idx] - anchor)
-    elif safe.ndim == 2:
-        safe[:, action_idx] = anchor[None, :] + scale * (
-            safe[:, action_idx] - anchor[None, :]
-        )
-    else:
-        raise ValueError(f"Unsupported action shape for pause scaling: {safe.shape}")
-    return safe
-
 
 def _should_pause_for_safety(args, min_h, safety_info):
     if not args.pause_on_unsafe:
@@ -4643,389 +813,282 @@ def _should_pause_for_safety(args, min_h, safety_info):
     return False, None
 
 
-def _mujoco_model_data(task):
-    mojo = getattr(task, "_mojo", None) or getattr(task, "mojo", None)
-    if mojo is None:
-        return None, None
-    model = getattr(mojo, "model", None)
-    data = getattr(mojo, "data", None)
-    if model is not None and data is not None:
-        return model, data
-    physics = getattr(mojo, "physics", None)
-    if physics is not None:
-        return getattr(physics.model, "ptr", physics.model), getattr(physics.data, "ptr", physics.data)
-    return None, None
-
-
-def _mujoco_site_position(model, data, names: Sequence[str]):
+def _action_bridge_gripper_index(index: Any, action_dim: int) -> int | None:
     try:
-        import mujoco
+        idx = int(index)
     except Exception:  # noqa: BLE001
         return None
-    for name in names:
-        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
-        if site_id >= 0:
-            return np.asarray(data.site_xpos[site_id], dtype=np.float64).reshape(3)
-    return None
+    if idx < 0:
+        idx += int(action_dim)
+    if idx < 0 or idx >= int(action_dim):
+        return None
+    return idx
 
 
-def _box_edge_segments_world(center, size, xmat=None):
-    center = np.asarray(center, dtype=np.float64).reshape(3)
-    size = np.asarray(size, dtype=np.float64).reshape(3)
-    rot = np.eye(3, dtype=np.float64) if xmat is None else np.asarray(xmat, dtype=np.float64).reshape(3, 3)
-    corners = []
-    labels = []
-    for dx in (-1.0, 1.0):
-        for dy in (-1.0, 1.0):
-            for dz in (-1.0, 1.0):
-                local = np.asarray([dx * size[0], dy * size[1], dz * size[2]], dtype=np.float64)
-                corners.append((center + rot @ local).astype(float).tolist())
-                labels.append((int(dx), int(dy), int(dz)))
-    idx = {label: i for i, label in enumerate(labels)}
-    pairs = []
-    for dx in (-1, 1):
-        for dy in (-1, 1):
-            pairs.append((idx[(dx, dy, -1)], idx[(dx, dy, 1)]))
-        for dz in (-1, 1):
-            pairs.append((idx[(dx, -1, dz)], idx[(dx, 1, dz)]))
-    for dy in (-1, 1):
-        for dz in (-1, 1):
-            pairs.append((idx[(-1, dy, dz)], idx[(1, dy, dz)]))
-    return [[corners[a], corners[b]] for a, b in pairs]
+def _action_bridge_cosine(a: np.ndarray, b: np.ndarray) -> float | None:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if not np.isfinite(denom) or denom <= 1e-8:
+        return None
+    return float(np.dot(a, b) / denom)
 
 
-def _mujoco_find_body_id(model, names: Sequence[str]):
+
+def _ablation_action_rows(action: Any) -> np.ndarray | None:
+    if action is None:
+        return None
     try:
-        import mujoco
-    except Exception:  # noqa: BLE001
-        return -1
-    for name in names:
-        try:
-            body_id = int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name))
-        except Exception:  # noqa: BLE001
-            body_id = -1
-        if body_id >= 0:
-            return body_id
-    suffixes = tuple(f"/{name}" for name in names)
-    for body_id in range(int(model.nbody)):
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
-        if body_name in names or body_name.endswith(suffixes):
-            return int(body_id)
-    return -1
-
-
-def _mujoco_body_is_descendant(model, body_id: int, ancestor_id: int) -> bool:
-    if ancestor_id < 0 or body_id < 0:
-        return False
-    body_id = int(body_id)
-    ancestor_id = int(ancestor_id)
-    while body_id >= 0:
-        if body_id == ancestor_id:
-            return True
-        parent = int(model.body_parentid[body_id])
-        if parent == body_id:
-            break
-        body_id = parent
-    return False
-
-
-def _mujoco_body_name(model, body_id: int) -> str:
-    try:
-        import mujoco
-        return mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(body_id)) or ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _drawer_scene_geometry(model, data):
-    try:
-        import mujoco
+        arr = np.asarray(action, dtype=np.float32)
     except Exception:  # noqa: BLE001
         return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    return arr.reshape(-1, arr.shape[-1])
 
-    cabinet_body_id = _mujoco_find_body_id(model, ("base_cabinet_600",))
-    drawer_body_id = _mujoco_find_body_id(
-        model,
-        ("base_cabinet_600/drawer_small_4", "drawer_small_4"),
-    )
 
-    cabinet_segments = []
-    drawer_segments = []
-    cabinet_geoms = []
-    drawer_geoms = []
-    for geom_id in range(int(model.ngeom)):
-        try:
-            if int(model.geom_type[geom_id]) != int(mujoco.mjtGeom.mjGEOM_BOX):
-                continue
-            body_id = int(model.geom_bodyid[geom_id])
-            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
-            body_name = _mujoco_body_name(model, body_id)
-            in_cabinet = (
-                _mujoco_body_is_descendant(model, body_id, cabinet_body_id)
-                or geom_name.startswith("base_cabinet_600")
-                or body_name.startswith("base_cabinet_600")
-                or "/base_cabinet_600" in body_name
-            )
-            if not in_cabinet:
-                continue
-            segments = _box_edge_segments_world(
-                data.geom_xpos[geom_id],
-                model.geom_size[geom_id],
-                data.geom_xmat[geom_id],
-            )
-        except Exception:  # noqa: BLE001
+def _ablation_nominal_env_action_for_sequence_step(
+    target_action: Any,
+    sequence_index: int,
+    template_env_action: Any,
+) -> np.ndarray | None:
+    """Build the env action chunk that should accompany a forced nominal q frame.
+
+    The forced-q ablation is only meaningful if the action-sequence wrapper sees
+    the same temporal action context that ACT would have produced near this
+    nominal window. For frame k, feed a shifted nominal action chunk starting
+    from target_action[k], instead of a live hold action.
+    """
+
+    rows = _ablation_action_rows(target_action)
+    if rows is None:
+        return None
+    try:
+        template = np.asarray(template_env_action, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+    if template.size == 0:
+        return None
+    action_dim = int(template.shape[-1])
+    if rows.shape[-1] != action_dim:
+        return None
+
+    start = max(0, int(sequence_index))
+    if template.ndim == 1:
+        return rows[min(start, rows.shape[0] - 1)].astype(template.dtype, copy=True)
+
+    out = template.copy()
+    flat = out.reshape(-1, action_dim)
+    for i in range(flat.shape[0]):
+        flat[i] = rows[min(start + i, rows.shape[0] - 1)]
+    return out.astype(template.dtype, copy=False)
+
+
+def _seed_action_sequence_history_with_nominal_actions(
+    env: Any,
+    target_action: Any,
+    *,
+    history_window_len: int | None = None,
+) -> int:
+    """Seed ActionSequence temporal ensemble history with nominal ACT actions."""
+
+    wrapper = _find_wrapped_env_with_attr(env, "_action_history")
+    if wrapper is None:
+        return 0
+    rows = _ablation_action_rows(target_action)
+    if rows is None:
+        return 0
+    try:
+        history = getattr(wrapper, "_action_history")
+        history_arr = np.asarray(history)
+        cur_step = int(getattr(wrapper, "_cur_step"))
+        sequence_length = int(getattr(wrapper, "_sequence_length"))
+    except Exception:  # noqa: BLE001
+        return 0
+    if history_arr.ndim != 3 or cur_step < 0:
+        return 0
+    action_dim = int(history_arr.shape[-1])
+    if rows.shape[-1] != action_dim:
+        return 0
+    slot_count = int(history_window_len) if history_window_len is not None else int(rows.shape[0])
+    slot_count = max(1, min(slot_count, int(rows.shape[0]), int(history_arr.shape[0])))
+    end_col = min(cur_step + sequence_length, history_arr.shape[1])
+    if end_col <= cur_step:
+        return 0
+
+    # At bridge time the wrapper's _cur_step may have been reset or held.  The
+    # temporal ensemble reads all nonzero rows at column _cur_step, so seed that
+    # actual read column directly instead of limiting valid slots by cur_step.
+    # This turns the selected nominal resume action window into the ensemble
+    # context ACT will really execute on the next step.
+    try:
+        history_arr[:, cur_step:end_col] = 0
+    except Exception:  # noqa: BLE001
+        pass
+    first_row = max(0, min(cur_step - slot_count + 1, history_arr.shape[0] - slot_count))
+    filled = 0
+    for slot in range(slot_count):
+        row = first_row + slot
+        if row < 0 or row >= history_arr.shape[0]:
             continue
-        entry = {
-            "name": geom_name or body_name or f"geom_{geom_id}",
-            "body": body_name,
-            "center": np.asarray(data.geom_xpos[geom_id], dtype=np.float64).astype(float).tolist(),
-            "size": np.asarray(model.geom_size[geom_id], dtype=np.float64).astype(float).tolist(),
-            "segments": segments,
-        }
-        is_drawer_geom = (
-            _mujoco_body_is_descendant(model, body_id, drawer_body_id)
-            or "/drawer_small_4" in body_name
-            or body_name.endswith("drawer_small_4")
-            or "/drawer_small_4" in geom_name
-            or geom_name.endswith("drawer_small_4")
-        )
-        if is_drawer_geom:
-            drawer_segments.extend(segments)
-            drawer_geoms.append(entry)
-        else:
-            cabinet_segments.extend(segments)
-            cabinet_geoms.append(entry)
-
-    if not cabinet_segments and not drawer_segments:
-        return None
-    return {
-        "absolute": True,
-        "cabinet": cabinet_segments,
-        "drawer": drawer_segments,
-        "cabinet_geoms": cabinet_geoms,
-        "drawer_geoms": drawer_geoms,
-        "source": "mujoco_geoms",
-    }
-
-
-def _drawer_scene_geometry_from_cabinet_xml(handle_pos, open_distance=None, open_fraction=None):
+        for col in range(cur_step, end_col):
+            nominal_idx = min(col - cur_step, rows.shape[0] - 1)
+            history_arr[row, col] = rows[nominal_idx].astype(history_arr.dtype, copy=False)
+        filled += 1
     try:
-        import mujoco
+        if not np.shares_memory(history_arr, history):
+            setattr(wrapper, "_action_history", history_arr.astype(getattr(history, "dtype", history_arr.dtype)))
     except Exception:  # noqa: BLE001
-        return None
-    try:
-        handle = np.asarray(handle_pos, dtype=np.float64).reshape(3)
-    except Exception:  # noqa: BLE001
-        return None
-    if not np.isfinite(handle).all():
-        return None
-
-    xml_path = REPO / "external/bigym/bigym/envs/xmls/props/kitchen/base_cabinet_600.xml"
-    if not xml_path.is_file():
-        return None
-    try:
-        model = mujoco.MjModel.from_xml_path(str(xml_path))
-        data = mujoco.MjData(model)
-        distance = 0.0 if open_distance is None or not np.isfinite(float(open_distance)) else float(open_distance)
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "drawer_small_4")
-        if joint_id >= 0:
-            qpos_adr = int(model.jnt_qposadr[joint_id])
-            data.qpos[qpos_adr] = distance
-        mujoco.mj_forward(model, data)
-        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "drawer_small_4")
-        if site_id < 0:
-            return None
-        offset = handle - np.asarray(data.site_xpos[site_id], dtype=np.float64).reshape(3)
-        geometry = _drawer_scene_geometry(model, data)
-        if geometry is None:
-            return None
-        for key in ("cabinet_geoms", "drawer_geoms"):
-            for geom in geometry.get(key, []):
-                geom["center"] = (np.asarray(geom["center"], dtype=np.float64) + offset).astype(float).tolist()
-                geom["segments"] = [
-                    (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
-                    for seg in geom.get("segments", [])
-                ]
-        geometry["cabinet"] = [
-            (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
-            for seg in geometry.get("cabinet", [])
-        ]
-        geometry["drawer"] = [
-            (np.asarray(seg, dtype=np.float64) + offset).astype(float).tolist()
-            for seg in geometry.get("drawer", [])
-        ]
-        geometry["handle"] = _box_edge_segments_world(handle, [0.025, 0.025, 0.025])
-        geometry["handle_pos"] = handle.astype(float).tolist()
-        geometry["origin"] = [0.0, 0.0, 0.0]
-        geometry["open_axis"] = [0.0, 0.0, 0.0]
-        geometry["default_open"] = 0.0
-        geometry["open_fraction"] = None if open_fraction is None else float(open_fraction)
-        geometry["source"] = "base_cabinet_600_xml"
-        return geometry
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Failed to build XML drawer geometry fallback: %s", exc)
-        return None
-
-def _drawer_open_distance_and_fraction(task, model, data):
-    distance = None
-    joint_range = None
-    try:
-        import mujoco
-        for name in ("base_cabinet_600/drawer_small_4", "drawer_small_4"):
-            joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            if joint_id < 0:
-                continue
-            qpos_adr = int(model.jnt_qposadr[joint_id])
-            distance = float(data.qpos[qpos_adr])
-            joint_range = np.asarray(model.jnt_range[joint_id], dtype=np.float64).reshape(2)
-            break
-    except Exception:  # noqa: BLE001
-        distance = None
-
-    if distance is None and hasattr(task, "cabinet_drawers"):
+        pass
+    if hasattr(wrapper, "_last_smoothed_action"):
         try:
-            distance = float(np.asarray(task.cabinet_drawers.get_state()).reshape(-1)[-1])
+            last_idx = min(slot_count - 1, rows.shape[0] - 1)
+            setattr(wrapper, "_last_smoothed_action", rows[last_idx].astype(history_arr.dtype, copy=True))
         except Exception:  # noqa: BLE001
-            distance = None
+            pass
+    return int(filled)
 
-    if distance is None:
-        return None, None
+def _seed_action_sequence_history_with_prior_act_chunk(
+    env: Any,
+    target_action: Any,
+) -> int:
+    """Seed one real, progress-validated prior ACT prediction before a fresh query."""
 
-    if (
-        joint_range is not None
-        and np.isfinite(joint_range).all()
-        and float(joint_range[1]) > float(joint_range[0])
-    ):
-        fraction = (distance - float(joint_range[0])) / (float(joint_range[1]) - float(joint_range[0]))
-    else:
-        fraction = distance / 0.38
-    return float(distance), float(np.clip(fraction, 0.0, 1.0))
-
-
-
-def _diagnostic_task_state(env) -> dict[str, Any]:
-    """Best-effort task progress/object state for failure diagnosis logs."""
+    wrapper = _find_wrapped_env_with_attr(env, "_action_history")
+    if wrapper is None:
+        return 0
+    rows = _ablation_action_rows(target_action)
+    if rows is None:
+        return 0
     try:
-        task = get_bigym_task(env)
+        history = np.asarray(getattr(wrapper, "_action_history"))
+        sequence_length = int(getattr(wrapper, "_sequence_length"))
     except Exception:  # noqa: BLE001
-        task = _find_wrapped_env_with_attr(env, "mojo")
-    if task is None:
+        return 0
+    if history.ndim != 3 or history.shape[0] < 2:
+        return 0
+    if rows.shape[-1] != history.shape[-1]:
+        return 0
+
+    # Row 0 represents the last progress-producing ACT query. The wrapper will
+    # write the current fresh ACT query to row 1, so temporal ensembling sees
+    # exactly one verified prior contributor plus the live prediction.
+    history[...] = 0
+    cur_step = 1
+    end_col = min(cur_step + sequence_length, history.shape[1])
+    for col in range(cur_step, end_col):
+        action_idx = min(col - cur_step, rows.shape[0] - 1)
+        history[0, col] = rows[action_idx].astype(history.dtype, copy=False)
+    setattr(wrapper, "_cur_step", cur_step)
+    if hasattr(wrapper, "_last_smoothed_action"):
+        setattr(wrapper, "_last_smoothed_action", None)
+    return 1
+
+
+def _temporal_action_history_stats(env: Any, resume_first_action: np.ndarray) -> dict[str, Any]:
+    wrapper = _find_wrapped_env_with_attr(env, "_action_history")
+    if wrapper is None:
         return {
-            "drawer_open_distance": None,
-            "drawer_open_fraction": None,
-            "drawer_joint_position": None,
-            "task_progress": None,
-            "ee_object_distance": None,
-            "object_state": None,
+            "action_bridge_temporal_history_slot_count": None,
+            "action_bridge_temporal_history_vs_resume_l2": None,
         }
-
-    model, data = _mujoco_model_data(task)
-    drawer_distance = None
-    drawer_fraction = None
-    handle_pos = None
-    ee_pos = None
-    drawer_scene_geometry = None
-    ee_object_distance = None
-    if model is not None and data is not None:
-        drawer_distance, drawer_fraction = _drawer_open_distance_and_fraction(task, model, data)
-        drawer_scene_geometry = _drawer_scene_geometry(model, data)
-        handle_pos = _mujoco_site_position(
-            model,
-            data,
-            ("base_cabinet_600/drawer_small_4", "drawer_small_4"),
-        )
-        ee_pos = _mujoco_site_position(
-            model,
-            data,
-            ("h1/right_end_effector", "right_end_effector"),
-        )
-        if handle_pos is not None and ee_pos is not None:
-            ee_object_distance = float(np.linalg.norm(ee_pos - handle_pos))
-    elif hasattr(task, "cabinet_drawers"):
-        drawer_distance, drawer_fraction = _drawer_open_distance_and_fraction(task, model, data)
-
-    task_progress = drawer_fraction if drawer_fraction is not None else drawer_distance
-    object_state = {}
-    if drawer_distance is not None:
-        object_state["drawer_open_distance"] = float(drawer_distance)
-    if drawer_fraction is not None:
-        object_state["drawer_open_fraction"] = float(drawer_fraction)
-    if handle_pos is not None:
-        object_state["handle_pos"] = np.asarray(handle_pos, dtype=np.float64).astype(float).tolist()
-    if ee_pos is not None:
-        object_state["ee_pos"] = np.asarray(ee_pos, dtype=np.float64).astype(float).tolist()
-    if drawer_scene_geometry is not None:
-        object_state["drawer_scene_geometry"] = drawer_scene_geometry
+    try:
+        history = np.asarray(getattr(wrapper, "_action_history"))
+        cur_step = int(getattr(wrapper, "_cur_step"))
+    except Exception:  # noqa: BLE001
+        return {
+            "action_bridge_temporal_history_slot_count": None,
+            "action_bridge_temporal_history_vs_resume_l2": None,
+        }
+    if history.ndim != 3 or cur_step < 0 or cur_step >= history.shape[1]:
+        return {
+            "action_bridge_temporal_history_slot_count": 0,
+            "action_bridge_temporal_history_vs_resume_l2": None,
+        }
+    cur_actions = np.asarray(history[:, cur_step], dtype=np.float32)
+    if cur_actions.ndim != 2 or cur_actions.shape[-1] != resume_first_action.shape[-1]:
+        return {
+            "action_bridge_temporal_history_slot_count": 0,
+            "action_bridge_temporal_history_vs_resume_l2": None,
+        }
+    valid = np.all(cur_actions != 0, axis=1)
+    cur_actions = cur_actions[valid]
+    slot_count = int(cur_actions.shape[0])
+    if slot_count <= 0:
+        return {
+            "action_bridge_temporal_history_slot_count": 0,
+            "action_bridge_temporal_history_vs_resume_l2": None,
+        }
+    gain = float(getattr(wrapper, "_gain", 0.0))
+    weights = np.exp(-gain * np.arange(slot_count, dtype=np.float32))
+    weight_sum = float(np.sum(weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        weights = np.ones(slot_count, dtype=np.float32) / float(slot_count)
+    else:
+        weights = weights / weight_sum
+    ensemble = np.sum(cur_actions * weights[:, None], axis=0)
     return {
-        "drawer_open_distance": None if drawer_distance is None else float(drawer_distance),
-        "drawer_open_fraction": None if drawer_fraction is None else float(drawer_fraction),
-        "drawer_joint_position": None if drawer_distance is None else float(drawer_distance),
-        "task_progress": None if task_progress is None else float(task_progress),
-        "ee_object_distance": ee_object_distance,
-        "object_state": object_state or None,
+        "action_bridge_temporal_history_slot_count": slot_count,
+        "action_bridge_temporal_history_vs_resume_l2": float(
+            np.linalg.norm(ensemble - resume_first_action)
+        ),
     }
 
 
-def _diagnostic_progress_delta(before: dict[str, Any], after: dict[str, Any]) -> Optional[float]:
-    before_progress = before.get("task_progress") if before else None
-    after_progress = after.get("task_progress") if after else None
-    if before_progress is None or after_progress is None:
-        return None
-    before_progress = float(before_progress)
-    after_progress = float(after_progress)
-    if not (np.isfinite(before_progress) and np.isfinite(after_progress)):
-        return None
-    return float(after_progress - before_progress)
-
-
-def _finite_task_progress(task_state: Optional[dict[str, Any]]) -> Optional[float]:
-    if not task_state:
-        return None
-    progress = task_state.get("task_progress")
-    if progress is None:
-        return None
-    progress = float(progress)
-    return progress if np.isfinite(progress) else None
-
-
-def _post_recovery_task_guard_reanchor_allowed(phase_state, args):
-    phase = str((phase_state or {}).get("phase", "pre_grasp"))
-    allowed = set(getattr(args, "post_recovery_task_guard_reanchor_phases", ["grasp"]))
-    return phase in allowed, phase
-
-
-def _post_recovery_task_guard_ready(task_state, phase_state, args):
-    phase = str((phase_state or {}).get("phase", "pre_grasp"))
-    if phase == "pre_grasp":
-        return False, "pre_grasp"
-
-    ee_distance = None
-    if task_state:
-        ee_distance = task_state.get("ee_object_distance")
-    if ee_distance is None and phase_state is not None:
-        ee_distance = phase_state.get("ee_to_handle_dist")
-
-    near_handle = False
-    if ee_distance is not None:
-        ee_distance = float(ee_distance)
-        near_handle = (
-            np.isfinite(ee_distance)
-            and float(args.post_recovery_task_guard_max_ee_distance) > 0.0
-            and ee_distance <= float(args.post_recovery_task_guard_max_ee_distance)
+def _action_bridge_diagnostics(
+    *,
+    env: Any,
+    last_recovery_first_action: Any,
+    resume_first_action: Any,
+    arm_indices: Any,
+    gripper_index: Any,
+) -> dict[str, Any]:
+    resume = np.asarray(resume_first_action, dtype=np.float32).reshape(-1)
+    out: dict[str, Any] = {
+        "action_bridge_resume_first_action_norm": float(np.linalg.norm(resume)),
+    }
+    out.update(_temporal_action_history_stats(env, resume))
+    if last_recovery_first_action is None:
+        out.update(
+            {
+                "action_bridge_last_recovery_vs_resume_l2": None,
+                "action_bridge_last_recovery_vs_resume_cosine": None,
+                "action_bridge_last_recovery_arm_l2": None,
+                "action_bridge_last_recovery_gripper_delta": None,
+                "action_bridge_last_recovery_action_norm": None,
+            }
         )
-
-    progress = _finite_task_progress(task_state)
-    has_progress = (
-        progress is not None
-        and progress > float(args.post_recovery_task_guard_min_progress)
+        return out
+    last = np.asarray(last_recovery_first_action, dtype=np.float32).reshape(-1)
+    if last.shape != resume.shape:
+        out.update(
+            {
+                "action_bridge_last_recovery_vs_resume_l2": None,
+                "action_bridge_last_recovery_vs_resume_cosine": None,
+                "action_bridge_last_recovery_arm_l2": None,
+                "action_bridge_last_recovery_gripper_delta": None,
+                "action_bridge_last_recovery_action_norm": float(np.linalg.norm(last)),
+            }
+        )
+        return out
+    delta = resume - last
+    arm_idx = np.asarray(arm_indices, dtype=np.int64).reshape(-1)
+    arm_idx = arm_idx[(arm_idx >= 0) & (arm_idx < resume.shape[0])]
+    grip_idx = _action_bridge_gripper_index(gripper_index, resume.shape[0])
+    out.update(
+        {
+            "action_bridge_last_recovery_vs_resume_l2": float(np.linalg.norm(delta)),
+            "action_bridge_last_recovery_vs_resume_cosine": _action_bridge_cosine(last, resume),
+            "action_bridge_last_recovery_arm_l2": (
+                None if arm_idx.size == 0 else float(np.linalg.norm(delta[arm_idx]))
+            ),
+            "action_bridge_last_recovery_gripper_delta": (
+                None if grip_idx is None else float(resume[grip_idx] - last[grip_idx])
+            ),
+            "action_bridge_last_recovery_action_norm": float(np.linalg.norm(last)),
+        }
     )
-
-    if near_handle:
-        return True, "near_handle"
-    if phase == "pull" and has_progress:
-        return True, "task_progress"
-
-    return False, phase
+    return out
 
 
 def _diagnostic_mode_flags(safety_info: dict, arm_delta: float, eps: float) -> dict[str, Any]:
@@ -5103,159 +1166,6 @@ def _diagnostic_mode_flags(safety_info: dict, arm_delta: float, eps: float) -> d
         "committed_active": committed_active,
     }
 
-
-def _phase_reanchor_state(env, args):
-    try:
-        task = get_bigym_task(env)
-    except Exception:  # noqa: BLE001
-        task = _find_wrapped_env_with_attr(env, "mojo")
-    if task is None:
-        return None
-
-    model, data = _mujoco_model_data(task)
-    if model is None or data is None:
-        return None
-
-    handle_pos = _mujoco_site_position(
-        model,
-        data,
-        ("base_cabinet_600/drawer_small_4", "drawer_small_4"),
-    )
-    ee_pos = _mujoco_site_position(
-        model,
-        data,
-        ("h1/right_end_effector", "right_end_effector"),
-    )
-    if handle_pos is None or ee_pos is None:
-        return None
-
-    drawer_distance, drawer_fraction = _drawer_open_distance_and_fraction(task, model, data)
-    if drawer_fraction is None:
-        drawer_fraction = 0.0
-
-    gripper_qpos = None
-    gripper_closed = False
-    robot = getattr(task, "robot", None)
-    if robot is not None and hasattr(robot, "qpos_grippers"):
-        try:
-            qpos_grippers = np.asarray(robot.qpos_grippers, dtype=np.float64).reshape(-1)
-            if qpos_grippers.size:
-                gripper_qpos = float(qpos_grippers[-1])
-                gripper_closed = gripper_qpos >= float(args.phase_reanchor_gripper_closed_threshold)
-        except Exception:  # noqa: BLE001
-            pass
-
-    ee_to_handle_xy = handle_pos[:2] - ee_pos[:2]
-    ee_to_handle_dist = float(np.linalg.norm(ee_to_handle_xy))
-    if drawer_fraction >= float(args.phase_reanchor_done_threshold):
-        phase = "done"
-    elif (
-        drawer_fraction >= float(args.phase_reanchor_pull_open_threshold)
-        or (gripper_closed and ee_to_handle_dist <= float(args.phase_reanchor_grasp_dist))
-    ):
-        phase = "pull"
-    elif ee_to_handle_dist <= float(args.phase_reanchor_grasp_dist):
-        phase = "grasp"
-    else:
-        phase = "pre_grasp"
-
-    return {
-        "task": task,
-        "phase": phase,
-        "handle_pos": handle_pos,
-        "ee_pos": ee_pos,
-        "ee_to_handle_xy": ee_to_handle_xy,
-        "ee_to_handle_dist": ee_to_handle_dist,
-        "drawer_open_distance": drawer_distance,
-        "drawer_open_fraction": float(drawer_fraction),
-        "gripper_qpos": gripper_qpos,
-        "gripper_closed": bool(gripper_closed),
-    }
-
-
-def _phase_reanchor_offset_xy(args, phase: str) -> np.ndarray:
-    if phase == "pull":
-        offset = args.phase_reanchor_pull_offset_xy
-    elif phase == "grasp":
-        offset = args.phase_reanchor_grasp_offset_xy
-    else:
-        offset = args.phase_reanchor_pregrasp_offset_xy
-    return np.asarray(offset, dtype=np.float64).reshape(2)
-
-
-def _should_start_phase_reanchor(args, step: int, state, drawer_history, cooldown_left: int):
-    if not args.phase_reanchor or state is None or cooldown_left > 0:
-        return False, None
-    if state.get("phase") == "done" or step < int(args.phase_reanchor_check_after_steps):
-        return False, None
-
-    window = int(args.phase_reanchor_no_progress_window)
-    if len(drawer_history) < window:
-        return False, None
-    recent = np.asarray(drawer_history[-window:], dtype=np.float64)
-    if not np.isfinite(recent).any():
-        return False, None
-    progress = float(np.nanmax(recent) - np.nanmin(recent))
-    return progress < float(args.phase_reanchor_min_drawer_progress), progress
-
-
-def _phase_reanchor_action(env, safe_env_action, q_full, oscbf, args, state):
-    chunk, was_single_chunk = _as_chunk(safe_env_action)
-    raw_first = _raw_scaled_first_action(env, chunk[0])
-    if raw_first is None:
-        return None, None
-
-    raw_first = np.asarray(raw_first, dtype=np.float32).reshape(-1).copy()
-    phase = str(state.get("phase", "pre_grasp"))
-    target_ee_xy = np.asarray(state["handle_pos"][:2], dtype=np.float64) + _phase_reanchor_offset_xy(args, phase)
-    ee_xy = np.asarray(state["ee_pos"][:2], dtype=np.float64)
-    ee_error_xy = target_ee_xy - ee_xy
-    base_cmd_zeroed_reason = None
-    if phase == "pull" or bool(state.get("gripper_closed")):
-        base_cmd_xy = np.zeros(2, dtype=np.float32)
-        base_cmd_zeroed_reason = "closed_gripper_or_pull_phase"
-    else:
-        base_cmd_xy = np.clip(
-            float(args.phase_reanchor_base_gain) * ee_error_xy,
-            -float(args.phase_reanchor_max_base_step),
-            float(args.phase_reanchor_max_base_step),
-        ).astype(np.float32)
-
-    if raw_first.shape[0] >= 2:
-        raw_first[:2] = base_cmd_xy
-    if raw_first.shape[0] >= 4:
-        raw_first[2:4] = 0.0
-
-    action_idx = np.asarray(getattr(oscbf, "bigym_action_arm_indices", []), dtype=np.int64)
-    state_idx = np.asarray(getattr(oscbf, "bigym_state_arm_indices", []), dtype=np.int64)
-    q = np.asarray(q_full, dtype=np.float32).reshape(-1)
-    pair_count = min(action_idx.size, state_idx.size)
-    action_idx = action_idx[:pair_count]
-    state_idx = state_idx[:pair_count]
-    valid = (action_idx < raw_first.shape[0]) & (state_idx < q.shape[0])
-    if np.any(valid):
-        raw_first[action_idx[valid]] = q[state_idx[valid]]
-
-    normalized_first = _raw_action_to_normalized(env, raw_first)
-    if normalized_first is None:
-        return None, None
-    normalized_first = np.asarray(normalized_first, dtype=np.float32).reshape(-1)
-    if phase in {"grasp", "pull"}:
-        normalized_first[-1] = float(np.clip(args.phase_reanchor_gripper_value, -1.0, 1.0))
-
-    reanchored_chunk = np.repeat(normalized_first[None, :], chunk.shape[0], axis=0)
-    info = {
-        "phase": phase,
-        "target_ee_xy": target_ee_xy.astype(float).tolist(),
-        "ee_error_xy": ee_error_xy.astype(float).tolist(),
-        "base_cmd_xy": base_cmd_xy.astype(float).tolist(),
-        "base_cmd_zeroed_reason": base_cmd_zeroed_reason,
-        "drawer_open_fraction": float(state.get("drawer_open_fraction", 0.0)),
-        "ee_to_handle_dist": float(state.get("ee_to_handle_dist", np.nan)),
-    }
-    return _restore_action_shape(reanchored_chunk, was_single_chunk), info
-
-
 def _as_chunk(action) -> tuple[np.ndarray, bool]:
     action = np.asarray(action, dtype=np.float32)
     if action.ndim == 1:
@@ -5276,24 +1186,542 @@ def _safe_info_get(info: dict, key: str, default=None):
     return value
 
 
-def _optional_float(value):
-    if value is None:
+
+def _action_sequence_history_snapshot(env: Any) -> dict[str, Any]:
+    wrapper = _find_wrapped_env_with_attr(env, "_action_history")
+    if wrapper is None:
+        return {"available": False}
+    try:
+        history = np.asarray(getattr(wrapper, "_action_history"), dtype=np.float32)
+        cur_step = int(getattr(wrapper, "_cur_step"))
+        if history.ndim != 3 or not 0 <= cur_step < history.shape[1]:
+            return {"available": False}
+        column = history[:, cur_step]
+        smoothed = getattr(wrapper, "_last_smoothed_action", None)
+        smoothed_arr = np.asarray(smoothed, dtype=np.float32).reshape(-1) if smoothed is not None else np.asarray([], dtype=np.float32)
+        return {"available": True, "cur_step": cur_step, "column_sum": float(np.sum(column)), "column_l2": float(np.linalg.norm(column)), "column_nonzero_count": int(np.count_nonzero(column)), "last_smoothed_l2": float(np.linalg.norm(smoothed_arr))}
+    except Exception:  # noqa: BLE001
+        return {"available": False}
+
+
+def _action_sequence_history_snapshot_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    if not (bool(before.get("available")) and bool(after.get("available"))):
+        return {"mpc_handoff_scoring_history_snapshot_available": False, "mpc_handoff_scoring_history_mutated": None}
+    delta = max(abs(float(after.get("column_sum", 0.0)) - float(before.get("column_sum", 0.0))), abs(float(after.get("column_l2", 0.0)) - float(before.get("column_l2", 0.0))), abs(float(after.get("last_smoothed_l2", 0.0)) - float(before.get("last_smoothed_l2", 0.0))), abs(int(after.get("column_nonzero_count", 0)) - int(before.get("column_nonzero_count", 0))), abs(int(after.get("cur_step", 0)) - int(before.get("cur_step", 0))))
+    return {"mpc_handoff_scoring_history_snapshot_available": True, "mpc_handoff_scoring_history_mutated": bool(delta > 1e-6), "mpc_handoff_scoring_history_mutation_delta": float(delta), "mpc_handoff_scoring_history_before_cur_step": int(before.get("cur_step", 0)), "mpc_handoff_scoring_history_after_cur_step": int(after.get("cur_step", 0))}
+
+
+def _resolve_nominal_window_source_path(source):
+    if source is None:
         return None
-    return float(value)
+    path = Path(str(source)).expanduser()
+    if path.is_dir():
+        return path / "nominal_rollout_diagnostics.jsonl"
+    return path
 
 
-def _optional_bool(value):
-    if value is None:
+def _load_phase_reanchor_nominal_windows(args):
+    if not bool(getattr(args, "phase_reanchor_nominal_window_enabled", False)):
+        return []
+    source_path = _resolve_nominal_window_source_path(
+        getattr(args, "phase_reanchor_nominal_window_source", None)
+    )
+    if source_path is None or not source_path.exists():
+        return []
+
+    run_dir = source_path.parent
+    success_eps = None
+    ep_summary = run_dir / "metrics_episodes.json"
+    if ep_summary.exists():
+        try:
+            episodes = json.loads(ep_summary.read_text())
+            success_eps = {
+                int(e.get("episode")) for e in episodes if bool(e.get("success"))
+            }
+        except Exception:  # noqa: BLE001
+            success_eps = None
+
+    metric_by_ep_step = {}
+    metrics_path = run_dir / "metrics.jsonl"
+    if metrics_path.exists():
+        try:
+            with metrics_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    ep = int(row.get("episode", -1))
+                    step = int(row.get("step", -1))
+                    metric_by_ep_step[(ep, step)] = row
+        except Exception:  # noqa: BLE001
+            metric_by_ep_step = {}
+
+    diag_by_ep = {}
+    with source_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            ep = int(row.get("episode", -1))
+            if success_eps is not None and ep not in success_eps:
+                continue
+            step = int(row.get("step", -1))
+            q = row.get("q_before")
+            act = row.get("nominal_first_action") or row.get("safe_first_action")
+            if q is None:
+                continue
+            diag_by_ep.setdefault(ep, {})[step] = {"q": q, "action": act}
+
+    window_len = max(1, int(getattr(args, "phase_reanchor_nominal_window_len", 4)))
+    lead = max(0, int(getattr(args, "phase_reanchor_nominal_window_lead_steps", 3)))
+    windows = []
+    seen = set()
+    for ep, rows in sorted(diag_by_ep.items()):
+        if not rows:
+            continue
+        manipulation_steps = sorted(
+            step for (m_ep, step), m in metric_by_ep_step.items()
+            if m_ep == ep and m.get("interaction_context") == "manipulation_progress"
+        )
+        candidate_windows = []
+        if manipulation_steps:
+            raw_lags = getattr(args, "phase_reanchor_nominal_window_pregrasp_lags", [])
+            if raw_lags is None:
+                raw_lags = []
+            if isinstance(raw_lags, str):
+                raw_lags = [x.strip() for x in raw_lags.split(",") if x.strip()]
+            pregrasp_lags = []
+            for lag in raw_lags:
+                try:
+                    lag_i = int(lag)
+                except Exception:  # noqa: BLE001
+                    continue
+                if lag_i >= 0:
+                    pregrasp_lags.append(lag_i)
+            first_manipulation_step = int(manipulation_steps[0])
+            for lag_i in sorted(set(pregrasp_lags), reverse=True):
+                target_end = max(0, first_manipulation_step - lag_i)
+                candidate_windows.append((target_end, f"pregrasp_lag_{lag_i}_window", "pregrasp"))
+            # Use multiple windows around the successful pregrasp-to-manipulation
+            # transition, not only the first one.  This gives retargeting a more
+            # task-useful option when q is close but EE/handle geometry is still off.
+            for step in manipulation_steps[:24]:
+                candidate_windows.append((max(0, int(step) - 1 + lead), "manipulation_progress_sliding_window", "manipulation"))
+        else:
+            scored = []
+            for step in rows:
+                m = metric_by_ep_step.get((ep, step), {})
+                d = m.get("resume_affordance_target_distance") or m.get("ee_to_handle_dist")
+                try:
+                    d = float(d)
+                except Exception:  # noqa: BLE001
+                    d = float("inf")
+                scored.append((d, step))
+            if scored:
+                candidate_windows.append((min(scored)[1], "min_distance_window", "unknown"))
+        for target_end, selection_label, resume_stage in candidate_windows:
+            steps = [step for step in range(target_end - window_len + 1, target_end + 1) if step in rows]
+            if len(steps) < window_len:
+                available = [step for step in sorted(rows) if step <= target_end]
+                steps = available[-window_len:]
+            if len(steps) < window_len:
+                continue
+            key = (ep, tuple(steps))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                q_window = np.asarray([rows[step]["q"] for step in steps], dtype=np.float32)
+            except Exception:  # noqa: BLE001
+                continue
+            action_rows = [rows[step].get("action") for step in steps]
+            action_window = None
+            if all(a is not None for a in action_rows):
+                try:
+                    action_window = np.asarray(action_rows, dtype=np.float32)
+                except Exception:  # noqa: BLE001
+                    action_window = None
+            ref_metrics = [metric_by_ep_step.get((ep, step), {}) for step in steps]
+            distances = []
+            progress_steps = 0
+            for m in ref_metrics:
+                if m.get("interaction_context") == "manipulation_progress":
+                    progress_steps += 1
+                d = m.get("resume_affordance_target_distance") or m.get("ee_to_handle_dist")
+                try:
+                    distances.append(float(d))
+                except Exception:  # noqa: BLE001
+                    pass
+            windows.append(
+                {
+                    "source": str(source_path),
+                    "episode": int(ep),
+                    "steps": [int(x) for x in steps],
+                    "start_step": int(steps[0]),
+                    "end_step": int(steps[-1]),
+                    "q_window": q_window,
+                    "action_window": action_window,
+                    "mean_target_distance": float(np.mean(distances)) if distances else None,
+                    "min_target_distance": float(np.min(distances)) if distances else None,
+                    "manipulation_progress_steps": int(progress_steps),
+                    "selection": str(selection_label),
+                    "resume_stage": str(resume_stage),
+                }
+            )
+    return windows
+
+
+def _select_phase_reanchor_nominal_window(windows, q_full, oscbf, phase_state=None, args=None):
+    if not windows:
         return None
-    if isinstance(value, (list, tuple, np.ndarray)):
-        return bool(np.asarray(value).any())
-    return bool(value)
-
-
-def _optional_str(value):
-    if value is None:
+    q = np.asarray(q_full, dtype=np.float32).reshape(-1)
+    state_idx = np.asarray(getattr(oscbf, "bigym_state_safety_indices", []), dtype=np.int64)
+    if state_idx.size == 0:
+        base = np.asarray(getattr(oscbf, "bigym_state_base_indices", []), dtype=np.int64)
+        arm = np.asarray(getattr(oscbf, "bigym_state_arm_indices", []), dtype=np.int64)
+        state_idx = np.concatenate([base, arm]) if base.size or arm.size else arm
+    live_distance = None
+    if phase_state is not None:
+        try:
+            live_distance = float(phase_state.get("ee_to_handle_dist"))
+        except Exception:  # noqa: BLE001
+            live_distance = None
+    q_ok_threshold = 0.24
+    distance_margin = 0.04
+    selector_mode = str(getattr(args, "phase_reanchor_nominal_window_selector", "taskspace_aware"))
+    requested_stage = str(getattr(args, "phase_reanchor_nominal_window_stage", "auto"))
+    candidate_windows = list(windows)
+    if requested_stage != "auto":
+        staged = [w for w in candidate_windows if str(w.get("resume_stage", "unknown")) == requested_stage]
+        if staged:
+            candidate_windows = staged
+    best = None
+    for window in candidate_windows:
+        q_window = np.asarray(window.get("q_window"), dtype=np.float32)
+        if q_window.ndim != 2 or q_window.shape[0] == 0:
+            continue
+        valid = state_idx < min(q.shape[0], q_window.shape[1])
+        if not np.any(valid):
+            continue
+        idx = state_idx[valid]
+        err = q_window[:, idx] - q[idx].reshape(1, -1)
+        l2 = float(np.min(np.linalg.norm(err, axis=1)))
+        ref_distance = window.get("mean_target_distance")
+        ref_distance = float(ref_distance) if isinstance(ref_distance, (int, float)) else 0.5
+        progress_bonus = 0.02 * float(window.get("manipulation_progress_steps", 0) or 0)
+        taskspace_gap = None
+        if live_distance is not None and np.isfinite(live_distance):
+            taskspace_gap = float(live_distance - ref_distance)
+        retarget = bool(taskspace_gap is not None and taskspace_gap > distance_margin)
+        if selector_mode == "distribution_first":
+            # Distribution-first reanchor treats live task-space geometry as a
+            # feasibility signal, not as the objective. ACT should regain a
+            # plausible pregrasp/resume history and then perform approach/grasp
+            # itself instead of being driven to the handle by the safety filter.
+            stage = str(window.get("resume_stage", "unknown"))
+            score = l2 + 0.05 * ref_distance
+            reason = f"distribution_first_{stage}"
+        elif retarget:
+            # Nominal q windows are priors, not absolute targets.  When the
+            # live end effector is visibly farther from the task target than a
+            # candidate successful window, prefer task-space-compatible windows
+            # and keep q distance as a regularizer instead of a hard precondition.
+            q_penalty = 0.10 * l2 if l2 <= q_ok_threshold else 0.35 * l2
+            score = ref_distance + q_penalty - progress_bonus
+            reason = "taskspace_retarget"
+        else:
+            score = l2 + 0.25 * ref_distance - progress_bonus
+            reason = "nearest_full_q"
+        if best is None or score < best[0]:
+            best = (score, l2, reason, window)
+    if best is None:
         return None
-    return str(value)
+    _, l2, reason, window = best
+    selected = dict(window)
+    selected["current_q_l2"] = float(l2)
+    selected["selection_reason"] = reason
+    selected["selector_mode"] = selector_mode
+    if live_distance is not None and np.isfinite(live_distance):
+        selected["live_target_distance"] = float(live_distance)
+    return selected
+
+def _phase_reanchor_live_release_status(phase_state, args):
+    if not bool(getattr(args, 'phase_reanchor_release_requires_live_taskspace', True)):
+        return True, 'disabled', None, None
+    if not isinstance(phase_state, dict):
+        return False, 'missing_phase_state', None, None
+    phase = str(phase_state.get('phase', 'unknown'))
+    if phase == 'done':
+        return True, 'task_done', 0.0, 0.0
+    try:
+        handle_pos = np.asarray(phase_state.get('handle_pos'), dtype=np.float64).reshape(-1)
+        ee_pos = np.asarray(phase_state.get('ee_pos'), dtype=np.float64).reshape(-1)
+    except Exception:
+        handle_pos = np.asarray([], dtype=np.float64)
+        ee_pos = np.asarray([], dtype=np.float64)
+    target_error = None
+    try:
+        target_error = float(phase_state.get('ee_to_target_dist'))
+        if not np.isfinite(target_error):
+            target_error = None
+    except (TypeError, ValueError):
+        target_error = None
+    if target_error is None and handle_pos.size >= 2 and ee_pos.size >= 2:
+        if phase == 'pull':
+            offset_xy = getattr(args, 'phase_reanchor_pull_offset_xy', [0.0, -0.1])
+        elif phase == 'grasp':
+            offset_xy = getattr(args, 'phase_reanchor_grasp_offset_xy', [-0.03, 0.0])
+        else:
+            offset_xy = getattr(args, 'phase_reanchor_pregrasp_offset_xy', [-0.12, -0.06])
+        offset_xy = np.asarray(offset_xy, dtype=np.float64).reshape(2)
+        target_xy = handle_pos[:2] + offset_xy
+        target_error = float(np.linalg.norm(target_xy - ee_pos[:2]))
+    handle_dist = None
+    try:
+        handle_dist = float(phase_state.get('ee_to_handle_dist'))
+        if not np.isfinite(handle_dist):
+            handle_dist = None
+    except (TypeError, ValueError):
+        handle_dist = None
+    if bool(phase_state.get('task_point_geometry_untrusted', False)):
+        return False, 'live_taskspace_geometry_untrusted', target_error, handle_dist
+    target_limit = float(getattr(args, 'phase_reanchor_live_release_target_error', 0.16))
+    handle_limit = float(getattr(args, 'phase_reanchor_live_release_handle_dist', 0.24))
+    target_ok = target_error is not None and np.isfinite(target_error) and target_error <= target_limit
+    handle_ok = handle_dist is not None and np.isfinite(handle_dist) and handle_dist <= handle_limit
+    if bool(getattr(args, "phase_reanchor_live_release_require_both", False)):
+        if target_ok and handle_ok:
+            return True, 'live_taskspace_ready_both', target_error, handle_dist
+        if target_error is None and handle_dist is None:
+            return False, 'live_taskspace_unavailable', target_error, handle_dist
+        return False, 'live_taskspace_not_ready_both', target_error, handle_dist
+    if target_ok or handle_ok:
+        return True, 'live_taskspace_ready', target_error, handle_dist
+    if target_error is None and handle_dist is None:
+        return False, 'live_taskspace_unavailable', target_error, handle_dist
+    return False, 'live_taskspace_not_ready', target_error, handle_dist
+
+
+def _phase_reanchor_bridge_contact_status(phase_state, args):
+    requires_contact = bool(getattr(args, "phase_reanchor_bridge_requires_handle_proximity", False))
+    try:
+        limit = float(
+            getattr(
+                args,
+                "phase_reanchor_bridge_handle_dist",
+                getattr(args, "phase_reanchor_live_release_handle_dist", 0.24),
+            )
+        )
+    except (TypeError, ValueError):
+        limit = float(getattr(args, "phase_reanchor_live_release_handle_dist", 0.24))
+    handle_dist = None
+    if isinstance(phase_state, dict):
+        for key in ("gripper_to_handle_dist", "ee_to_handle_dist"):
+            try:
+                value = float(phase_state.get(key))
+                if np.isfinite(value):
+                    handle_dist = value
+                    break
+            except (TypeError, ValueError):
+                pass
+        if bool(phase_state.get("task_point_geometry_untrusted", False)):
+            return False, "bridge_contact_geometry_untrusted", handle_dist, limit
+    elif requires_contact:
+        return False, "bridge_contact_missing_phase_state", None, limit
+    if not requires_contact:
+        return True, "bridge_contact_gate_disabled", handle_dist, limit
+    if handle_dist is None:
+        return False, "bridge_contact_handle_unavailable", handle_dist, limit
+    if handle_dist <= limit:
+        return True, "bridge_contact_ready", handle_dist, limit
+    return False, "bridge_contact_not_ready", handle_dist, limit
+
+
+def _act_resumable_score_terms(safety_info, args):
+    if not isinstance(safety_info, dict):
+        return {}
+
+    def _finite_float(key, default=None):
+        try:
+            value = safety_info.get(key, default)
+            value = float(value)
+            return value if np.isfinite(value) else None
+        except (TypeError, ValueError):
+            return None
+
+    def _distance_score(distance, good, scale):
+        if distance is None:
+            return None
+        return float(np.clip(1.0 - max(0.0, distance - good) / max(scale, 1e-6), 0.0, 1.0))
+
+    nominal_score = _finite_float("resume_affordance_component_score")
+    if nominal_score is None:
+        nominal_score = _finite_float("resume_affordance_score")
+    nominal_min = _finite_float("resume_affordance_min_component_score", 0.25)
+    if nominal_min is None:
+        nominal_min = 0.25
+
+    target_limit = float(getattr(args, "phase_reanchor_live_release_target_error", 0.16))
+    handle_limit = float(getattr(args, "phase_reanchor_live_release_handle_dist", 0.24))
+    target_dist = _finite_float("phase_reanchor_ee_to_target_dist")
+    if target_dist is None:
+        target_dist = _finite_float("phase_reanchor_live_release_target_error")
+    handle_dist = _finite_float("phase_reanchor_ee_to_handle_dist")
+    if handle_dist is None:
+        handle_dist = _finite_float("phase_reanchor_live_release_handle_dist")
+
+    bridge_requires_handle = bool(getattr(args, "phase_reanchor_bridge_requires_handle_proximity", False))
+    bridge_handle_limit = float(getattr(args, "phase_reanchor_bridge_handle_dist", handle_limit))
+    target_score = _distance_score(target_dist, target_limit, 0.45)
+    handle_score = _distance_score(handle_dist, bridge_handle_limit if bridge_requires_handle else handle_limit, 0.45)
+    affordance_available = bool(safety_info.get("resume_affordance_available", False))
+    affordance_task_relevant = bool(safety_info.get("resume_affordance_task_relevant", False))
+    affordance_ok = bool(safety_info.get("resume_affordance_ok", False))
+    live_scores = [score for score in (target_score, handle_score) if score is not None]
+    if bridge_requires_handle and target_score is not None and handle_score is not None:
+        live_score = min(target_score, handle_score)
+    else:
+        live_score = max(live_scores) if live_scores else _finite_float("resume_affordance_target_distance_score")
+    geometry_untrusted = bool(safety_info.get("phase_reanchor_task_point_geometry_untrusted", False))
+    if geometry_untrusted and live_score is not None:
+        live_score = 0.0
+
+    nominal_ok = bool(nominal_score is not None and nominal_score >= nominal_min)
+    target_ok = target_dist is not None and target_dist <= target_limit
+    handle_ok = handle_dist is not None and handle_dist <= (bridge_handle_limit if bridge_requires_handle else handle_limit)
+    if bridge_requires_handle:
+        live_ok = bool(not geometry_untrusted and target_ok and handle_ok)
+    elif target_dist is None and handle_dist is None:
+        # Bigym can expose a task-specific live affordance without exposing a
+        # phase-reanchor distance. Do not turn valid live geometry into OOD just
+        # because the optional reanchor telemetry is unavailable.
+        live_ok = bool(
+            not geometry_untrusted
+            and affordance_available
+            and affordance_task_relevant
+            and affordance_ok
+        )
+    else:
+        live_ok = bool(not geometry_untrusted and (target_ok or handle_ok))
+    score = None
+    if nominal_score is not None and live_score is not None:
+        score = float(min(nominal_score, live_score))
+
+    return {
+        "act_resumable_score": score,
+        "act_resumable_nominal_score": nominal_score,
+        "act_resumable_live_score": live_score,
+        "act_resumable_nominal_ok": nominal_ok if nominal_score is not None else None,
+        "act_resumable_live_ok": live_ok if live_score is not None else None,
+        "act_resumable_ok": bool(nominal_ok and live_ok) if score is not None else None,
+        "act_resumable_live_target_distance": target_dist,
+        "act_resumable_live_handle_distance": handle_dist,
+        "act_resumable_live_requires_handle_proximity": bridge_requires_handle,
+        "act_resumable_live_handle_limit": bridge_handle_limit if bridge_requires_handle else handle_limit,
+        "act_resumable_geometry_untrusted": geometry_untrusted,
+    }
+
+def _resume_affordance_context_from_task_state(
+    task_state: Optional[dict[str, Any]],
+    phase_state: Optional[dict[str, Any]],
+    *,
+    gripper_latched: bool = False,
+    args=None,
+) -> dict[str, Any]:
+    """Translate eval/task diagnostics into generic SafeChunk resume features."""
+    context: dict[str, Any] = {
+        "resume_adapter": "bigym_task_diagnostics",
+        "resume_context_source": "diagnostic_task_state",
+        "resume_target_label": "interaction_target",
+    }
+    task_state = task_state or {}
+    object_state = task_state.get("object_state")
+    if isinstance(object_state, dict):
+        context["resume_object_state_available"] = True
+    progress = task_state.get("task_progress")
+    if progress is not None:
+        try:
+            progress_f = float(progress)
+            if np.isfinite(progress_f):
+                context["resume_task_progress"] = progress_f
+        except (TypeError, ValueError):
+            pass
+    distance = task_state.get("ee_object_distance")
+    if distance is not None:
+        try:
+            distance_f = float(distance)
+            if np.isfinite(distance_f):
+                context["resume_target_distance"] = distance_f
+                context["resume_target_distance_source"] = "diagnostic_task_state.ee_object_distance"
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(phase_state, dict):
+        context["resume_adapter"] = "bigym_phase_reanchor_adapter"
+        context["resume_context_source"] = "phase_reanchor_state"
+        phase = str(phase_state.get("phase", "unknown"))
+        if phase == "pre_grasp":
+            context["interaction_context"] = "pre_contact"
+        elif phase == "grasp":
+            context["interaction_context"] = "contact_rich"
+        elif phase == "pull":
+            context["interaction_context"] = "manipulation_progress"
+        elif phase == "done":
+            context["interaction_context"] = "done"
+        else:
+            context["interaction_context"] = phase
+        distance = phase_state.get("ee_to_handle_dist")
+        if distance is not None:
+            try:
+                distance_f = float(distance)
+                if np.isfinite(distance_f):
+                    context["resume_target_distance"] = distance_f
+                    context["resume_target_distance_source"] = "phase_reanchor_state.ee_to_handle_dist"
+            except (TypeError, ValueError):
+                pass
+        for source_key, context_key in (
+            ("handle_pos", "resume_target_position"),
+            ("ee_pos", "resume_current_ee_position"),
+            ("ee_to_handle_xy", "resume_target_vector"),
+        ):
+            vector = phase_state.get(source_key)
+            if vector is None:
+                continue
+            try:
+                vector_arr = np.asarray(vector, dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            if vector_arr.size > 0 and bool(np.all(np.isfinite(vector_arr))):
+                context[context_key] = [float(v) for v in vector_arr.tolist()]
+                context[f"{context_key}_source"] = f"phase_reanchor_state.{source_key}"
+        drawer_fraction = phase_state.get("drawer_open_fraction")
+        if drawer_fraction is not None:
+            try:
+                progress_f = float(drawer_fraction)
+                if np.isfinite(progress_f):
+                    context["resume_task_progress"] = progress_f
+            except (TypeError, ValueError):
+                pass
+        gripper_closed = bool(phase_state.get("gripper_closed", False))
+        context["resume_gripper_closed"] = gripper_closed
+        context["resume_target_contact"] = bool(gripper_latched or gripper_closed)
+
+    if "interaction_context" not in context:
+        progress_f = context.get("resume_task_progress")
+        distance_f = context.get("resume_target_distance")
+        grasp_dist = float(getattr(args, "phase_reanchor_grasp_dist", 0.12)) if args is not None else 0.12
+        min_progress = float(getattr(args, "post_recovery_task_guard_min_progress", 1e-6)) if args is not None else 1e-6
+        if progress_f is not None and progress_f > min_progress:
+            context["interaction_context"] = "manipulation_progress"
+        elif distance_f is not None and distance_f <= grasp_dist:
+            context["interaction_context"] = "pre_contact"
+        elif distance_f is not None:
+            context["interaction_context"] = "free_motion"
+        else:
+            context["interaction_context"] = "unknown"
+    if "resume_target_contact" not in context and gripper_latched:
+        context["resume_target_contact"] = True
+    return context
 
 
 def _unmodelled_robot_contact_reason(contact_pairs):
@@ -5327,142 +1755,6 @@ def _assert_chunk_properties(nominal_chunk, safe_chunk, arm_indices):
         raise AssertionError("Safe chunk contains non-finite values")
     for k in range(nominal_chunk.shape[0]):
         assert_action_properties(nominal_chunk[k], safe_chunk[k], arm_indices)
-
-
-def _chunk_filter_advantage_metrics(
-    nominal_chunk,
-    safe_chunk,
-    arm_indices,
-    intervention_eps: float,
-) -> dict[str, Optional[float]]:
-    nominal_chunk, _ = _as_chunk(nominal_chunk)
-    safe_chunk, _ = _as_chunk(safe_chunk)
-    arm_indices = np.asarray(arm_indices, dtype=np.int64)
-
-    nominal_arm = nominal_chunk[:, arm_indices]
-    safe_arm = safe_chunk[:, arm_indices]
-    delta_arm = safe_arm - nominal_arm
-    step_arm_delta = np.linalg.norm(delta_arm, axis=1)
-    edited = step_arm_delta > float(intervention_eps)
-    edited_steps = np.flatnonzero(edited)
-    chunk_arm_delta = float(np.linalg.norm(delta_arm))
-    first_delta = float(step_arm_delta[0]) if step_arm_delta.size else 0.0
-    future_delta = (
-        float(np.linalg.norm(delta_arm[1:])) if delta_arm.shape[0] > 1 else 0.0
-    )
-
-    if nominal_arm.shape[0] > 1:
-        nominal_variation = float(np.mean(np.linalg.norm(np.diff(nominal_arm, axis=0), axis=1)))
-        safe_variation = float(np.mean(np.linalg.norm(np.diff(safe_arm, axis=0), axis=1)))
-        edit_variation = float(np.mean(np.linalg.norm(np.diff(delta_arm, axis=0), axis=1)))
-    else:
-        nominal_variation = 0.0
-        safe_variation = 0.0
-        edit_variation = 0.0
-
-    denom = max(chunk_arm_delta, 1e-12)
-    return {
-        "chunk_modified_fraction": float(np.mean(edited)) if edited.size else 0.0,
-        "chunk_modified_steps": int(edited_steps.size),
-        "chunk_first_modified_step": int(edited_steps[0]) if edited_steps.size else None,
-        "chunk_last_modified_step": int(edited_steps[-1]) if edited_steps.size else None,
-        "chunk_mean_step_arm_delta": float(np.mean(step_arm_delta)) if step_arm_delta.size else 0.0,
-        "chunk_max_step_arm_delta": float(np.max(step_arm_delta)) if step_arm_delta.size else 0.0,
-        "chunk_future_arm_delta": future_delta,
-        "chunk_future_edit_fraction": float(future_delta / denom),
-        "chunk_first_edit_fraction": float(first_delta / denom),
-        "chunk_safe_arm_variation": safe_variation,
-        "chunk_nominal_arm_variation": nominal_variation,
-        "chunk_arm_variation_delta": float(safe_variation - nominal_variation),
-        "chunk_edit_variation": edit_variation,
-        "chunk_preemptive_intervention": bool(first_delta <= float(intervention_eps) and future_delta > float(intervention_eps)),
-    }
-
-
-
-
-def _path_deviation_metrics(safechunk, obs, nominal_chunk, safe_chunk) -> dict[str, Optional[float]]:
-    try:
-        nominal_q = np.asarray(
-            safechunk.rollout_nominal_chunk(obs, nominal_chunk),
-            dtype=np.float32,
-        )
-        safe_q = np.asarray(
-            safechunk.rollout_nominal_chunk(obs, safe_chunk),
-            dtype=np.float32,
-        )
-        if nominal_q.shape != safe_q.shape or nominal_q.ndim != 2:
-            return {
-                "path_mean_deviation": None,
-                "path_max_deviation": None,
-                "path_final_deviation": None,
-            }
-        state_idx = np.asarray(safechunk.controlled_state_indices, dtype=np.int64)
-        valid = state_idx < nominal_q.shape[1]
-        state_idx = state_idx[valid]
-        if state_idx.size == 0:
-            return {
-                "path_mean_deviation": None,
-                "path_max_deviation": None,
-                "path_final_deviation": None,
-            }
-        step_deviation = np.linalg.norm(safe_q[:, state_idx] - nominal_q[:, state_idx], axis=1)
-        return {
-            "path_mean_deviation": float(np.mean(step_deviation)) if step_deviation.size else 0.0,
-            "path_max_deviation": float(np.max(step_deviation)) if step_deviation.size else 0.0,
-            "path_final_deviation": float(step_deviation[-1]) if step_deviation.size else 0.0,
-        }
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Path deviation metric failed: %s", exc)
-        return {
-            "path_mean_deviation": None,
-            "path_max_deviation": None,
-            "path_final_deviation": None,
-        }
-
-
-
-
-def _jsonable_trace_value(value):
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(k): _jsonable_trace_value(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable_trace_value(v) for v in value]
-    try:
-        arr = np.asarray(value)
-        if arr.ndim > 0:
-            if np.issubdtype(arr.dtype, np.number) or arr.dtype == np.bool_:
-                return arr.tolist()
-            return arr.astype(str).tolist()
-        if np.issubdtype(arr.dtype, np.number):
-            return arr.item()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        return float(value)
-    except Exception:  # noqa: BLE001
-        return str(value)
-
-
-def _clearance_sequence_payload(safety_eval, horizon: int):
-    if not isinstance(safety_eval, dict):
-        return None
-    clearances = safety_eval.get("min_clearances")
-    if clearances is None:
-        return None
-    try:
-        arr = np.asarray(clearances, dtype=np.float32).reshape(-1)
-        if horizon > 0:
-            arr = arr[:horizon]
-        return arr.astype(float).tolist()
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def _sliced_safety_eval(safety_eval, start: int, end: int):
@@ -5535,256 +1827,22 @@ def _state_trace_payload(
             int(q_arr.shape[0]) if q_arr.ndim >= 1 else 0,
         ),
     }
+    robot_h_geometry = None
+    if horizon_operator is not None:
+        try:
+            robot_h_geometry = horizon_operator.robot_safety_geometry_sequence(
+                q_arr,
+                trace_indices=(0,),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Robot h-compute trace geometry failed: %s", exc)
+    if robot_h_geometry is not None:
+        payload["robot_h_compute_geometry"] = _jsonable_trace_value(robot_h_geometry)
     if action_arr is not None:
         payload["action_chunk"] = action_arr.astype(float).tolist()
     if include_q_states:
         payload["q_seq"] = q_arr.astype(float).tolist()
     return payload
-
-
-def _data_position(data, idx: int, *field_names):
-    for field_name in field_names:
-        values = getattr(data, field_name, None)
-        if values is None:
-            continue
-        try:
-            return np.asarray(values[int(idx)], dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
-def _mujoco_named_position(model, data, obj_type, names: Sequence[str], *field_names):
-    try:
-        import mujoco
-    except Exception:  # noqa: BLE001
-        return None, None
-
-    for name in names:
-        obj_id = mujoco.mj_name2id(model, obj_type, name)
-        if obj_id < 0:
-            continue
-        pos = _data_position(data, int(obj_id), *field_names)
-        if pos is not None and np.isfinite(pos).all():
-            return pos, name
-    return None, None
-
-
-def _human_arm_wrist_position(model, data):
-    try:
-        import mujoco
-    except Exception:  # noqa: BLE001
-        return None, None
-
-    pos, name = _mujoco_named_position(
-        model,
-        data,
-        mujoco.mjtObj.mjOBJ_BODY,
-        ("cylinder_arm/wrist", "wrist"),
-        "xpos",
-        "body_xpos",
-    )
-    if pos is not None:
-        return pos, name
-
-    pos, name = _mujoco_named_position(
-        model,
-        data,
-        mujoco.mjtObj.mjOBJ_GEOM,
-        ("cylinder_arm/vis_wrist", "vis_wrist"),
-        "geom_xpos",
-    )
-    if pos is not None:
-        return pos, name
-
-    return None, None
-
-
-def _human_arm_trajectory_sample(env, episode: int, step: int):
-    try:
-        import mujoco
-    except Exception:  # noqa: BLE001
-        return None
-
-    base_env = _find_wrapped_env_with_attr(env, "mojo")
-    if base_env is None:
-        return None
-    try:
-        model = base_env.mojo.physics.model.ptr
-        data = base_env.mojo.physics.data
-    except Exception:  # noqa: BLE001
-        try:
-            model = base_env.mojo.model
-            data = base_env.mojo.data
-        except Exception:  # noqa: BLE001
-            return None
-
-    geoms = []
-    for gid in range(model.ngeom):
-        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ""
-        lower = name.lower()
-        if not (
-            lower.startswith("cylinder_arm/")
-            or lower.endswith("upperarm_geom")
-            or lower.endswith("forearm_geom")
-        ):
-            continue
-        try:
-            pos = np.asarray(data.geom_xpos[gid], dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            continue
-        geoms.append({"name": name, "pos": pos.astype(float).tolist()})
-
-    wrist_pos, wrist_name = _human_arm_wrist_position(model, data)
-    if not geoms and wrist_pos is None:
-        return None
-
-    sample = {
-        "episode": int(episode),
-        "step": int(step),
-        "time": float(getattr(data, "time", np.nan)),
-        "geoms": geoms,
-    }
-    if geoms:
-        centers = np.asarray([g["pos"] for g in geoms], dtype=np.float64)
-        sample["center"] = np.mean(centers, axis=0).astype(float).tolist()
-    if wrist_pos is not None:
-        sample["wrist_name"] = str(wrist_name)
-        sample["wrist_pos"] = np.asarray(wrist_pos, dtype=np.float64).astype(float).tolist()
-    return sample
-
-
-def _robot_ee_position(model, data):
-    try:
-        import mujoco
-    except Exception:  # noqa: BLE001
-        return None, None
-
-    pos, name = _mujoco_named_position(
-        model,
-        data,
-        mujoco.mjtObj.mjOBJ_SITE,
-        (
-            "right_wrist",
-            "h1/right_wrist",
-            "right_wrist_yaw",
-            "h1/right_wrist_yaw",
-            "wrist",
-            "h1/wrist",
-            "right_end_effector",
-            "h1/right_end_effector",
-            "right_gripper",
-            "h1/right_gripper",
-        ),
-        "site_xpos",
-    )
-    if pos is not None:
-        return pos, f"site:{name}"
-
-    priority_patterns = (
-        ("right_wrist",),
-        ("robotiq_2f85_right", "driver"),
-        ("robotiq_2f85_right",),
-        ("robotiq_2f85_right", "finger"),
-        ("robotiq_2f85_right", "pad"),
-    )
-    exclude_patterns = ("visual", "camera", "left")
-    for patterns in priority_patterns:
-        points = []
-        names = []
-        for geom_id in range(model.ngeom):
-            geom_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or ""
-            lower = geom_name.lower()
-            if not lower or any(excluded in lower for excluded in exclude_patterns):
-                continue
-            if all(pattern in lower for pattern in patterns):
-                pos = _data_position(data, geom_id, "geom_xpos")
-                if pos is not None and np.isfinite(pos).all():
-                    points.append(pos)
-                    names.append(geom_name)
-        if points:
-            return np.mean(np.stack(points, axis=0), axis=0), "geom_average:" + ",".join(names[:4])
-    return None, None
-
-
-def _robot_ee_trajectory_sample(
-    env,
-    episode: int,
-    step: int,
-    task_state=None,
-    horizon_operator=None,
-    q_full=None,
-):
-    pos = None
-    source = None
-    data = None
-
-    if horizon_operator is not None and q_full is not None:
-        try:
-            candidate = horizon_operator.ee_pose(np.asarray(q_full, dtype=np.float32))
-            if candidate is not None:
-                candidate = np.asarray(candidate, dtype=np.float64).reshape(-1)
-                if candidate.size >= 3 and np.isfinite(candidate[:3]).all():
-                    pos = candidate[:3]
-                    source = "safety_model_ee"
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Safety-model executed EE extraction failed: %s", exc)
-
-    try:
-        task = get_bigym_task(env)
-        model, data = _mujoco_model_data(task)
-        if pos is None and model is not None and data is not None:
-            pos, source = _robot_ee_position(model, data)
-    except Exception:  # noqa: BLE001
-        if pos is None:
-            source = None
-
-    if pos is None and isinstance(task_state, dict):
-        object_state = task_state.get("object_state")
-        if isinstance(object_state, dict) and object_state.get("ee_pos") is not None:
-            try:
-                candidate = np.asarray(object_state.get("ee_pos"), dtype=np.float64).reshape(3)
-                if np.isfinite(candidate).all():
-                    pos = candidate
-                    source = "diagnostic_task_state.ee_pos"
-            except Exception:  # noqa: BLE001
-                pos = None
-
-    if pos is None:
-        return None
-
-    sample = {
-        "episode": int(episode),
-        "step": int(step),
-        "time": float(getattr(data, "time", np.nan)) if data is not None else None,
-        "ee_pos": np.asarray(pos, dtype=np.float64).astype(float).tolist(),
-        "source": source,
-    }
-    if isinstance(task_state, dict):
-        for key in ("drawer_open_distance", "drawer_open_fraction", "drawer_joint_position"):
-            value = task_state.get(key)
-            if value is not None:
-                try:
-                    sample[key] = float(value)
-                except (TypeError, ValueError):
-                    pass
-        object_state = task_state.get("object_state")
-        if isinstance(object_state, dict):
-            copied_state = {}
-            for key in ("handle_pos", "drawer_open_distance", "drawer_open_fraction", "drawer_scene_geometry"):
-                value = object_state.get(key)
-                if value is not None:
-                    copied_state[key] = _jsonable_trace_value(value)
-            if copied_state:
-                sample["object_state"] = copied_state
-            if object_state.get("handle_pos") is not None:
-                try:
-                    handle_pos = np.asarray(object_state.get("handle_pos"), dtype=np.float64).reshape(3)
-                    if np.isfinite(handle_pos).all():
-                        sample["handle_pos"] = handle_pos.astype(float).tolist()
-                except Exception:  # noqa: BLE001
-                    pass
-    return sample
 
 
 def _horizon_human_capsule_trace(horizon_operator, obs, horizon: int):
@@ -5881,6 +1939,1471 @@ def _segment_len_from_info(safety_info, *keys, default=0):
     return int(default)
 
 
+def _to_flat_float_array(value) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.size == 0:
+        return np.asarray([], dtype=np.float64)
+    return arr
+
+
+def _float_list(value) -> Optional[list[float]]:
+    arr = _to_flat_float_array(value)
+    if arr is None:
+        return None
+    return arr.astype(float).tolist()
+
+
+def _diff_list(actual, expected) -> Optional[list[float]]:
+    actual_arr = _to_flat_float_array(actual)
+    expected_arr = _to_flat_float_array(expected)
+    if actual_arr is None or expected_arr is None:
+        return None
+    n = min(actual_arr.size, expected_arr.size)
+    if n <= 0:
+        return []
+    return (actual_arr[:n] - expected_arr[:n]).astype(float).tolist()
+
+
+def _vector_stats(values) -> dict[str, Optional[float]]:
+    arr = _to_flat_float_array(values)
+    if arr is None or arr.size == 0:
+        return {"l2": None, "max_abs": None, "mean_abs": None}
+    abs_arr = np.abs(arr)
+    return {
+        "l2": float(np.linalg.norm(arr)),
+        "max_abs": float(np.max(abs_arr)),
+        "mean_abs": float(np.mean(abs_arr)),
+    }
+
+
+def _h1_q_error_group_stats(error_values) -> dict[str, dict[str, Optional[float]]]:
+    arr = _to_flat_float_array(error_values)
+    if arr is None:
+        return {
+            "base": _vector_stats(None),
+            "arm": _vector_stats(None),
+            "all": _vector_stats(None),
+        }
+    return {
+        "base": _vector_stats(arr[:4]),
+        "arm": _vector_stats(arr[4:14]),
+        "all": _vector_stats(arr),
+    }
+
+
+def _named_h1_q_error_rows(actual, expected) -> list[dict[str, Any]]:
+    actual_arr = _to_flat_float_array(actual)
+    expected_arr = _to_flat_float_array(expected)
+    if actual_arr is None or expected_arr is None:
+        return []
+    n = min(actual_arr.size, expected_arr.size)
+    rows = []
+    names = list(TREE_JOINT_NAMES)
+    for i in range(n):
+        error = float(actual_arr[i] - expected_arr[i])
+        rows.append(
+            {
+                "index": int(i),
+                "name": names[i] if i < len(names) else f"dim_{i}",
+                "actual": float(actual_arr[i]),
+                "expected": float(expected_arr[i]),
+                "error": error,
+                "abs_error": abs(error),
+            }
+        )
+    return rows
+
+
+def _named_action_error_rows(actual, expected) -> list[dict[str, Any]]:
+    actual_arr = _to_flat_float_array(actual)
+    expected_arr = _to_flat_float_array(expected)
+    if actual_arr is None or expected_arr is None:
+        return []
+    n = min(actual_arr.size, expected_arr.size)
+    rows = []
+    for i in range(n):
+        error = float(actual_arr[i] - expected_arr[i])
+        rows.append(
+            {
+                "index": int(i),
+                "actual": float(actual_arr[i]),
+                "expected": float(expected_arr[i]),
+                "error": error,
+                "abs_error": abs(error),
+            }
+        )
+    return rows
+
+
+def _mujoco_state_snapshot(env) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    try:
+        mojo = get_bigym_mojo(env)
+        data = mojo.data
+        snapshot.update(
+            {
+                "time": float(data.time),
+                "qpos": np.asarray(data.qpos, dtype=np.float64).copy().astype(float).tolist(),
+                "qvel": np.asarray(data.qvel, dtype=np.float64).copy().astype(float).tolist(),
+                "ctrl": np.asarray(data.ctrl, dtype=np.float64).copy().astype(float).tolist(),
+            }
+        )
+        try:
+            snapshot["act"] = np.asarray(data.act, dtype=np.float64).copy().astype(float).tolist()
+        except Exception:  # noqa: BLE001
+            snapshot["act"] = None
+    except Exception as exc:  # noqa: BLE001
+        snapshot["mujoco_snapshot_error"] = str(exc)
+
+    try:
+        h1_state = extract_h1_state(env)
+        snapshot.update(
+            {
+                "h1_joint_names": list(TREE_JOINT_NAMES),
+                "h1_q_full": h1_state.q_full.astype(float).tolist(),
+                "h1_qd_full": h1_state.qd_full.astype(float).tolist(),
+                "h1_q_ctrl": h1_state.q_ctrl.astype(float).tolist(),
+                "h1_qd_ctrl": h1_state.qd_ctrl.astype(float).tolist(),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        snapshot["h1_snapshot_error"] = str(exc)
+    return _jsonable_trace_value(snapshot)
+
+
+
+def _mujoco_visual_pose_snapshot(env: Any) -> dict[str, Any]:
+    """Snapshot world poses for visual-context bodies/sites.
+
+    We intentionally keep this tiny: only body/site names containing wrist/head/camera/cam.
+    This tells us whether ACT's wrist/head camera geometry is actually the same at
+    recovery resume, without logging full RGB frames.
+    """
+
+    out: dict[str, Any] = {}
+    try:
+        mojo = get_bigym_mojo(env)
+        model = mojo.model
+        data = mojo.data
+    except Exception as exc:  # noqa: BLE001
+        return {"snapshot_error": str(exc)}
+
+    try:
+        import mujoco  # type: ignore
+    except Exception:  # noqa: BLE001
+        mujoco = None
+
+    tokens = ("wrist", "head", "camera", "cam")
+
+    def _name(kind: str, idx: int) -> str | None:
+        if mujoco is not None:
+            try:
+                obj = mujoco.mjtObj.mjOBJ_BODY if kind == "body" else mujoco.mjtObj.mjOBJ_SITE
+                name = mujoco.mj_id2name(model, obj, int(idx))
+                if name:
+                    return str(name)
+            except Exception:  # noqa: BLE001
+                pass
+        attr = "body_names" if kind == "body" else "site_names"
+        try:
+            names = getattr(model, attr)
+            name = names[int(idx)]
+            if isinstance(name, bytes):
+                return name.decode("utf-8", errors="ignore")
+            return str(name)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _include(name: str | None) -> bool:
+        if not name:
+            return False
+        lower = str(name).lower()
+        return any(token in lower for token in tokens)
+
+    def _capture(kind: str, count_attr: str, pos_attr: str, mat_attr: str) -> None:
+        try:
+            count = int(getattr(model, count_attr))
+            pos_arr = np.asarray(getattr(data, pos_attr), dtype=np.float64)
+            mat_arr = np.asarray(getattr(data, mat_attr), dtype=np.float64)
+        except Exception:  # noqa: BLE001
+            return
+        for idx in range(count):
+            name = _name(kind, idx)
+            if not _include(name):
+                continue
+            try:
+                pos = pos_arr[idx].reshape(-1)[:3].astype(float).tolist()
+            except Exception:  # noqa: BLE001
+                pos = None
+            try:
+                xmat = mat_arr[idx].reshape(-1)[:9].astype(float).tolist()
+            except Exception:  # noqa: BLE001
+                xmat = None
+            out[f"{kind}:{name}"] = {"pos": pos, "xmat": xmat}
+
+    _capture("body", "nbody", "xpos", "xmat")
+    _capture("site", "nsite", "site_xpos", "site_xmat")
+    return _jsonable_trace_value(out)
+
+
+def _mujoco_visual_pose_compare_metrics(
+    current: Any,
+    expected: Any,
+    prefix: str,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        f"{prefix}_key_count": None,
+        f"{prefix}_common_key_count": None,
+        f"{prefix}_missing_key_count": None,
+        f"{prefix}_pos_l2": None,
+        f"{prefix}_pos_max_abs": None,
+        f"{prefix}_pos_worst_key": None,
+        f"{prefix}_pos_worst_l2": None,
+        f"{prefix}_wrist_pos_l2": None,
+        f"{prefix}_head_pos_l2": None,
+        f"{prefix}_camera_pos_l2": None,
+        f"{prefix}_xmat_l2": None,
+        f"{prefix}_xmat_max_abs": None,
+        f"{prefix}_xmat_worst_key": None,
+        f"{prefix}_xmat_worst_l2": None,
+    }
+    if not isinstance(current, dict) or not isinstance(expected, dict):
+        return out
+    current_keys = {k for k, v in current.items() if isinstance(v, dict)}
+    expected_keys = {k for k, v in expected.items() if isinstance(v, dict)}
+    common = sorted(current_keys & expected_keys)
+    out[f"{prefix}_key_count"] = int(len(current_keys))
+    out[f"{prefix}_common_key_count"] = int(len(common))
+    out[f"{prefix}_missing_key_count"] = int(len(current_keys ^ expected_keys))
+
+    pos_sum_sq = 0.0
+    pos_max_abs = 0.0
+    pos_worst_key = None
+    pos_worst_l2 = None
+    xmat_sum_sq = 0.0
+    xmat_max_abs = 0.0
+    xmat_worst_key = None
+    xmat_worst_l2 = None
+    group_pos_sum_sq = {"wrist": 0.0, "head": 0.0, "camera": 0.0}
+
+    for key in common:
+        cur = current.get(key) or {}
+        exp = expected.get(key) or {}
+        for field, total_name in (("pos", "pos"), ("xmat", "xmat")):
+            cur_arr = _to_flat_float_array(cur.get(field))
+            exp_arr = _to_flat_float_array(exp.get(field))
+            if cur_arr is None or exp_arr is None:
+                continue
+            n = min(cur_arr.size, exp_arr.size)
+            if n <= 0:
+                continue
+            diff = cur_arr[:n] - exp_arr[:n]
+            l2 = float(np.linalg.norm(diff))
+            max_abs = float(np.max(np.abs(diff))) if diff.size else 0.0
+            if total_name == "pos":
+                pos_sum_sq += float(np.dot(diff, diff))
+                pos_max_abs = max(pos_max_abs, max_abs)
+                if pos_worst_l2 is None or l2 > pos_worst_l2:
+                    pos_worst_l2 = l2
+                    pos_worst_key = str(key)
+                lower = str(key).lower()
+                if "wrist" in lower:
+                    group_pos_sum_sq["wrist"] += float(np.dot(diff, diff))
+                if "head" in lower:
+                    group_pos_sum_sq["head"] += float(np.dot(diff, diff))
+                if "camera" in lower or "cam" in lower:
+                    group_pos_sum_sq["camera"] += float(np.dot(diff, diff))
+            else:
+                xmat_sum_sq += float(np.dot(diff, diff))
+                xmat_max_abs = max(xmat_max_abs, max_abs)
+                if xmat_worst_l2 is None or l2 > xmat_worst_l2:
+                    xmat_worst_l2 = l2
+                    xmat_worst_key = str(key)
+
+    out[f"{prefix}_pos_l2"] = float(np.sqrt(pos_sum_sq)) if common else None
+    out[f"{prefix}_pos_max_abs"] = float(pos_max_abs) if common else None
+    out[f"{prefix}_pos_worst_key"] = pos_worst_key
+    out[f"{prefix}_pos_worst_l2"] = pos_worst_l2
+    out[f"{prefix}_wrist_pos_l2"] = float(np.sqrt(group_pos_sum_sq["wrist"]))
+    out[f"{prefix}_head_pos_l2"] = float(np.sqrt(group_pos_sum_sq["head"]))
+    out[f"{prefix}_camera_pos_l2"] = float(np.sqrt(group_pos_sum_sq["camera"]))
+    out[f"{prefix}_xmat_l2"] = float(np.sqrt(xmat_sum_sq)) if common else None
+    out[f"{prefix}_xmat_max_abs"] = float(xmat_max_abs) if common else None
+    out[f"{prefix}_xmat_worst_key"] = xmat_worst_key
+    out[f"{prefix}_xmat_worst_l2"] = xmat_worst_l2
+    return out
+
+_ABLATION_PLANNED_RECOVERY_Q_SOURCES = (
+    # Eval-only ablation should test the planner's recovery/rejoin terminal
+    # state, not the one-step predicted post-action state. If none of these
+    # fields is present, skip the teleport so the ablation stays interpretable.
+    "mpc_recovery_target_tube_terminal_q",
+    "committed_rejoin_resume_tube_terminal_q",
+    "recover_resume_tube_terminal_q",
+)
+
+_ABLATION_PLANNED_RECOVERY_Q_WINDOW_SOURCES = (
+    "mpc_recovery_target_tube_window_q",
+    "mpc_recovery_target_tube_window_q_seq",
+    "mpc_recovery_target_tube_q_window",
+    "committed_rejoin_resume_tube_window_q",
+    "recover_resume_tube_window_q",
+    "recover_resume_window_q",
+)
+
+_ABLATION_PLANNED_RECOVERY_Q_TARGET_WINDOW_SOURCES = (
+    # Original nominal 4-frame window selected by the recovery resume-window
+    # objective.  In source_mode=original_nominal_window, the ablation teleports
+    # to the last q in this window and seeds ACT with the whole window.
+    "recover_resume_window_target_q",
+)
+
+_ABLATION_PLANNED_RECOVERY_ACCEPT_KEYS = (
+    "mpc_recovery_accepted",
+    "committed_suffix_replan_accepted",
+    "recover_accepted",
+    "explicit_recovery_accepted",
+    "optimized_accepted",
+    "committed_released_for_act_resume",
+    "resume_from_committed_rejoin",
+)
+
+
+def _mujoco_forward_for_ablation(mojo) -> None:
+    try:
+        mojo.forward()
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import mujoco  # type: ignore
+
+        mujoco.mj_forward(mojo.model, mojo.data)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not call MuJoCo forward after ablation q set: %s", exc)
+
+
+def _ablation_as_1d_q(value) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim >= 2:
+        arr = arr.reshape((-1, arr.shape[-1]))[-1]
+    else:
+        arr = arr.reshape(-1)
+    if not np.all(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def _ablation_select_planned_recovery_q(
+    safety_info: dict,
+    source_mode: str = "planned_terminal",
+) -> tuple[np.ndarray | None, str | None]:
+    if not isinstance(safety_info, dict):
+        return None, None
+    mode = str(source_mode or "planned_terminal").strip().lower()
+    source_groups = []
+    if mode in {
+        "original_nominal_window",
+        "nominal_window",
+        "target_window",
+        "closest_nominal_window",
+        "recover_resume_window_target_q",
+    }:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_TARGET_WINDOW_SOURCES)
+    if mode in {"auto", "target_then_planned", "nominal_then_planned"}:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_TARGET_WINDOW_SOURCES)
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_SOURCES)
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_WINDOW_SOURCES)
+    if not source_groups:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_SOURCES)
+        # Planned recovery runs often expose the 4-frame resume window but not a
+        # separate terminal-q field.  Use the last q in that window as the
+        # terminal force target so the replay-sequence ablation can test the
+        # actual optimizer output instead of silently skipping.
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_WINDOW_SOURCES)
+    for sources in source_groups:
+        for key in sources:
+            q = _ablation_as_1d_q(_safe_info_get(safety_info, key))
+            if q is not None:
+                return q, key
+    return None, None
+
+
+def _ablation_should_force_planned_recovery_q(safety_info: dict, trigger: str) -> bool:
+    trigger = str(trigger or "accepted").strip().lower()
+    if trigger in {"always", "any", "any_planned", "planned"}:
+        return True
+    if trigger in {"accepted", "accepted_recovery", "recovery_accepted"}:
+        return any(bool(_safe_info_get(safety_info, key)) for key in _ABLATION_PLANNED_RECOVERY_ACCEPT_KEYS)
+    if trigger.startswith("key:"):
+        return bool(_safe_info_get(safety_info, trigger.split(":", 1)[1]))
+    return any(bool(_safe_info_get(safety_info, key)) for key in _ABLATION_PLANNED_RECOVERY_ACCEPT_KEYS)
+
+
+def _ablation_force_q_indices(mode: str, q_dim: int) -> np.ndarray:
+    mode = str(mode or "controlled").strip().lower()
+    if q_dim <= 0:
+        return np.zeros((0,), dtype=np.int64)
+    if mode in {"controlled", "all", "full", "robot", "q", "whole_robot"}:
+        start, end = 0, q_dim
+    elif mode in {"base", "floating_base"}:
+        start, end = 0, min(4, q_dim)
+    elif mode in {"arm", "arms", "upper_body"}:
+        start, end = min(4, q_dim), q_dim
+    elif mode in {"left_arm", "left"}:
+        start, end = min(4, q_dim), min(9, q_dim)
+    elif mode in {"right_arm", "right"}:
+        start, end = min(9, q_dim), q_dim
+    else:
+        start, end = 0, q_dim
+    return np.arange(start, end, dtype=np.int64)
+
+
+def _copy_policy_obs_for_ablation(obs):
+    if not isinstance(obs, dict):
+        return obs
+    copied = {}
+    for key, value in obs.items():
+        try:
+            copied[key] = np.asarray(value).copy()
+        except Exception:  # noqa: BLE001
+            copied[key] = copy.deepcopy(value)
+    return copied
+
+
+def _observation_snapshot_for_ablation(env, observation_space=None):
+    candidates = []
+    if env is not None:
+        candidates.append(env)
+        unwrapped = getattr(env, "unwrapped", None)
+        if unwrapped is not None and id(unwrapped) != id(env):
+            candidates.append(unwrapped)
+        try:
+            provider = _find_wrapped_env_with_attr(env, "get_observation")
+            if provider is not None and all(id(provider) != id(c) for c in candidates):
+                candidates.append(provider)
+        except Exception:  # noqa: BLE001
+            pass
+
+    for candidate in candidates:
+        for name in ("get_observation", "_get_obs", "get_obs"):
+            getter = getattr(candidate, name, None)
+            if not callable(getter):
+                continue
+            try:
+                obs = getter()
+                obs = _copy_policy_obs_for_ablation(obs)
+                try:
+                    obs = _adapt_policy_obs_to_space(obs, observation_space)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Could not adapt ablation policy obs snapshot: %s", exc)
+                return obs
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not collect ablation observation via %s: %s", name, exc)
+                continue
+    return None
+
+
+def _ablation_select_planned_recovery_q_window(
+    safety_info: dict,
+    live_q: np.ndarray,
+    target_q: np.ndarray,
+    q_dim: int,
+    stack_len: int,
+    *,
+    allow_interpolation: bool,
+    source_mode: str = "planned_terminal",
+) -> tuple[np.ndarray | None, str | None, bool]:
+    stack_len = max(1, int(stack_len))
+    mode = str(source_mode or "planned_terminal").strip().lower()
+    source_groups = []
+    if mode in {
+        "original_nominal_window",
+        "nominal_window",
+        "target_window",
+        "closest_nominal_window",
+        "recover_resume_window_target_q",
+    }:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_TARGET_WINDOW_SOURCES)
+    if mode in {"auto", "target_then_planned", "nominal_then_planned"}:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_TARGET_WINDOW_SOURCES)
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_WINDOW_SOURCES)
+    if not source_groups:
+        source_groups.append(_ABLATION_PLANNED_RECOVERY_Q_WINDOW_SOURCES)
+    for sources in source_groups:
+        for key in sources:
+            value = _safe_info_get(safety_info, key)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=np.float64)
+            except Exception:  # noqa: BLE001
+                continue
+            if arr.ndim < 2 or arr.shape[-1] <= 0:
+                continue
+            arr = arr.reshape((-1, arr.shape[-1]))
+            if arr.shape[0] == 0:
+                continue
+            full = np.repeat(target_q.reshape(1, -1), arr.shape[0], axis=0)
+            cols = min(q_dim, arr.shape[-1], full.shape[-1])
+            full[:, :cols] = arr[:, :cols]
+            if full.shape[0] >= stack_len:
+                full = full[-stack_len:]
+            else:
+                pad = np.repeat(full[:1], stack_len - full.shape[0], axis=0)
+                full = np.concatenate([pad, full], axis=0)
+            return full, key, False
+
+    if not allow_interpolation:
+        return None, None, False
+
+    alphas = np.linspace(1.0 / float(stack_len), 1.0, stack_len, dtype=np.float64)
+    window = live_q.reshape(1, -1) + alphas.reshape(-1, 1) * (target_q - live_q).reshape(1, -1)
+    return window, "interpolated_live_to_terminal", True
+
+
+def _collect_ablation_policy_obs_window(
+    *,
+    env,
+    policy_env,
+    safety_runtime_env,
+    q_window: np.ndarray,
+    indices: np.ndarray,
+    zero_velocity: bool,
+    qvel_window: np.ndarray | None = None,
+) -> list[dict]:
+    observation_space = None
+    for candidate in (policy_env, env, safety_runtime_env):
+        observation_space = getattr(candidate, "observation_space", None)
+        if observation_space is not None:
+            break
+
+    history = []
+    seen_envs: set[int] = set()
+    force_envs = []
+    for candidate in (env, policy_env, safety_runtime_env):
+        if candidate is None or id(candidate) in seen_envs:
+            continue
+        seen_envs.add(id(candidate))
+        force_envs.append(candidate)
+
+    obs_env = policy_env if policy_env is not None else env
+    q_arr = np.asarray(q_window, dtype=np.float64).reshape((-1, q_window.shape[-1]))
+    qvel_arr = None
+    if qvel_window is not None:
+        qvel_arr = np.asarray(qvel_window, dtype=np.float64).reshape((-1, q_window.shape[-1]))
+    for frame_idx, q_frame in enumerate(q_arr):
+        frame_qvel = qvel_arr[frame_idx] if qvel_arr is not None and frame_idx < qvel_arr.shape[0] else None
+        for candidate in force_envs:
+            _set_h1_q_for_ablation(
+                candidate, q_frame, indices, zero_velocity=zero_velocity, target_qvel=frame_qvel
+            )
+        obs_snapshot = _observation_snapshot_for_ablation(obs_env, observation_space)
+        if isinstance(obs_snapshot, dict):
+            history.append(obs_snapshot)
+    return history
+
+
+def _snapshot_mujoco_states_for_obs_seed(*envs) -> list[dict[str, Any]]:
+    snapshots: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candidate in envs:
+        if candidate is None:
+            continue
+        try:
+            mojo = get_bigym_mojo(candidate)
+            data = mojo.data
+        except Exception:  # noqa: BLE001
+            continue
+        data_id = id(data)
+        if data_id in seen:
+            continue
+        seen.add(data_id)
+        state: dict[str, Any] = {
+            "mojo": mojo,
+            "qpos": np.asarray(data.qpos, dtype=np.float64).copy(),
+            "qvel": np.asarray(data.qvel, dtype=np.float64).copy(),
+        }
+        ctrl = getattr(data, "ctrl", None)
+        if ctrl is not None:
+            state["ctrl"] = np.asarray(ctrl, dtype=np.float64).copy()
+        snapshots.append(state)
+    return snapshots
+
+
+def _restore_mujoco_states_for_obs_seed(snapshots: list[dict[str, Any]]) -> int:
+    restored = 0
+    for state in reversed(snapshots):
+        try:
+            mojo = state["mojo"]
+            data = mojo.data
+            data.qpos[:] = state["qpos"]
+            data.qvel[:] = state["qvel"]
+            if "ctrl" in state and getattr(data, "ctrl", None) is not None:
+                data.ctrl[:] = state["ctrl"]
+            _mujoco_forward_for_ablation(mojo)
+            restored += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not restore MuJoCo state after nominal obs seed collection: %s", exc)
+    return int(restored)
+
+
+def _collect_policy_obs_window_preserving_state(
+    *,
+    env,
+    policy_env,
+    safety_runtime_env,
+    q_window: np.ndarray,
+    indices: np.ndarray,
+    zero_velocity: bool,
+    qvel_window: np.ndarray | None = None,
+) -> tuple[list[dict], int]:
+    snapshots = _snapshot_mujoco_states_for_obs_seed(env, policy_env, safety_runtime_env)
+    try:
+        history = _collect_ablation_policy_obs_window(
+            env=env,
+            policy_env=policy_env,
+            safety_runtime_env=safety_runtime_env,
+            q_window=q_window,
+            indices=indices,
+            zero_velocity=zero_velocity,
+            qvel_window=qvel_window,
+        )
+    finally:
+        restored = _restore_mujoco_states_for_obs_seed(snapshots)
+    return history, restored
+
+
+def _ablation_env_dt(env) -> float:
+    try:
+        task = _find_wrapped_env_with_attr(env, "get_dt")
+        if task is not None:
+            return float(task.get_dt())
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.05
+
+
+def _ablation_window_qvel(q_window: np.ndarray, dt: float) -> np.ndarray | None:
+    if q_window is None:
+        return None
+    arr = np.asarray(q_window, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return None
+    dt = float(dt) if dt else 0.05
+    if dt <= 0:
+        dt = 0.05
+    n = arr.shape[0]
+    if n == 1:
+        return np.zeros_like(arr)
+    qvel = np.zeros_like(arr)
+    qvel[0] = (arr[1] - arr[0]) / dt
+    qvel[-1] = (arr[-1] - arr[-2]) / dt
+    if n > 2:
+        qvel[1:-1] = (arr[2:] - arr[:-2]) / (2.0 * dt)
+    return qvel
+
+
+def _set_h1_q_for_ablation(
+    env,
+    target_q: np.ndarray,
+    indices: np.ndarray,
+    *,
+    zero_velocity: bool,
+    target_qvel: np.ndarray | None = None,
+) -> bool:
+    if env is None or target_q is None or indices.size == 0:
+        return False
+    try:
+        mojo = get_bigym_mojo(env)
+        model = mojo.model
+        data = mojo.data
+        tree_to_mj = build_tree_to_mujoco_index_map(env, TREE_JOINT_NAMES)
+        updated = 0
+        for raw_i in indices:
+            i = int(raw_i)
+            if i < 0 or i >= len(TREE_JOINT_NAMES) or i >= target_q.size:
+                continue
+            joint_name = TREE_JOINT_NAMES[i]
+            joint_id = tree_to_mj.get(joint_name) if hasattr(tree_to_mj, "get") else tree_to_mj[joint_name]
+            qpos_adr = int(model.jnt_qposadr[joint_id])
+            data.qpos[qpos_adr] = float(target_q[i])
+            if target_qvel is not None and i < target_qvel.size:
+                dof_adr = int(model.jnt_dofadr[joint_id])
+                data.qvel[dof_adr] = float(target_qvel[i])
+            elif zero_velocity:
+                dof_adr = int(model.jnt_dofadr[joint_id])
+                data.qvel[dof_adr] = 0.0
+            updated += 1
+        if updated <= 0:
+            return False
+        _mujoco_forward_for_ablation(mojo)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not force planned recovery q for ablation: %s", exc)
+        return False
+
+
+def _maybe_force_planned_recovery_q_ablation(
+    *,
+    args,
+    env,
+    policy_env,
+    safety_runtime_env,
+    safechunk,
+    safety_info,
+    safe_env_action,
+) -> tuple[dict, np.ndarray, bool, list[dict] | None]:
+    safety_info = dict(safety_info or {})
+    if not bool(getattr(args, "ablation_force_planned_recovery_q", False)):
+        return safety_info, safe_env_action, False, None
+
+    safety_info["ablation_force_planned_recovery_q_enabled"] = True
+    source_mode = str(getattr(args, "ablation_force_planned_recovery_q_source_mode", "planned_terminal"))
+    window_mode = str(getattr(args, "ablation_force_planned_recovery_q_window_mode", "default"))
+    safety_info["ablation_force_planned_recovery_q_source_mode"] = source_mode
+    safety_info["ablation_force_planned_recovery_q_window_mode"] = window_mode
+    trigger = str(getattr(args, "ablation_force_planned_recovery_q_trigger", "accepted"))
+    if not _ablation_should_force_planned_recovery_q(safety_info, trigger):
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_applied": False,
+                "ablation_force_planned_recovery_q_skip_reason": "trigger_not_matched",
+                "ablation_force_planned_recovery_q_trigger": trigger,
+                "ablation_force_planned_recovery_q_source_mode": source_mode,
+            }
+        )
+        return safety_info, safe_env_action, False, None
+
+    planned_q, source = _ablation_select_planned_recovery_q(safety_info, source_mode)
+    if planned_q is None:
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_applied": False,
+                "ablation_force_planned_recovery_q_skip_reason": "planned_q_missing",
+                "ablation_force_planned_recovery_q_trigger": trigger,
+                "ablation_force_planned_recovery_q_source_mode": source_mode,
+            }
+        )
+        return safety_info, safe_env_action, False, None
+
+    try:
+        live_q = np.asarray(extract_h1_state(env).q_full, dtype=np.float64).reshape(-1)
+    except Exception as exc:  # noqa: BLE001
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_applied": False,
+                "ablation_force_planned_recovery_q_skip_reason": "live_q_unavailable",
+                "ablation_force_planned_recovery_q_error": str(exc),
+            }
+        )
+        return safety_info, safe_env_action, False, None
+
+    q_dim = int(min(live_q.size, planned_q.size, len(TREE_JOINT_NAMES)))
+    mode = str(getattr(args, "ablation_force_planned_recovery_q_mode", "controlled"))
+    indices = _ablation_force_q_indices(mode, q_dim)
+    if indices.size == 0:
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_applied": False,
+                "ablation_force_planned_recovery_q_skip_reason": "empty_force_indices",
+                "ablation_force_planned_recovery_q_source": source,
+                "ablation_force_planned_recovery_q_mode": mode,
+            }
+        )
+        return safety_info, safe_env_action, False, None
+
+    terminal_target_q = live_q.copy()
+    terminal_target_q[indices] = planned_q[indices]
+    replay_sequence = bool(getattr(args, "ablation_force_planned_recovery_q_replay_sequence", False))
+    if window_mode == "set_state_only":
+        replay_sequence = False
+    should_prepare_window = bool(getattr(args, "ablation_force_planned_recovery_q_seed_policy_window", False)) or replay_sequence
+    q_window = None
+    qvel_window = None
+    window_source = None
+    window_interpolated = False
+    mean_step_l2 = None
+    max_step_l2 = None
+    qvel_dt = None
+    mean_qvel_l2 = None
+    max_qvel_l2 = None
+    stack_len = max(1, int(getattr(args, "ablation_force_planned_recovery_q_window_len", 4)))
+    if should_prepare_window:
+        q_window, window_source, window_interpolated = _ablation_select_planned_recovery_q_window(
+            safety_info,
+            live_q,
+            terminal_target_q,
+            q_dim,
+            stack_len,
+            allow_interpolation=bool(
+                getattr(args, "ablation_force_planned_recovery_q_window_interpolate", True)
+            ),
+            source_mode=source_mode,
+        )
+        if q_window is not None and q_window.shape[0] > 1:
+            step_delta = np.diff(q_window[:, indices], axis=0)
+            step_l2 = np.linalg.norm(step_delta, axis=1)
+            mean_step_l2 = float(np.mean(step_l2))
+            max_step_l2 = float(np.max(step_l2))
+        if q_window is not None and bool(
+            getattr(args, "ablation_force_planned_recovery_q_seed_window_velocity", True)
+        ):
+            qvel_dt = _ablation_env_dt(env)
+            qvel_window = _ablation_window_qvel(q_window, qvel_dt)
+            if qvel_window is not None:
+                try:
+                    qvel_l2 = np.linalg.norm(np.asarray(qvel_window, dtype=np.float64)[:, indices], axis=1)
+                    mean_qvel_l2 = float(np.mean(qvel_l2))
+                    max_qvel_l2 = float(np.max(qvel_l2))
+                except Exception:
+                    mean_qvel_l2 = None
+                    max_qvel_l2 = None
+
+    target_q = terminal_target_q.copy()
+    target_qvel = None
+    if replay_sequence and q_window is not None and q_window.shape[0] > 0:
+        target_q = live_q.copy()
+        cols = min(target_q.shape[0], q_window.shape[-1])
+        valid_indices = indices[indices < cols]
+        target_q[valid_indices] = np.asarray(q_window[0], dtype=np.float64)[valid_indices]
+        if qvel_window is not None:
+            target_qvel = np.zeros_like(target_q)
+            target_qvel[valid_indices] = np.asarray(qvel_window[0], dtype=np.float64)[valid_indices]
+    delta = target_q - live_q
+    forced_env_count = 0
+    seen_envs: set[int] = set()
+    force_envs = []
+    for candidate in (env, policy_env, safety_runtime_env):
+        if candidate is None or id(candidate) in seen_envs:
+            continue
+        seen_envs.add(id(candidate))
+        force_envs.append(candidate)
+    zero_velocity = bool(getattr(args, "ablation_force_planned_recovery_q_zero_velocity", True))
+    for candidate in force_envs:
+        if _set_h1_q_for_ablation(
+            candidate, target_q, indices, zero_velocity=zero_velocity, target_qvel=target_qvel
+        ):
+            forced_env_count += 1
+
+    if forced_env_count <= 0:
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_applied": False,
+                "ablation_force_planned_recovery_q_skip_reason": "mujoco_set_failed",
+                "ablation_force_planned_recovery_q_source": source,
+                "ablation_force_planned_recovery_q_mode": mode,
+            }
+        )
+        return safety_info, safe_env_action, False, None
+
+    ablation_policy_obs_history = None
+    if should_prepare_window:
+        window_obs_count = 0
+        if (
+            q_window is not None
+            and bool(getattr(args, "ablation_force_planned_recovery_q_seed_policy_window", False))
+            and not replay_sequence
+        ):
+            ablation_policy_obs_history = _collect_ablation_policy_obs_window(
+                env=env,
+                policy_env=policy_env,
+                safety_runtime_env=safety_runtime_env,
+                q_window=q_window,
+                indices=indices,
+                zero_velocity=zero_velocity,
+                qvel_window=qvel_window,
+            )
+            window_obs_count = len(ablation_policy_obs_history)
+        safety_info.update(
+            {
+                "ablation_force_planned_recovery_q_seed_window_enabled": bool(
+                    getattr(args, "ablation_force_planned_recovery_q_seed_policy_window", False)
+                ),
+                "ablation_force_planned_recovery_q_window_mode": window_mode,
+                "ablation_force_planned_recovery_q_window_source": window_source,
+                "ablation_force_planned_recovery_q_window_interpolated": bool(window_interpolated),
+                "ablation_force_planned_recovery_q_window_len": int(q_window.shape[0]) if q_window is not None else 0,
+                "ablation_force_planned_recovery_q_window_obs_count": int(window_obs_count),
+                "ablation_force_planned_recovery_q_window_step_l2_mean": mean_step_l2,
+                "ablation_force_planned_recovery_q_window_step_l2_max": max_step_l2,
+                "ablation_force_planned_recovery_q_window_qvel_enabled": qvel_window is not None,
+                "ablation_force_planned_recovery_q_window_qvel_dt": qvel_dt,
+                "ablation_force_planned_recovery_q_window_qvel_l2_mean": mean_qvel_l2,
+                "ablation_force_planned_recovery_q_window_qvel_l2_max": max_qvel_l2,
+                "ablation_force_planned_recovery_q_replay_sequence_enabled": bool(replay_sequence),
+                "ablation_force_planned_recovery_q_replay_sequence_source": window_source,
+                "ablation_force_planned_recovery_q_replay_sequence_len": int(q_window.shape[0]) if q_window is not None else 0,
+                "ablation_force_planned_recovery_q_replay_sequence_q": (
+                    np.asarray(q_window, dtype=np.float64).astype(float).tolist()
+                    if replay_sequence and q_window is not None
+                    else None
+                ),
+                "ablation_force_planned_recovery_q_replay_sequence_qvel": (
+                    np.asarray(qvel_window, dtype=np.float64).astype(float).tolist()
+                    if replay_sequence and qvel_window is not None
+                    else None
+                ),
+            }
+        )
+
+    reset_history_count = 0
+    if bool(getattr(args, "ablation_force_planned_recovery_q_reset_history", False)):
+        reset_seen: set[int] = set()
+        for candidate in (env, policy_env):
+            if candidate is None or id(candidate) in reset_seen:
+                continue
+            reset_seen.add(id(candidate))
+            try:
+                reset_history_count += int(_reset_action_sequence_history(candidate))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not reset action-sequence history for ablation: %s", exc)
+
+    filter_reset = False
+    if bool(getattr(args, "ablation_force_planned_recovery_q_reset_filter", True)) and hasattr(safechunk, "reset"):
+        try:
+            safechunk.reset()
+            filter_reset = True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not reset SafeChunk after ablation q force: %s", exc)
+
+    sync_low_level_state_count = 0
+    if bool(getattr(args, "ablation_force_planned_recovery_q_sync_low_level_state", False)):
+        sync_seen: set[int] = set()
+        for candidate in (env, policy_env, safety_runtime_env):
+            if candidate is None or id(candidate) in sync_seen:
+                continue
+            sync_seen.add(id(candidate))
+            try:
+                sync_low_level_state_count += int(_sync_robot_low_level_hold_state(candidate))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not sync low-level state for ablation teleport: %s", exc)
+
+    hold_delta = None
+    hold_indices = None
+    sequence_action_source = None
+    sequence_action_index = None
+    sequence_nominal_action_used = False
+    if bool(getattr(args, "ablation_force_planned_recovery_q_hold_current_step", True)):
+        target_action = _safe_info_get(safety_info, "recover_resume_window_target_action")
+        nominal_env_action = _ablation_nominal_env_action_for_sequence_step(
+            target_action,
+            0,
+            safe_env_action,
+        )
+        if nominal_env_action is not None:
+            safe_env_action = nominal_env_action
+            sequence_action_source = "recover_resume_window_target_action"
+            sequence_action_index = 0
+            sequence_nominal_action_used = True
+        else:
+            try:
+                safe_env_action, hold_indices, hold_delta = _hard_hold_action_from_live_robot(env, safe_env_action)
+                sequence_action_source = "live_hold"
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not switch current ablation step to live hold action: %s", exc)
+
+    arm_start = min(4, delta.size)
+    base_end = min(4, delta.size)
+    safety_info.update(
+        {
+            "ablation_force_planned_recovery_q_applied": True,
+            "ablation_force_planned_recovery_q_skip_reason": None,
+            "ablation_force_planned_recovery_q_trigger": trigger,
+            "ablation_force_planned_recovery_q_source": source,
+            "ablation_force_planned_recovery_q_source_mode": source_mode,
+            "ablation_force_planned_recovery_q_window_mode": window_mode,
+            "ablation_force_planned_recovery_q_mode": mode,
+            "ablation_force_planned_recovery_q_indices": indices.astype(int).tolist(),
+            "ablation_force_planned_recovery_q_sequence_nominal_action_used": bool(sequence_nominal_action_used),
+            "ablation_force_planned_recovery_q_sequence_action_source": sequence_action_source,
+            "ablation_force_planned_recovery_q_sequence_action_index": sequence_action_index,
+            "ablation_force_planned_recovery_q_dim": int(q_dim),
+            "ablation_force_planned_recovery_q_l2_from_pre": float(np.linalg.norm(delta[indices])),
+            "ablation_force_planned_recovery_q_max_abs_from_pre": float(np.max(np.abs(delta[indices]))) if indices.size else 0.0,
+            "ablation_force_planned_recovery_q_arm_l2_from_pre": float(np.linalg.norm(delta[arm_start:])),
+            "ablation_force_planned_recovery_q_base_l2_from_pre": float(np.linalg.norm(delta[:base_end])),
+            "ablation_force_planned_recovery_q_forced_env_count": int(forced_env_count),
+            "ablation_force_planned_recovery_q_reset_history_count": int(reset_history_count),
+            "ablation_force_planned_recovery_q_reset_filter": bool(filter_reset),
+            "ablation_force_planned_recovery_q_sync_low_level_state_count": int(sync_low_level_state_count),
+            "ablation_force_planned_recovery_q_zero_velocity": bool(zero_velocity),
+            "ablation_force_planned_recovery_q_hold_current_step": bool(getattr(args, "ablation_force_planned_recovery_q_hold_current_step", True)),
+            "ablation_force_planned_recovery_q_hold_delta": float(hold_delta) if hold_delta is not None else None,
+            "ablation_force_planned_recovery_q_hold_indices": hold_indices,
+        }
+    )
+    return safety_info, safe_env_action, True, ablation_policy_obs_history
+
+
+
+def _vector_compare_metrics(lhs, rhs, prefix: str) -> dict[str, Any]:
+    try:
+        lhs_arr = np.asarray(lhs, dtype=np.float64).reshape(-1)
+        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        return {}
+    if lhs_arr.size == 0 or rhs_arr.size == 0:
+        return {}
+    n = min(lhs_arr.size, rhs_arr.size)
+    lhs_arr = lhs_arr[:n]
+    rhs_arr = rhs_arr[:n]
+    diff = lhs_arr - rhs_arr
+    lhs_norm = float(np.linalg.norm(lhs_arr))
+    rhs_norm = float(np.linalg.norm(rhs_arr))
+    denom = lhs_norm * rhs_norm
+    cosine = None if denom <= 1e-12 else float(np.dot(lhs_arr, rhs_arr) / denom)
+    return {
+        f"{prefix}_l2": float(np.linalg.norm(diff)),
+        f"{prefix}_max_abs": float(np.max(np.abs(diff))),
+        f"{prefix}_cosine": cosine,
+        f"{prefix}_dim": int(n),
+    }
+
+
+
+
+def _action_agreement_metrics(
+    lhs,
+    rhs,
+    prefix: str,
+    *,
+    arm_indices=None,
+    gripper_index=None,
+) -> dict[str, Any]:
+    out = _vector_compare_metrics(lhs, rhs, prefix)
+    try:
+        lhs_arr = np.asarray(lhs, dtype=np.float64).reshape(-1)
+        rhs_arr = np.asarray(rhs, dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        return out
+    if lhs_arr.size == 0 or rhs_arr.size == 0:
+        return out
+    n = min(lhs_arr.size, rhs_arr.size)
+    lhs_arr = lhs_arr[:n]
+    rhs_arr = rhs_arr[:n]
+    if arm_indices is not None:
+        try:
+            arm_idx = np.asarray(arm_indices, dtype=np.int64).reshape(-1)
+            arm_idx = np.where(arm_idx < 0, arm_idx + n, arm_idx)
+            arm_idx = arm_idx[(arm_idx >= 0) & (arm_idx < n)]
+            if arm_idx.size:
+                arm_delta = lhs_arr[arm_idx] - rhs_arr[arm_idx]
+                out.update(
+                    {
+                        f"{prefix}_arm_l2": float(np.linalg.norm(arm_delta)),
+                        f"{prefix}_arm_max_abs": float(np.max(np.abs(arm_delta))),
+                        f"{prefix}_arm_dim": int(arm_idx.size),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            pass
+    if gripper_index is not None:
+        try:
+            grip_idx = int(gripper_index)
+            if grip_idx < 0:
+                grip_idx += n
+            if 0 <= grip_idx < n:
+                delta = float(lhs_arr[grip_idx] - rhs_arr[grip_idx])
+                out.update(
+                    {
+                        f"{prefix}_gripper_delta": delta,
+                        f"{prefix}_gripper_abs_delta": abs(delta),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+
+
+def _numeric_array_or_none(value: Any) -> np.ndarray | None:
+    try:
+        arr = np.asarray(value)
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.size == 0:
+        return None
+    if not np.issubdtype(arr.dtype, np.number) and arr.dtype != np.bool_:
+        return None
+    try:
+        return arr.astype(np.float64, copy=False)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _looks_like_image_obs_key(key: Any, arr: np.ndarray) -> bool:
+    key_s = str(key).lower()
+    if any(token in key_s for token in ("rgb", "image", "camera", "pixels", "front", "wrist", "head")):
+        return True
+    return bool(arr.ndim >= 3)
+
+
+def _policy_obs_snapshot_compare_metrics(current: Any, expected: Any, prefix: str) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        f"{prefix}_key_count": None,
+        f"{prefix}_common_key_count": None,
+        f"{prefix}_missing_key_count": None,
+        f"{prefix}_shape_mismatch_key_count": None,
+        f"{prefix}_numeric_key_count": None,
+        f"{prefix}_numeric_mismatch_key_count": None,
+        f"{prefix}_numeric_l2": None,
+        f"{prefix}_numeric_mean_abs": None,
+        f"{prefix}_numeric_max_abs": None,
+        f"{prefix}_numeric_worst_key": None,
+        f"{prefix}_numeric_worst_l2": None,
+        f"{prefix}_image_key_count": None,
+        f"{prefix}_image_mismatch_key_count": None,
+        f"{prefix}_image_l2": None,
+        f"{prefix}_image_mean_abs": None,
+        f"{prefix}_image_max_abs": None,
+        f"{prefix}_image_worst_key": None,
+        f"{prefix}_image_worst_l2": None,
+    }
+    if not isinstance(current, dict) or not isinstance(expected, dict):
+        return out
+
+    current_keys = set(current.keys())
+    expected_keys = set(expected.keys())
+    common_keys = sorted(current_keys & expected_keys, key=str)
+    out[f"{prefix}_key_count"] = int(len(current_keys))
+    out[f"{prefix}_common_key_count"] = int(len(common_keys))
+    out[f"{prefix}_missing_key_count"] = int(len((current_keys ^ expected_keys)))
+
+    numeric_sum_sq = 0.0
+    numeric_sum_abs = 0.0
+    numeric_count = 0
+    numeric_keys = 0
+    numeric_mismatch_keys = 0
+    numeric_max_abs = 0.0
+    numeric_worst_key = None
+    numeric_worst_l2 = None
+
+    image_sum_sq = 0.0
+    image_sum_abs = 0.0
+    image_count = 0
+    image_keys = 0
+    image_mismatch_keys = 0
+    image_max_abs = 0.0
+    image_worst_key = None
+    image_worst_l2 = None
+    shape_mismatch = 0
+
+    for key in common_keys:
+        cur = _numeric_array_or_none(current.get(key))
+        exp = _numeric_array_or_none(expected.get(key))
+        if cur is None or exp is None:
+            continue
+        numeric_keys += 1
+        if cur.shape != exp.shape:
+            shape_mismatch += 1
+        n = min(cur.size, exp.size)
+        if n <= 0:
+            continue
+        cur_flat = cur.reshape(-1)[:n]
+        exp_flat = exp.reshape(-1)[:n]
+        diff = cur_flat - exp_flat
+        key_l2 = float(np.linalg.norm(diff))
+        key_abs_sum = float(np.sum(np.abs(diff)))
+        key_max_abs = float(np.max(np.abs(diff))) if diff.size else 0.0
+        if key_l2 > 1e-9 or key_max_abs > 1e-9 or cur.shape != exp.shape:
+            numeric_mismatch_keys += 1
+        numeric_sum_sq += float(np.dot(diff, diff))
+        numeric_sum_abs += key_abs_sum
+        numeric_count += int(n)
+        numeric_max_abs = max(numeric_max_abs, key_max_abs)
+        if numeric_worst_l2 is None or key_l2 > numeric_worst_l2:
+            numeric_worst_l2 = key_l2
+            numeric_worst_key = str(key)
+
+        if _looks_like_image_obs_key(key, cur) or _looks_like_image_obs_key(key, exp):
+            image_keys += 1
+            if key_l2 > 1e-9 or key_max_abs > 1e-9 or cur.shape != exp.shape:
+                image_mismatch_keys += 1
+            image_sum_sq += float(np.dot(diff, diff))
+            image_sum_abs += key_abs_sum
+            image_count += int(n)
+            image_max_abs = max(image_max_abs, key_max_abs)
+            if image_worst_l2 is None or key_l2 > image_worst_l2:
+                image_worst_l2 = key_l2
+                image_worst_key = str(key)
+
+    out[f"{prefix}_shape_mismatch_key_count"] = int(shape_mismatch)
+    out[f"{prefix}_numeric_key_count"] = int(numeric_keys)
+    out[f"{prefix}_numeric_mismatch_key_count"] = int(numeric_mismatch_keys)
+    if numeric_count > 0:
+        out[f"{prefix}_numeric_l2"] = float(np.sqrt(numeric_sum_sq))
+        out[f"{prefix}_numeric_mean_abs"] = float(numeric_sum_abs / float(numeric_count))
+        out[f"{prefix}_numeric_max_abs"] = float(numeric_max_abs)
+        out[f"{prefix}_numeric_worst_key"] = numeric_worst_key
+        out[f"{prefix}_numeric_worst_l2"] = numeric_worst_l2
+    out[f"{prefix}_image_key_count"] = int(image_keys)
+    out[f"{prefix}_image_mismatch_key_count"] = int(image_mismatch_keys)
+    if image_count > 0:
+        out[f"{prefix}_image_l2"] = float(np.sqrt(image_sum_sq))
+        out[f"{prefix}_image_mean_abs"] = float(image_sum_abs / float(image_count))
+        out[f"{prefix}_image_max_abs"] = float(image_max_abs)
+        out[f"{prefix}_image_worst_key"] = image_worst_key
+        out[f"{prefix}_image_worst_l2"] = image_worst_l2
+    return out
+
+def _target_action_window_diagnostics(
+    target_action: Any,
+    predicted_first_action: Any,
+) -> dict[str, Any]:
+    rows = _ablation_action_rows(target_action)
+    if rows is None:
+        return {
+            "act_resume_diag_target_action_rows": None,
+            "act_resume_diag_target_action_dim": None,
+            "act_resume_diag_target_first_action_norm": None,
+            "act_resume_diag_predicted_first_action_norm": None,
+            "act_resume_diag_target_window_best_index": None,
+            "act_resume_diag_target_window_best_l2": None,
+            "act_resume_diag_target_window_l2_0": None,
+            "act_resume_diag_target_window_l2_1": None,
+            "act_resume_diag_target_window_l2_2": None,
+            "act_resume_diag_target_window_l2_3": None,
+        }
+    try:
+        pred = np.asarray(predicted_first_action, dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        pred = np.empty((0,), dtype=np.float64)
+    action_dim = int(rows.shape[-1]) if rows.ndim == 2 else 0
+    out: dict[str, Any] = {
+        "act_resume_diag_target_action_rows": int(rows.shape[0]),
+        "act_resume_diag_target_action_dim": int(action_dim),
+        "act_resume_diag_target_first_action_norm": float(np.linalg.norm(rows[0])) if rows.shape[0] else None,
+        "act_resume_diag_predicted_first_action_norm": float(np.linalg.norm(pred)) if pred.size else None,
+        "act_resume_diag_target_window_best_index": None,
+        "act_resume_diag_target_window_best_l2": None,
+        "act_resume_diag_target_window_l2_0": None,
+        "act_resume_diag_target_window_l2_1": None,
+        "act_resume_diag_target_window_l2_2": None,
+        "act_resume_diag_target_window_l2_3": None,
+    }
+    if pred.size == 0 or action_dim <= 0:
+        return out
+    n = min(int(pred.size), action_dim)
+    pred_n = pred[:n]
+    best_idx = None
+    best_l2 = None
+    for idx, row in enumerate(rows):
+        row_n = np.asarray(row, dtype=np.float64).reshape(-1)[:n]
+        l2 = float(np.linalg.norm(pred_n - row_n))
+        if idx < 4:
+            out[f"act_resume_diag_target_window_l2_{idx}"] = l2
+        if best_l2 is None or l2 < best_l2:
+            best_l2 = l2
+            best_idx = idx
+    out["act_resume_diag_target_window_best_index"] = int(best_idx) if best_idx is not None else None
+    out["act_resume_diag_target_window_best_l2"] = best_l2
+    return out
+
+def _first_action_or_none(action) -> np.ndarray | None:
+    if action is None:
+        return None
+    try:
+        return np.asarray(extract_first_action(action), dtype=np.float64).reshape(-1)
+    except Exception:  # noqa: BLE001
+        try:
+            chunk, _ = _as_chunk(action)
+            if len(chunk) == 0:
+                return None
+            return np.asarray(chunk[0], dtype=np.float64).reshape(-1)
+        except Exception:  # noqa: BLE001
+            return None
+
+def _should_log_mpc_replay_diagnostic(safety_info: dict) -> bool:
+    if not isinstance(safety_info, dict):
+        return False
+    diagnostic_keys = (
+        "planned_pre_action_q",
+        "planned_post_action_q",
+        "planned_action_at_index",
+        "actual_pre_action_q",
+        "replay_predicted_post_action_q",
+        "committed_action",
+    )
+    if any(_safe_info_get(safety_info, key) is not None for key in diagnostic_keys):
+        return True
+    return bool(
+        _safe_info_get(safety_info, "mpc_recovery_replan_attempted")
+        or _safe_info_get(safety_info, "mpc_recovery_accepted")
+        or _safe_info_get(safety_info, "committed_chunk_active")
+        or _safe_info_get(safety_info, "committed_suffix_replan_attempted")
+        or _safe_info_get(safety_info, "resume_from_committed_rejoin")
+    )
+
+
+def _collect_mpc_replay_diagnostic(
+    *,
+    episode: int,
+    step: int,
+    safety_info: dict,
+    safe_env_action,
+    pre_mujoco_snapshot: Optional[dict[str, Any]],
+    post_mujoco_snapshot: Optional[dict[str, Any]],
+    reward: Optional[float],
+    terminated: Optional[bool],
+    truncated: Optional[bool],
+) -> Optional[dict[str, Any]]:
+    if not _should_log_mpc_replay_diagnostic(safety_info):
+        return None
+
+    planned_pre_q = _safe_info_get(safety_info, "planned_pre_action_q")
+    planned_post_q = _safe_info_get(safety_info, "planned_post_action_q")
+    replay_pre_q = _safe_info_get(safety_info, "actual_pre_action_q")
+    replay_post_q = _safe_info_get(safety_info, "replay_predicted_post_action_q")
+    planned_action = _safe_info_get(safety_info, "planned_action_at_index")
+    committed_action = _safe_info_get(safety_info, "committed_action")
+    executed_first_action = extract_first_action(safe_env_action)
+
+    actual_pre_q = None
+    if isinstance(pre_mujoco_snapshot, dict):
+        actual_pre_q = pre_mujoco_snapshot.get("h1_q_full")
+    if actual_pre_q is None:
+        actual_pre_q = replay_pre_q
+
+    actual_post_q = None
+    if isinstance(post_mujoco_snapshot, dict):
+        actual_post_q = post_mujoco_snapshot.get("h1_q_full")
+
+    actual_pre_minus_planned_pre = _diff_list(actual_pre_q, planned_pre_q)
+    replay_pre_minus_planned_pre = _diff_list(replay_pre_q, planned_pre_q)
+    actual_post_minus_planned_post = _diff_list(actual_post_q, planned_post_q)
+    replay_post_minus_planned_post = _diff_list(replay_post_q, planned_post_q)
+    actual_post_minus_replay_post = _diff_list(actual_post_q, replay_post_q)
+    committed_minus_planned_action = _diff_list(committed_action, planned_action)
+    executed_minus_planned_action = _diff_list(executed_first_action, planned_action)
+
+    return _jsonable_trace_value(
+        {
+            "episode": int(episode),
+            "step": int(step),
+            "mode": _safe_info_get(safety_info, "mode"),
+            "safety_mode": _safe_info_get(safety_info, "safety_mode"),
+            "deformation_source": _safe_info_get(safety_info, "deformation_source"),
+            "committed_chunk_active": _safe_info_get(safety_info, "committed_chunk_active"),
+            "committed_chunk_mode": _safe_info_get(safety_info, "committed_chunk_mode"),
+            "committed_chunk_index": _safe_info_get(safety_info, "committed_chunk_index"),
+            "committed_chunk_length": _safe_info_get(safety_info, "committed_chunk_length"),
+            "mpc_recovery_replan_attempted": _safe_info_get(safety_info, "mpc_recovery_replan_attempted"),
+            "mpc_recovery_accepted": _safe_info_get(safety_info, "mpc_recovery_accepted"),
+            "mpc_recovery_reject_reason": _safe_info_get(safety_info, "mpc_recovery_reject_reason"),
+            "committed_suffix_replan_attempted": _safe_info_get(safety_info, "committed_suffix_replan_attempted"),
+            "committed_suffix_replan_accepted": _safe_info_get(safety_info, "committed_suffix_replan_accepted"),
+            "committed_suffix_replan_rejected": _safe_info_get(safety_info, "committed_suffix_replan_rejected"),
+            "committed_suffix_replan_reject_reason": _safe_info_get(safety_info, "committed_suffix_replan_reject_reason"),
+            "control_type": _safe_info_get(safety_info, "control_type"),
+            "dt": _safe_info_get(safety_info, "dt"),
+            "controlled_state_indices": _safe_info_get(safety_info, "controlled_state_indices"),
+            "controlled_action_indices": _safe_info_get(safety_info, "controlled_action_indices"),
+            "action_conversion_mode": _safe_info_get(safety_info, "action_conversion_mode"),
+            "reward": None if reward is None else float(reward),
+            "terminated": None if terminated is None else bool(terminated),
+            "truncated": None if truncated is None else bool(truncated),
+            "h1_joint_names": list(TREE_JOINT_NAMES),
+            "planned_pre_action_q": _float_list(planned_pre_q),
+            "planned_post_action_q": _float_list(planned_post_q),
+            "safety_filter_actual_pre_action_q": _float_list(replay_pre_q),
+            "safety_filter_replay_predicted_post_action_q": _float_list(replay_post_q),
+            "bigym_actual_pre_action_q": _float_list(actual_pre_q),
+            "bigym_actual_post_action_q": _float_list(actual_post_q),
+            "planned_action_at_index": _float_list(planned_action),
+            "committed_action": _float_list(committed_action),
+            "executed_first_action": _float_list(executed_first_action),
+            "actual_pre_minus_planned_pre_q": actual_pre_minus_planned_pre,
+            "replay_pre_minus_planned_pre_q": replay_pre_minus_planned_pre,
+            "actual_post_minus_planned_post_q": actual_post_minus_planned_post,
+            "replay_post_minus_planned_post_q": replay_post_minus_planned_post,
+            "actual_post_minus_replay_predicted_post_q": actual_post_minus_replay_post,
+            "committed_minus_planned_action": committed_minus_planned_action,
+            "executed_minus_planned_action": executed_minus_planned_action,
+            "actual_pre_minus_planned_pre_q_stats": _h1_q_error_group_stats(actual_pre_minus_planned_pre),
+            "actual_post_minus_planned_post_q_stats": _h1_q_error_group_stats(actual_post_minus_planned_post),
+            "replay_post_minus_planned_post_q_stats": _h1_q_error_group_stats(replay_post_minus_planned_post),
+            "actual_post_minus_replay_predicted_post_q_stats": _h1_q_error_group_stats(actual_post_minus_replay_post),
+            "committed_minus_planned_action_stats": _vector_stats(committed_minus_planned_action),
+            "executed_minus_planned_action_stats": _vector_stats(executed_minus_planned_action),
+            "actual_post_vs_planned_post_by_joint": _named_h1_q_error_rows(actual_post_q, planned_post_q),
+            "actual_post_vs_replay_predicted_post_by_joint": _named_h1_q_error_rows(actual_post_q, replay_post_q),
+            "actual_pre_vs_planned_pre_by_joint": _named_h1_q_error_rows(actual_pre_q, planned_pre_q),
+            "executed_vs_planned_action_by_dim": _named_action_error_rows(executed_first_action, planned_action),
+            "planned_clearance_pre": _safe_info_get(safety_info, "planned_clearance_pre"),
+            "planned_clearance_post": _safe_info_get(safety_info, "planned_clearance_post"),
+            "replay_clearance_pre": _safe_info_get(safety_info, "replay_clearance_pre"),
+            "replay_clearance_post": _safe_info_get(safety_info, "replay_clearance_post"),
+            "actual_vs_planned_pre_q_error": _safe_info_get(safety_info, "actual_vs_planned_pre_q_error"),
+            "actual_vs_planned_post_q_error": _safe_info_get(safety_info, "actual_vs_planned_post_q_error"),
+            "planning_vs_replay_clearance_pre_error": _safe_info_get(safety_info, "planning_vs_replay_clearance_pre_error"),
+            "planning_vs_replay_clearance_post_error": _safe_info_get(safety_info, "planning_vs_replay_clearance_post_error"),
+            "planning_human_state_snapshot": _safe_info_get(safety_info, "planning_human_state_snapshot"),
+            "replay_human_state": _safe_info_get(safety_info, "replay_human_state"),
+            "pre_mujoco_state": pre_mujoco_snapshot,
+            "post_mujoco_state": post_mujoco_snapshot,
+        }
+    )
+
+
+def _mpc_replay_error_summary(records: Sequence[dict]) -> dict[str, Optional[float]]:
+    post_l2 = []
+    post_max_abs = []
+    model_l2 = []
+    model_max_abs = []
+    base_l2 = []
+    arm_l2 = []
+    for record in records:
+        post_stats = (record.get("actual_post_minus_planned_post_q_stats") or {}).get("all") or {}
+        model_stats = (record.get("actual_post_minus_replay_predicted_post_q_stats") or {}).get("all") or {}
+        base_stats = (record.get("actual_post_minus_planned_post_q_stats") or {}).get("base") or {}
+        arm_stats = (record.get("actual_post_minus_planned_post_q_stats") or {}).get("arm") or {}
+        if post_stats.get("l2") is not None:
+            post_l2.append(float(post_stats["l2"]))
+        if post_stats.get("max_abs") is not None:
+            post_max_abs.append(float(post_stats["max_abs"]))
+        if model_stats.get("l2") is not None:
+            model_l2.append(float(model_stats["l2"]))
+        if model_stats.get("max_abs") is not None:
+            model_max_abs.append(float(model_stats["max_abs"]))
+        if base_stats.get("l2") is not None:
+            base_l2.append(float(base_stats["l2"]))
+        if arm_stats.get("l2") is not None:
+            arm_l2.append(float(arm_stats["l2"]))
+
+    def _mean(values):
+        return float(np.mean(values)) if values else None
+
+    def _max(values):
+        return float(np.max(values)) if values else None
+
+    return {
+        "mpc_replay_diagnostic_mean_actual_post_vs_planned_post_l2": _mean(post_l2),
+        "mpc_replay_diagnostic_max_actual_post_vs_planned_post_l2": _max(post_l2),
+        "mpc_replay_diagnostic_mean_actual_post_vs_planned_post_max_abs": _mean(post_max_abs),
+        "mpc_replay_diagnostic_max_actual_post_vs_planned_post_max_abs": _max(post_max_abs),
+        "mpc_replay_diagnostic_mean_actual_post_vs_replay_post_l2": _mean(model_l2),
+        "mpc_replay_diagnostic_max_actual_post_vs_replay_post_l2": _max(model_l2),
+        "mpc_replay_diagnostic_mean_actual_post_vs_replay_post_max_abs": _mean(model_max_abs),
+        "mpc_replay_diagnostic_max_actual_post_vs_replay_post_max_abs": _max(model_max_abs),
+        "mpc_replay_diagnostic_mean_base_l2": _mean(base_l2),
+        "mpc_replay_diagnostic_mean_arm_l2": _mean(arm_l2),
+    }
+
+
 def _collect_chunk_trajectory_trace(
     *,
     args,
@@ -5898,10 +3421,10 @@ def _collect_chunk_trajectory_trace(
     try:
         nominal, _ = _as_chunk(nominal_chunk)
         generated, _ = _as_chunk(generated_chunk)
-        nominal_q = safechunk.rollout_nominal_chunk(obs, nominal)
-        nominal_eval = safechunk.evaluate_horizon_safety(obs, nominal_q)
-        generated_q = safechunk.rollout_nominal_chunk(obs, generated)
-        generated_eval = safechunk.evaluate_horizon_safety(obs, generated_q)
+        nominal_q = safechunk.intervention.rollout_nominal_chunk(obs, nominal)
+        nominal_eval = safechunk.intervention.evaluate_horizon_safety(obs, nominal_q)
+        generated_q = safechunk.intervention.rollout_nominal_chunk(obs, generated)
+        generated_eval = safechunk.intervention.evaluate_horizon_safety(obs, generated_q)
 
         # The controller executes only the first row of each ACT chunk before
         # replanning. Keep trajectory trace payloads aligned with that
@@ -5909,8 +3432,8 @@ def _collect_chunk_trajectory_trace(
         # only internally for safety evaluation above.
         nominal_exec = nominal[:1].copy()
         generated_exec = generated[:1].copy()
-        nominal_exec_q = safechunk.rollout_nominal_chunk(obs, nominal_exec)
-        generated_exec_q = safechunk.rollout_nominal_chunk(obs, generated_exec)
+        nominal_exec_q = safechunk.intervention.rollout_nominal_chunk(obs, nominal_exec)
+        generated_exec_q = safechunk.intervention.rollout_nominal_chunk(obs, generated_exec)
         nominal_exec_eval = _sliced_safety_eval(nominal_eval, 0, 1)
         generated_exec_eval = _sliced_safety_eval(generated_eval, 0, 1)
 
@@ -5942,15 +3465,15 @@ def _collect_chunk_trajectory_trace(
                 else None,
             }
         else:
-            braked_chunk, brake_info = safechunk.horizon_brake(
+            braked_chunk, brake_info = safechunk.brake.horizon_brake(
                 obs,
                 nominal,
                 nominal_eval,
             )
-            braked_q = safechunk.rollout_nominal_chunk(obs, braked_chunk)
-            brake_eval = safechunk.evaluate_horizon_safety(obs, braked_q)
+            braked_q = safechunk.intervention.rollout_nominal_chunk(obs, braked_chunk)
+            brake_eval = safechunk.intervention.evaluate_horizon_safety(obs, braked_q)
             braked_exec = braked_chunk[:1].copy()
-            braked_exec_q = safechunk.rollout_nominal_chunk(obs, braked_exec)
+            braked_exec_q = safechunk.intervention.rollout_nominal_chunk(obs, braked_exec)
             brake_exec_eval = _sliced_safety_eval(brake_eval, 0, 1)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Chunk trajectory trace collection failed: %s", exc)
@@ -6007,7 +3530,6 @@ def _collect_chunk_trajectory_trace(
     deform_len = _segment_len_from_info(
         safety_info,
         "deform_chunk_length",
-        "yield_chunk_length",
         default=0,
     )
     recover_len = _segment_len_from_info(
@@ -6067,8 +3589,16 @@ def _collect_chunk_trajectory_trace(
         "deform_mode": _safe_info_get(safety_info, "deform_mode"),
         "recovery_phase": _safe_info_get(safety_info, "recovery_phase"),
         "deformation_source": source,
-        "accepted_candidate_name": _safe_info_get(safety_info, "accepted_candidate_name"),
-        "accepted_candidate_type": _safe_info_get(safety_info, "accepted_candidate_type"),
+        "accepted_path_name": _safe_info_get(
+                safety_info,
+                "accepted_path_name",
+                _safe_info_get(safety_info, "accepted_candidate_name"),
+            ),
+        "accepted_path_type": _safe_info_get(
+                safety_info,
+                "accepted_path_type",
+                _safe_info_get(safety_info, "accepted_candidate_type"),
+            ),
         "optimized_accepted": _safe_info_get(safety_info, "optimized_accepted"),
         "fallback_used": _safe_info_get(safety_info, "fallback_used"),
         "first_violation": _safe_info_get(safety_info, "first_violation"),
@@ -6101,388 +3631,34 @@ def _collect_chunk_trajectory_trace(
     return _jsonable_trace_value(record)
 
 
-def _trace_xyz_array(trace):
-    if not isinstance(trace, dict):
-        return None
-    xyz = trace.get("ee_xyz")
-    if xyz is None:
-        return None
-    try:
-        arr = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
-    except Exception:  # noqa: BLE001
-        return None
-    finite = np.isfinite(arr).all(axis=1)
-    arr = arr[finite]
-    return arr if arr.size else None
-
-
-def _set_3d_axes_equal(ax, point_arrays):
-    arrays = [np.asarray(a, dtype=np.float64).reshape(-1, 3) for a in point_arrays if a is not None and np.asarray(a).size]
-    if not arrays:
-        return
-    points = np.concatenate(arrays, axis=0)
-    finite = np.isfinite(points).all(axis=1)
-    points = points[finite]
-    if points.size == 0:
-        return
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
-    centers = 0.5 * (mins + maxs)
-    radius = 0.5 * float(np.max(maxs - mins))
-    radius = max(radius, 1e-3)
-    ax.set_xlim(centers[0] - radius, centers[0] + radius)
-    ax.set_ylim(centers[1] - radius, centers[1] + radius)
-    ax.set_zlim(centers[2] - radius, centers[2] + radius)
-
-
-def _save_chunk_trajectory_plot(
-    path: Path,
-    episode: int,
-    trace_records: list[dict],
-    human_samples: list[dict],
-    max_events: int,
-):
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not import matplotlib for chunk trajectory plot: %s", exc)
-        return None
-
-    selected = trace_records
-    if max_events > 0 and len(selected) > max_events:
-        selected = selected[-max_events:]
-
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    styles = {
-        "nominal": ("0.55", "--", 1.0, 0.35),
-        "braking": ("tab:orange", "-", 2.0, 0.75),
-        "deformed": ("tab:blue", "-", 2.2, 0.85),
-        "recovery": ("tab:green", "-", 2.2, 0.85),
-        "generated": ("black", ":", 1.4, 0.55),
-    }
-    plotted_labels = set()
-    point_arrays = []
-
-    centers = []
-    for sample in human_samples:
-        center = sample.get("center") if isinstance(sample, dict) else None
-        if center is None:
-            continue
-        try:
-            center_arr = np.asarray(center, dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            continue
-        if np.isfinite(center_arr).all():
-            centers.append(center_arr)
-    if centers:
-        center_arr = np.stack(centers, axis=0)
-        point_arrays.append(center_arr)
-        ax.plot(
-            center_arr[:, 0],
-            center_arr[:, 1],
-            center_arr[:, 2],
-            color="crimson",
-            linewidth=2.6,
-            alpha=0.9,
-            label="human arm center",
-        )
-        plotted_labels.add("human arm center")
-
-    geom_names = sorted(
-        {
-            geom.get("name")
-            for sample in human_samples
-            if isinstance(sample, dict)
-            for geom in sample.get("geoms", [])
-            if isinstance(geom, dict) and geom.get("name")
-        }
-    )
-    for geom_name in geom_names:
-        points = []
-        for sample in human_samples:
-            if not isinstance(sample, dict):
-                continue
-            for geom in sample.get("geoms", []):
-                if geom.get("name") != geom_name:
-                    continue
-                try:
-                    pos = np.asarray(geom.get("pos"), dtype=np.float64).reshape(3)
-                except Exception:  # noqa: BLE001
-                    continue
-                if np.isfinite(pos).all():
-                    points.append(pos)
-        if len(points) < 2:
-            continue
-        arr = np.stack(points, axis=0)
-        point_arrays.append(arr)
-        short_name = geom_name.split("/")[-1]
-        label = short_name if short_name not in plotted_labels else None
-        ax.plot(
-            arr[:, 0],
-            arr[:, 1],
-            arr[:, 2],
-            color="lightcoral",
-            linewidth=0.9,
-            alpha=0.35,
-            label=label,
-        )
-        if label:
-            plotted_labels.add(label)
-
-    for record in selected:
-        traces = record.get("traces", {}) if isinstance(record, dict) else {}
-        for name in ("braking", "deformed", "recovery", "generated", "nominal"):
-            arr = _trace_xyz_array(traces.get(name))
-            if arr is None or arr.shape[0] < 1:
-                continue
-            color, linestyle, linewidth, alpha = styles[name]
-            label = name if name not in plotted_labels else None
-            ax.plot(
-                arr[:, 0],
-                arr[:, 1],
-                arr[:, 2],
-                color=color,
-                linestyle=linestyle,
-                linewidth=linewidth,
-                alpha=alpha,
-                label=label,
-            )
-            if arr.shape[0] > 0:
-                ax.scatter(
-                    [arr[0, 0]],
-                    [arr[0, 1]],
-                    [arr[0, 2]],
-                    color=color,
-                    s=12,
-                    alpha=min(1.0, alpha + 0.1),
-                )
-            point_arrays.append(arr)
-            if label:
-                plotted_labels.add(label)
-
-    ax.set_title(f"Episode {episode:03d} SafeChunk 3D trajectories")
-    ax.set_xlabel("x world")
-    ax.set_ylabel("y world")
-    ax.set_zlabel("z world")
-    _set_3d_axes_equal(ax, point_arrays)
-    if plotted_labels:
-        ax.legend(loc="upper left", fontsize=8)
-    ax.view_init(elev=24, azim=-58)
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
-    return str(path)
-
-
-def _record_uses_receding_first_action(record: dict, trace_payload=None) -> bool:
-    horizon = record.get("executed_action_horizon")
-    if horizon is not None:
-        try:
-            return int(horizon) == 1
-        except Exception:  # noqa: BLE001
-            return False
-    if isinstance(trace_payload, dict):
-        shape = trace_payload.get("action_shape")
-        if isinstance(shape, list) and shape:
-            try:
-                return int(shape[0]) > 1
-            except Exception:  # noqa: BLE001
-                return False
-    return False
-
-
-def _trace_first_xyz(trace_payload):
-    arr = _trace_xyz_array(trace_payload)
-    if arr is None or arr.shape[0] < 1:
-        return None
-    first = np.asarray(arr[0], dtype=np.float64).reshape(3)
-    if not np.isfinite(first).all():
-        return None
-    return first
-
-
-def _trajectory_sample_segments(samples: list[dict], point_key: str, label_prefix: str):
-    grouped: dict[int, list[tuple[int, list[float]]]] = {}
-    for sample in samples:
-        if not isinstance(sample, dict):
-            continue
-        point = sample.get(point_key)
-        if point is None:
-            continue
-        try:
-            arr = np.asarray(point, dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            continue
-        if not np.isfinite(arr).all():
-            continue
-        episode = int(sample.get("episode", 0))
-        step = int(sample.get("step", 0))
-        grouped.setdefault(episode, []).append((step, arr.astype(float).tolist()))
-
-    segments = []
-    for episode, items in sorted(grouped.items()):
-        items = sorted(items, key=lambda item: item[0])
-        if not items:
-            continue
-        segments.append({"label": f"{label_prefix} episode {episode:03d}", "points": [point for _step, point in items], "steps": [int(step) for step, _point in items]})
-    return segments
-
-
-def _trajectory_trace_segments(trace_records: list[dict], trace_name: str, label_prefix: str, max_events: int):
-    selected = trace_records
-    if max_events > 0 and len(selected) > max_events:
-        selected = selected[-max_events:]
-
-    segments = []
-    receding_points: dict[int, list[tuple[int, list[float]]]] = {}
-    for record in selected:
-        if not isinstance(record, dict):
-            continue
-        traces = record.get("traces", {})
-        if not isinstance(traces, dict):
-            continue
-        arr = _trace_xyz_array(traces.get(trace_name))
-        if arr is None or arr.shape[0] < 1:
-            continue
-        episode = int(record.get("episode", 0))
-        step = int(record.get("step", 0))
-        if _record_uses_receding_first_action(record, traces.get(trace_name)):
-            receding_points.setdefault(episode, []).append((step + 1, arr[0].astype(float).tolist()))
-            continue
-        segments.append(
-            {
-                "label": f"{label_prefix} e{episode:03d} step {step}",
-                "points": arr.astype(float).tolist(),
-                "episode": episode,
-                "step": step,
-                "steps": [int(step + offset) for offset in range(arr.shape[0])],
-                "horizon_steps": [int(offset) for offset in range(arr.shape[0])],
-            }
-        )
-    for episode, items in sorted(receding_points.items()):
-        items = sorted(items, key=lambda item: item[0])
-        if not items:
-            continue
-        segments.append(
-            {
-                "label": f"{label_prefix} executed first-action episode {episode:03d}",
-                "points": [point for _step, point in items],
-                "episode": episode,
-                "step": int(items[0][0]),
-                "steps": [int(step) for step, _point in items],
-                "horizon_steps": [0 for _step, _point in items],
-                "trace_source": "executed_first_action",
-            }
-        )
-    return segments
-
-
-def _braking_trajectory_segments(trace_records: list[dict], max_events: int):
-    selected = trace_records
-    if max_events > 0 and len(selected) > max_events:
-        selected = selected[-max_events:]
-
-    segments = []
-    receding_points: dict[tuple[int, str], list[tuple[int, list[float]]]] = {}
-    for record in selected:
-        if not isinstance(record, dict):
-            continue
-        traces = record.get("traces", {})
-        if not isinstance(traces, dict):
-            continue
-        source = (
-            record.get("deformation_source")
-            or record.get("retiming_source")
-            or record.get("safety_mode")
-            or record.get("mode")
-        )
-        trace = traces.get("braking")
-        trace_source = "braking"
-        if (
-            source in {
-                "path_consistent_brake",
-                "path_consistent_brake_slowdown",
-                "unverified_emergency_failsafe",
-            }
-            and isinstance(traces.get("generated"), dict)
-        ):
-            trace = traces.get("generated")
-            trace_source = "generated_safe_first_action"
-        arr = _trace_xyz_array(trace)
-        if arr is None or arr.shape[0] < 1:
-            continue
-        episode = int(record.get("episode", 0))
-        step = int(record.get("step", 0))
-        if _record_uses_receding_first_action(record, trace):
-            receding_points.setdefault((episode, trace_source), []).append((step + 1, arr[0].astype(float).tolist()))
-            continue
-        segments.append(
-            {
-                "label": f"braking e{episode:03d} step {step}",
-                "points": arr.astype(float).tolist(),
-                "episode": episode,
-                "step": step,
-                "steps": [int(step + offset) for offset in range(arr.shape[0])],
-                "horizon_steps": [int(offset) for offset in range(arr.shape[0])],
-                "trace_source": trace_source,
-            }
-        )
-    for (episode, trace_source), items in sorted(receding_points.items()):
-        items = sorted(items, key=lambda item: item[0])
-        if not items:
-            continue
-        segments.append(
-            {
-                "label": f"braking executed first-action episode {episode:03d}",
-                "points": [point for _step, point in items],
-                "episode": episode,
-                "step": int(items[0][0]),
-                "steps": [int(step) for step, _point in items],
-                "horizon_steps": [0 for _step, _point in items],
-                "trace_source": trace_source,
-            }
-        )
-    return segments
-
-
-def _segment_timestep_labels(segment: dict, count: int):
-    raw_steps = segment.get("steps")
-    steps = raw_steps if isinstance(raw_steps, list) else []
-    raw_horizon_steps = segment.get("horizon_steps")
-    horizon_steps = raw_horizon_steps if isinstance(raw_horizon_steps, list) else []
-    labels = []
-    for idx in range(count):
-        parts = []
-        if idx < len(steps):
-            parts.append(f"timestep {steps[idx]}")
-        elif segment.get("step") is not None:
-            parts.append(f"timestep {int(segment['step']) + idx}")
-        else:
-            parts.append(f"timestep {idx}")
-        if idx < len(horizon_steps):
-            parts.append(f"horizon {horizon_steps[idx]}")
-        labels.append(", ".join(parts))
-    return labels
-
-
 def _execution_mode_from_safety_info(safety_info: dict) -> str:
     mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
     source = _safe_info_get(safety_info, "deformation_source")
+    diagnostic_mode = _safe_info_get(safety_info, "diagnostic_step_mode")
+    recovery_phase = _safe_info_get(safety_info, "recovery_phase")
+    committed_mode = _safe_info_get(safety_info, "committed_chunk_mode")
+    if diagnostic_mode == "recover" or bool(_safe_info_get(safety_info, "recover_step")):
+        return "recover"
+    if diagnostic_mode in {"brake", "fallback"} or bool(_safe_info_get(safety_info, "brake_step")):
+        return "braking"
+    if diagnostic_mode == "horizon_deform" or bool(_safe_info_get(safety_info, "deform_step")):
+        return "deform"
+    if diagnostic_mode == "act" or bool(_safe_info_get(safety_info, "act_step")):
+        return "policy"
+    if recovery_phase == "recover" or committed_mode == "recover":
+        return "recover"
+    if recovery_phase == "horizon_deform" or committed_mode == "horizon_deform":
+        return "deform"
     if mode in {None, "pass_through", "path_consistent_brake_intended_step"}:
         return "policy"
     if mode in {"horizon_brake", "unverified_emergency_failsafe", "pause_on_unsafe", "pause_and_restart", "stop"}:
         return "braking"
     if source in {"horizon_brake", "path_consistent_brake", "path_consistent_brake_slowdown"}:
         return "braking"
+    if mode in {"recover", "recover_safe_prefix", "committed_explicit_recovery"}:
+        return "recover"
     if mode in {"horizon_deform", "chunk_deform", "deform_safe_prefix", "emergency_deform_away"} or source in {"chunk_deform", "explicit_recover_deform", "explicit_return_deform"}:
         return "deform"
-    if mode in {"recover", "recover_safe_prefix", "committed_explicit_recovery"} or source == "committed_explicit_recovery":
-        return "recover"
     if mode in {"phase_reanchor", "sequential_oscbf"}:
         return str(mode)
     return "intervention"
@@ -6503,6 +3679,10 @@ def _annotate_executed_trajectory_sample(sample: dict, safety_info: dict | None,
             "execution_group": _execution_group_from_mode(mode),
             "safety_mode": "initial" if initial else _safe_info_get(info, "safety_mode"),
             "deformation_source": None if initial else _safe_info_get(info, "deformation_source"),
+            "diagnostic_step_mode": None if initial else _safe_info_get(info, "diagnostic_step_mode"),
+            "recovery_phase": None if initial else _safe_info_get(info, "recovery_phase"),
+            "committed_chunk_mode": None if initial else _safe_info_get(info, "committed_chunk_mode"),
+            "deform_mode": None if initial else _safe_info_get(info, "deform_mode"),
             "intervention_active": False if initial else _is_safety_intervention_mode(info),
             "brake_step": False if initial else mode == "braking",
             "deform_step": False if initial else mode == "deform",
@@ -6512,1941 +3692,10 @@ def _annotate_executed_trajectory_sample(sample: dict, safety_info: dict | None,
     return sample
 
 
-def _execution_sample_mode(sample: dict) -> str:
-    mode = sample.get("execution_mode") or sample.get("diagnostic_step_mode") or sample.get("safety_mode")
-    if mode in {None, "act", "pass_through", "path_consistent_brake_intended_step"}:
-        return "policy"
-    if bool(sample.get("brake_step")):
-        return "braking"
-    if bool(sample.get("deform_step")):
-        return "deform"
-    if bool(sample.get("recover_step")):
-        return "recover"
-    if bool(sample.get("intervention_active")):
-        return str(mode) if str(mode) not in {"act", "pass_through"} else "intervention"
-    return str(mode) if str(mode) not in {"act", "pass_through"} else "policy"
-
-
-def _execution_sample_point(sample: dict):
-    point = sample.get("ee_pos")
-    if point is None:
-        return None
-    try:
-        arr = np.asarray(point, dtype=np.float64).reshape(3)
-    except Exception:  # noqa: BLE001
-        return None
-    if not np.isfinite(arr).all():
-        return None
-    return arr
-
-
-def _group_execution_samples_by_episode(executed_samples: list[dict]):
-    grouped: dict[int, list[dict]] = {}
-    for sample in executed_samples:
-        if not isinstance(sample, dict):
-            continue
-        point = _execution_sample_point(sample)
-        if point is None:
-            continue
-        item = dict(sample)
-        item["_point"] = point
-        item["_mode"] = _execution_sample_mode(sample)
-        item["_group"] = sample.get("execution_group") or _execution_group_from_mode(item["_mode"])
-        grouped.setdefault(int(sample.get("episode", 0)), []).append(item)
-    for episode in list(grouped):
-        grouped[episode] = sorted(grouped[episode], key=lambda sample: int(sample.get("step", 0)))
-    return grouped
-
-
-def _execution_marker_segments(executed_samples: list[dict], group: str, label: str):
-    segments = []
-    for episode, items in sorted(_group_execution_samples_by_episode(executed_samples).items()):
-        selected = [item for item in items if item.get("_group") == group]
-        if not selected:
-            continue
-        segments.append(
-            {
-                "label": f"{label} episode {episode:03d}",
-                "points": [item["_point"].astype(float).tolist() for item in selected],
-                "steps": [int(item.get("step", 0)) for item in selected],
-                "execution_modes": [str(item.get("_mode")) for item in selected],
-            }
-        )
-    return segments
-
-
-def _execution_pair_segments(executed_samples: list[dict], segment_class: str):
-    segments = []
-    for episode, items in sorted(_group_execution_samples_by_episode(executed_samples).items()):
-        for prev, curr in zip(items, items[1:]):
-            prev_group = str(prev.get("_group"))
-            curr_group = str(curr.get("_group"))
-            prev_mode = str(prev.get("_mode"))
-            curr_mode = str(curr.get("_mode"))
-            is_policy = prev_group == curr_group == "policy"
-            is_intervention = prev_group == curr_group == "intervention" and prev_mode == curr_mode
-            is_transition = prev_group != curr_group or (prev_group == curr_group == "intervention" and prev_mode != curr_mode)
-            if segment_class == "policy" and not is_policy:
-                continue
-            if segment_class == "intervention" and not is_intervention:
-                continue
-            if segment_class == "transition" and not is_transition:
-                continue
-            segments.append(
-                {
-                    "label": (
-                        f"actual execution {prev_mode}->{curr_mode} e{episode:03d} "
-                        f"steps {int(prev.get('step', 0))}-{int(curr.get('step', 0))}"
-                    ),
-                    "points": [prev["_point"].astype(float).tolist(), curr["_point"].astype(float).tolist()],
-                    "episode": episode,
-                    "step": int(prev.get("step", 0)),
-                    "steps": [int(prev.get("step", 0)), int(curr.get("step", 0))],
-                    "execution_modes": [prev_mode, curr_mode],
-                }
-            )
-    return segments
-
-
-def _drawer_reference_from_samples(executed_samples: list[dict]):
-    handle_pos = None
-    open_distance = None
-    open_fraction = None
-    scene_geometry = None
-
-    def _point_or_none(value):
-        if value is None:
-            return None
-        try:
-            arr = np.asarray(value, dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            return None
-        return arr if np.isfinite(arr).all() else None
-
-    for sample in executed_samples:
-        if not isinstance(sample, dict):
-            continue
-        candidate = sample.get("handle_pos")
-        object_state = sample.get("object_state")
-        if candidate is None and isinstance(object_state, dict):
-            candidate = object_state.get("handle_pos")
-        if candidate is not None and handle_pos is None:
-            arr = _point_or_none(candidate)
-            if arr is not None:
-                handle_pos = arr
-
-        if scene_geometry is None:
-            value = sample.get("drawer_scene_geometry")
-            if value is None and isinstance(object_state, dict):
-                value = object_state.get("drawer_scene_geometry")
-            if isinstance(value, dict) and (value.get("cabinet") or value.get("drawer") or value.get("handle")):
-                scene_geometry = value
-
-        if open_distance is None:
-            value = sample.get("drawer_open_distance")
-            if value is None and isinstance(object_state, dict):
-                value = object_state.get("drawer_open_distance")
-            if value is not None:
-                try:
-                    open_distance = float(value)
-                except (TypeError, ValueError):
-                    pass
-        if open_fraction is None:
-            value = sample.get("drawer_open_fraction")
-            if value is None and isinstance(object_state, dict):
-                value = object_state.get("drawer_open_fraction")
-            if value is not None:
-                try:
-                    open_fraction = float(value)
-                except (TypeError, ValueError):
-                    pass
-        if scene_geometry is not None and handle_pos is not None and open_distance is not None and open_fraction is not None:
-            break
-
-    if scene_geometry is not None:
-        handle_segments = scene_geometry.get("handle") or []
-        if not handle_segments and handle_pos is not None:
-            handle_segments = _box_edge_segments_world(handle_pos, [0.025, 0.025, 0.025])
-        return {
-            "absolute": True,
-            "origin": [0.0, 0.0, 0.0],
-            "handle_pos": None if handle_pos is None else handle_pos.astype(float).tolist(),
-            "open_axis": [0.0, 0.0, 0.0],
-            "default_open": 0.0,
-            "open_fraction": None if open_fraction is None else float(open_fraction),
-            "cabinet": scene_geometry.get("cabinet") or [],
-            "drawer": scene_geometry.get("drawer") or [],
-            "handle": handle_segments,
-            "source": scene_geometry.get("source") or "mujoco_geoms",
-        }
-
-    if handle_pos is None:
-        return None
-
-    open_distance = 0.0 if open_distance is None or not np.isfinite(open_distance) else float(open_distance)
-    xml_geometry = _drawer_scene_geometry_from_cabinet_xml(handle_pos, open_distance, open_fraction)
-    if xml_geometry is not None:
-        return xml_geometry
-
-    open_axis = np.asarray([0.0, -1.0, 0.0], dtype=np.float64)
-    origin = handle_pos - open_axis * open_distance
-
-    def edges(center, size):
-        cx, cy, cz = [float(v) for v in center]
-        sx, sy, sz = [0.5 * float(v) for v in size]
-        corners = [
-            [cx + dx * sx, cy + dy * sy, cz + dz * sz]
-            for dx in (-1, 1)
-            for dy in (-1, 1)
-            for dz in (-1, 1)
-        ]
-        idx = {(dx, dy, dz): i for i, (dx, dy, dz) in enumerate((
-            (dx, dy, dz) for dx in (-1, 1) for dy in (-1, 1) for dz in (-1, 1)
-        ))}
-        pairs = []
-        for dx in (-1, 1):
-            for dy in (-1, 1):
-                pairs.append((idx[(dx, dy, -1)], idx[(dx, dy, 1)]))
-            for dz in (-1, 1):
-                pairs.append((idx[(dx, -1, dz)], idx[(dx, 1, dz)]))
-        for dy in (-1, 1):
-            for dz in (-1, 1):
-                pairs.append((idx[(-1, dy, dz)], idx[(1, dy, dz)]))
-        return [[corners[a], corners[b]] for a, b in pairs]
-
-    cabinet_segments = edges([0.0, 0.20, -0.07], [0.82, 0.48, 0.72])
-    drawer_segments = edges([0.0, 0.12, 0.0], [0.58, 0.30, 0.18])
-    front_segments = edges([0.0, 0.0, 0.0], [0.64, 0.025, 0.24])
-    handle_segments = [[[-0.16, -0.035, 0.0], [0.16, -0.035, 0.0]]]
-    return {
-        "absolute": False,
-        "origin": origin.astype(float).tolist(),
-        "handle_pos": handle_pos.astype(float).tolist(),
-        "open_axis": open_axis.astype(float).tolist(),
-        "default_open": float(open_distance),
-        "open_fraction": None if open_fraction is None else float(open_fraction),
-        "cabinet": cabinet_segments,
-        "drawer": drawer_segments + front_segments,
-        "handle": handle_segments,
-        "source": "handle_fallback",
-    }
-
-def _executed_policy_points_by_episode(executed_samples: list[dict]):
-    grouped: dict[int, list[tuple[int, np.ndarray]]] = {}
-    for sample in executed_samples:
-        if not isinstance(sample, dict):
-            continue
-        point = sample.get("ee_pos")
-        if point is None:
-            continue
-        try:
-            arr = np.asarray(point, dtype=np.float64).reshape(3)
-        except Exception:  # noqa: BLE001
-            continue
-        if not np.isfinite(arr).all():
-            continue
-        grouped.setdefault(int(sample.get("episode", 0)), []).append(
-            (int(sample.get("step", 0)), arr)
-        )
-    return {episode: sorted(items, key=lambda item: item[0]) for episode, items in grouped.items()}
-
-
-def _record_policy_anchor_point(record: dict, executed_by_episode: dict[int, list[tuple[int, np.ndarray]]]):
-    anchor_sample = record.get("policy_anchor_sample")
-    if isinstance(anchor_sample, dict):
-        point = anchor_sample.get("ee_pos")
-        if point is not None:
-            try:
-                arr = np.asarray(point, dtype=np.float64).reshape(3)
-                if np.isfinite(arr).all():
-                    return int(anchor_sample.get("step", record.get("step", 0))), arr
-            except Exception:  # noqa: BLE001
-                pass
-
-    episode = int(record.get("episode", 0))
-    step = int(record.get("step", 0))
-    candidates = executed_by_episode.get(episode, [])
-    if not candidates:
-        return None, None
-    return min(candidates, key=lambda item: abs(item[0] - step))
-
-
-def _policy_intervention_connector_segments(trace_records: list[dict], executed_samples: list[dict], max_events: int):
-    del executed_samples
-    selected = trace_records
-    if max_events > 0 and len(selected) > max_events:
-        selected = selected[-max_events:]
-    segments = []
-    for record in selected:
-        if not isinstance(record, dict):
-            continue
-        traces = record.get("traces", {})
-        if not isinstance(traces, dict):
-            continue
-        nominal = _trace_first_xyz(traces.get("nominal"))
-        if nominal is None:
-            continue
-        episode = int(record.get("episode", 0))
-        record_step = int(record.get("step", 0))
-        objective_step = record_step + 1
-        source = (
-            record.get("deformation_source")
-            or record.get("retiming_source")
-            or record.get("safety_mode")
-            or record.get("mode")
-        )
-        for trace_name, label_prefix in (
-            ("braking", "braking"),
-            ("deformed", "deformed"),
-            ("recovery", "recovered"),
-        ):
-            trace_payload = traces.get(trace_name)
-            if (
-                trace_name == "braking"
-                and source in {
-                    "path_consistent_brake",
-                    "path_consistent_brake_slowdown",
-                    "unverified_emergency_failsafe",
-                }
-                and isinstance(traces.get("generated"), dict)
-            ):
-                trace_payload = traces.get("generated")
-            intervention = _trace_first_xyz(trace_payload)
-            if intervention is None:
-                continue
-            distance = float(np.linalg.norm(intervention - nominal))
-            segments.append(
-                {
-                    "label": (
-                        f"policy step {objective_step} to {label_prefix} e{episode:03d} "
-                        f"step {record_step} ({distance:.3f} m)"
-                    ),
-                    "points": [nominal.astype(float).tolist(), intervention.astype(float).tolist()],
-                    "episode": episode,
-                    "step": record_step,
-                    "steps": [int(objective_step), int(objective_step)],
-                    "horizon_steps": [0, 0],
-                    "connector_distance": distance,
-                    "trace_name": trace_name,
-                    "trace_source": "nominal_policy_to_intervention",
-                }
-            )
-    return segments
-
-
-def _add_plotly_segments(fig, go, segments, *, name: str, color: str, width: int, dash=None, line: bool = True, markers: bool = True):
-    first = True
-    for segment in segments:
-        points = np.asarray(segment.get("points", []), dtype=np.float64).reshape(-1, 3)
-        if points.size == 0:
-            continue
-        finite = np.isfinite(points).all(axis=1)
-        points = points[finite]
-        if points.size == 0:
-            continue
-        labels = _segment_timestep_labels(segment, points.shape[0])
-        line_style = {"color": color, "width": width}
-        if dash:
-            line_style["dash"] = "dash"
-        if line:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=points[:, 0],
-                    y=points[:, 1],
-                    z=points[:, 2],
-                    mode="lines",
-                    name=name if first else segment.get("label", name),
-                    legendgroup=name,
-                    showlegend=first,
-                    line=line_style,
-                    text=[segment.get("label", name)] * points.shape[0],
-                    customdata=labels,
-                    hovertemplate="%{text}<br>%{customdata}<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
-                )
-            )
-        if markers:
-            fig.add_trace(
-                go.Scatter3d(
-                    x=points[:, 0],
-                    y=points[:, 1],
-                    z=points[:, 2],
-                    mode="markers",
-                    name=f"{name} timestep dots" if first else f"{segment.get('label', name)} timestep dots",
-                    legendgroup=f"{name} timestep dots",
-                    showlegend=first,
-                    marker={"color": color, "size": max(2, width + 1)},
-                    text=[segment.get("label", name)] * points.shape[0],
-                    customdata=labels,
-                    hovertemplate="%{text}<br>%{customdata}<br>x=%{x:.4f}<br>y=%{y:.4f}<br>z=%{z:.4f}<extra></extra>",
-                )
-            )
-        first = False
-
-
-
-def _executed_policy_segments_from_traces(trace_records: list[dict], executed_samples: list[dict], max_events: int):
-    segments = _trajectory_sample_segments(executed_samples, "ee_pos", "executed policy")
-    if segments:
-        return segments
-    return _braking_trajectory_segments(trace_records, max_events)
-
-
-def _first_trace_point(trace_payload):
-    arr = _trace_xyz_array(trace_payload)
-    if arr is None or arr.shape[0] == 0:
-        return None
-    return np.asarray(arr[0], dtype=np.float64).reshape(3)
-
-
-def _trajectory_frame_diagnostics(trace_records: list[dict], executed_samples: list[dict]):
-    executed_by_step = {}
-    for sample in executed_samples:
-        if not isinstance(sample, dict):
-            continue
-        point = _execution_sample_point(sample)
-        if point is None:
-            continue
-        executed_by_step[(int(sample.get("episode", 0)), int(sample.get("step", 0)))] = point
-
-    comparisons = []
-    for record in trace_records:
-        if not isinstance(record, dict):
-            continue
-        episode = int(record.get("episode", 0))
-        step = int(record.get("step", 0))
-        anchor = record.get("policy_anchor_sample")
-        if isinstance(anchor, dict) and anchor.get("ee_pos") is not None:
-            try:
-                src = np.asarray(anchor.get("ee_pos"), dtype=np.float64).reshape(3)
-                ref = executed_by_step.get((episode, int(anchor.get("step", step))))
-                if ref is not None and np.isfinite(src).all():
-                    diff = ref - src
-                    comparisons.append({
-                        "label": "policy anchor vs MuJoCo executed same timestep",
-                        "source": str(anchor.get("source")),
-                        "episode": episode,
-                        "step": int(anchor.get("step", step)),
-                        "norm": float(np.linalg.norm(diff)),
-                        "diff": diff.astype(float).tolist(),
-                    })
-            except Exception:  # noqa: BLE001
-                pass
-        traces = record.get("traces")
-        if not isinstance(traces, dict):
-            continue
-        for name in ("generated", "braking", "deformed", "recovery"):
-            point = _first_trace_point(traces.get(name))
-            ref = executed_by_step.get((episode, step + 1))
-            if point is None or ref is None:
-                continue
-            diff = ref - point
-            comparisons.append({
-                "label": f"{name} first-action FK vs MuJoCo executed next timestep",
-                "source": str((traces.get(name) or {}).get("frame", "unknown")),
-                "episode": episode,
-                "step": int(step + 1),
-                "norm": float(np.linalg.norm(diff)),
-                "diff": diff.astype(float).tolist(),
-            })
-
-    if not comparisons:
-        return {"count": 0, "note": "No comparable safety-model FK and MuJoCo execution samples were available."}
-    norms = np.asarray([c["norm"] for c in comparisons], dtype=np.float64)
-    worst = comparisons[int(np.argmax(norms))]
-    return {
-        "count": int(len(comparisons)),
-        "mean_norm": float(np.mean(norms)),
-        "max_norm": float(np.max(norms)),
-        "worst": worst,
-        "note": "Actual execution/human/drawer layers are MuJoCo world-frame samples. Planned objective layers are safety-model FK world estimates and may not align with MuJoCo.",
-    }
-
-
-def _chunk_trajectory_viewer_layers(trace_records, human_samples, executed_samples, max_events):
-    return [
-        {"name": "actual policy pass-through segments", "color": "#111827", "width": 4, "markers": False, "segments": _execution_pair_segments(executed_samples, "policy")},
-        {"name": "actual intervention segments", "color": "#f59e0b", "width": 4, "markers": False, "segments": _execution_pair_segments(executed_samples, "intervention")},
-        {"name": "actual mode transition segments", "color": "#a855f7", "width": 3, "markers": False, "segments": _execution_pair_segments(executed_samples, "transition")},
-        {"name": "actual policy pass-through poses", "color": "#111827", "width": 5, "line": False, "segments": _execution_marker_segments(executed_samples, "policy", "actual policy pose")},
-        {"name": "actual intervention poses", "color": "#f59e0b", "width": 5, "line": False, "segments": _execution_marker_segments(executed_samples, "intervention", "actual intervention pose")},
-        {"name": "human arm wrist joint trajectory", "color": "#d62728", "width": 4, "segments": _trajectory_sample_segments(human_samples, "wrist_pos", "human wrist")},
-        {"name": "planned braking first-action objective (safety-model FK)", "color": "#fbbf24", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _braking_trajectory_segments(trace_records, max_events)},
-        {"name": "planned deformed first-action objective (safety-model FK)", "color": "#2563eb", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _trajectory_trace_segments(trace_records, "deformed", "deformed", max_events)},
-        {"name": "planned recovered first-action objective (safety-model FK)", "color": "#16a34a", "width": 2, "dash": [5, 5], "markers": False, "visible": False, "segments": _trajectory_trace_segments(trace_records, "recovery", "recovered", max_events)},
-    ]
-
-
-def _save_chunk_trajectory_canvas_viewer(path: Path, title: str, trace_records: list[dict], human_samples: list[dict], executed_samples: list[dict], max_events: int):
-    layers = _chunk_trajectory_viewer_layers(trace_records, human_samples, executed_samples, max_events)
-    if not any(segment.get("points") for layer in layers for segment in layer.get("segments", [])):
-        return None
-    payload = {
-        "title": title,
-        "layers": layers,
-        "drawerReference": _drawer_reference_from_samples(executed_samples),
-        "frameDiagnostics": _trajectory_frame_diagnostics(trace_records, executed_samples),
-    }
-    payload_json = json.dumps(_jsonable_trace_value(payload), separators=(",", ":"))
-    template = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SafeChunk 3D Trajectory Viewer</title>
-<style>
-html,body{margin:0;height:100%;overflow:hidden;font-family:Arial,sans-serif;background:transparent;color:#151515}
-canvas{position:fixed;inset:0;width:100vw;height:100vh;background:transparent}
-.panel{position:fixed;left:14px;top:14px;width:min(430px,calc(100vw - 28px));max-height:calc(100vh - 28px);overflow:auto;background:rgba(255,255,255,.92);border:1px solid #d6d2c8;border-radius:8px;padding:12px;box-shadow:0 10px 30px rgba(0,0,0,.14)}
-.panel[hidden]{display:none}.panel-tab{position:fixed;left:14px;top:14px;z-index:2}
-.legend{position:fixed;right:14px;bottom:14px;max-width:min(340px,calc(100vw - 28px));background:rgba(255,255,255,.84);border:1px solid #d6d2c8;border-radius:8px;padding:8px 10px;font-size:12px;color:#1f2937;box-shadow:0 8px 24px rgba(0,0,0,.12);pointer-events:none}
-.legend[hidden]{display:none}.legend-title{font-weight:600;margin-bottom:5px}.legend-row{display:grid;grid-template-columns:24px 1fr auto;gap:7px;align-items:center;margin:3px 0}.legend-line{height:0;border-top:2px solid currentColor}.legend-count{color:#666}
-h1{font-size:16px;margin:0 0 8px}.hint{font-size:12px;color:#555;line-height:1.35;margin-bottom:8px}
-.dot-toggle{display:flex;align-items:center;gap:8px;border-top:1px solid #ebe7dd;margin-top:2px;padding:8px 0 4px;font-size:13px}
-.layer{border-top:1px solid #ebe7dd;padding:7px 0;font-size:13px}.layer-main{display:grid;grid-template-columns:18px 18px 1fr auto;gap:8px;align-items:center}.layer-style{display:grid;grid-template-columns:52px 1fr 42px;gap:8px;align-items:center;margin:6px 0 0 44px}.layer-style input[type=color]{width:100%;height:24px;padding:0;border:1px solid #c8c3b8;background:white}.layer-style input[type=range]{width:100%}
-.sw{width:14px;height:14px;border-radius:50%;border:1px solid rgba(0,0,0,.24)}
-button{border:1px solid #c8c3b8;background:white;border-radius:6px;padding:6px 9px;margin:2px 4px 8px 0;cursor:pointer}.count{font-size:12px;color:#666}
-.drawer-controls{border-top:1px solid #ebe7dd;margin-top:4px;padding:8px 0;font-size:13px}.drawer-controls h2{font-size:13px;margin:0 0 6px}.drawer-control{display:grid;grid-template-columns:58px 1fr 48px;gap:8px;align-items:center;margin:5px 0}.drawer-control input{width:100%}
-.frame-diagnostics{border-top:1px solid #ebe7dd;margin-top:4px;padding:8px 0;font-size:12px;color:#374151;line-height:1.35}.frame-diagnostics strong{color:#111827}
-</style>
-</head>
-<body>
-<canvas id="view"></canvas>
-<button id="showPanel" class="panel-tab" hidden>Show panel</button>
-<div id="legend" class="legend" hidden></div>
-<section id="panel" class="panel">
-<h1 id="title"></h1>
-<div class="hint">Choose Orbit or Pan, then left-drag. Mouse wheel zooms. Arrow keys pan; A/D and W/S orbit. Controls are remembered in this browser tab even if VS Code reloads the HTML.</div>
-<button id="reset">Reset view</button><button id="shot">Download screenshot</button><button id="hidePanel">Hide panel</button><button id="clearSettings">Reset controls</button>
-<label class="dot-toggle"><input id="dots" type="checkbox" checked> Timestep dots</label>
-<label class="dot-toggle"><input id="pauseRedraw" type="checkbox"> Pause redraw while editing</label>
-<label class="dot-toggle">Drag mode <select id="dragMode"><option value="orbit">Orbit</option><option value="pan">Pan</option></select></label>
-<div id="frameDiagnostics" class="frame-diagnostics" hidden></div>
-<div id="drawerControls" class="drawer-controls"></div>
-<div id="layers"></div>
-</section>
-<script>
-const DATA=__DATA__;
-const canvas=document.getElementById("view"),ctx=canvas.getContext("2d"),vis=new Map(),styles=new Map(),drawerRef=DATA.drawerReference||null;
-const STORE_KEY="safechunk_trajectory_viewer:"+location.pathname;
-let savedState={};try{savedState=JSON.parse(localStorage.getItem(STORE_KEY)||"{}")}catch(_e){savedState={}}
-let showDots=savedState.showDots!==undefined?!!savedState.showDots:true,drawDrawer=savedState.drawDrawer!==undefined?!!savedState.drawDrawer:!!drawerRef,drawerOffset=Array.isArray(savedState.drawerOffset)?savedState.drawerOffset.slice(0,3):[0,0,0],drawerOpen=savedState.drawerOpen!==undefined?Number(savedState.drawerOpen):(drawerRef?drawerRef.default_open:0),dragMode=savedState.dragMode||"orbit",panelHidden=!!savedState.panelHidden,pauseRedraw=false,yaw=-.85,pitch=.48,dist=1,target=[0,0,0],drag=false,pan=false,lx=0,ly=0;
-while(drawerOffset.length<3)drawerOffset.push(0);
-function add(a,b){return[a[0]+b[0],a[1]+b[1],a[2]+b[2]]}function sub(a,b){return[a[0]-b[0],a[1]-b[1],a[2]-b[2]]}function mul(a,s){return[a[0]*s,a[1]*s,a[2]*s]}function dot(a,b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]}function cross(a,b){return[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]}function len(a){return Math.sqrt(Math.max(1e-18,dot(a,a)))}function norm(a){return mul(a,1/len(a))}
-function serialize(){const layerVis={},layerStyles={};for(const [k,v] of vis.entries())layerVis[k]=v;for(const [k,v] of styles.entries())layerStyles[k]=v;return{showDots,drawDrawer,drawerOffset,drawerOpen,dragMode,panelHidden,layerVis,layerStyles}}
-function saveSettings(){try{localStorage.setItem(STORE_KEY,JSON.stringify(serialize()))}catch(_e){}}
-function maybeDraw(){saveSettings();if(!pauseRedraw)draw()}
-function allPts(){const out=[];for(const l of DATA.layers)for(const s of l.segments)for(const p of s.points)out.push(p);if(drawerRef){for(const k of ["cabinet","drawer","handle"])for(const seg of drawerRef[k]||[])for(const p of seg)out.push(drawerPointRaw(p,k!=="cabinet"))}return out}
-function bounds(){const pts=allPts();if(!pts.length)return{c:[0,0,0],r:1};const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];for(const p of pts)for(let i=0;i<3;i++){mn[i]=Math.min(mn[i],p[i]);mx[i]=Math.max(mx[i],p[i])}return{c:[(mn[0]+mx[0])/2,(mn[1]+mx[1])/2,(mn[2]+mx[2])/2],r:Math.max(.05,Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])/2)}}
-let box;
-function reset(){box=bounds();target=box.c.slice();dist=Math.max(.25,box.r*3.2);yaw=-.85;pitch=.48;draw()}
-function cam(){const cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw),pos=[target[0]+dist*cp*cy,target[1]+dist*cp*sy,target[2]+dist*sp],f=norm(sub(target,pos));let r=cross(f,[0,0,1]);r=len(r)<1e-5?[1,0,0]:norm(r);return{pos:pos,f:f,r:r,u:norm(cross(r,f))}}
-function proj(p,c){const rel=sub(p,c.pos),z=dot(rel,c.f);if(z<=1e-5)return null;const q=Math.min(canvas.width,canvas.height)*.82;return{x:canvas.width/2+dot(rel,c.r)*q/z,y:canvas.height/2-dot(rel,c.u)*q/z}}
-function line(points,color,w,c,dash){ctx.save();ctx.strokeStyle=color;ctx.lineWidth=w;ctx.lineJoin="round";ctx.lineCap="round";if(dash)ctx.setLineDash(dash.map(v=>v*(window.devicePixelRatio||1)));let on=false;for(const p of points){const q=proj(p,c);if(!q){on=false;continue}if(!on){ctx.beginPath();ctx.moveTo(q.x,q.y);on=true}else ctx.lineTo(q.x,q.y)}if(on)ctx.stroke();ctx.restore()}
-function point(p,color,r,c){const q=proj(p,c);if(!q)return;ctx.fillStyle=color;ctx.beginPath();ctx.arc(q.x,q.y,r,0,Math.PI*2);ctx.fill()}
-function defaultLayerStyle(layer){return{color:layer.color,width:.5,pointSize:1}}
-function layerStyle(layer){return styles.get(layer.name)||defaultLayerStyle(layer)}
-function drawerPointRaw(p,move){if(!drawerRef)return p;if(drawerRef.absolute)return[p[0]+drawerOffset[0],p[1]+drawerOffset[1],p[2]+drawerOffset[2]];const o=drawerRef.origin,a=drawerRef.open_axis,m=move?drawerOpen:0;return[o[0]+drawerOffset[0]+p[0]+a[0]*m,o[1]+drawerOffset[1]+p[1]+a[1]*m,o[2]+drawerOffset[2]+p[2]+a[2]*m]}
-function drawerPoint(p,move){return drawerPointRaw(p,move)}function drawerSegs(segs,color,w,c,move){for(const seg of segs)line(seg.map(p=>drawerPoint(p,move)),color,w,c)}
-function drawDrawerRef(c){if(!drawerRef||!drawDrawer)return;const dpr=window.devicePixelRatio||1;drawerSegs(drawerRef.cabinet||[],styles.get("__drawer_cabinet").color,styles.get("__drawer_cabinet").width*dpr,c,false);drawerSegs(drawerRef.drawer||[],styles.get("__drawer_box").color,styles.get("__drawer_box").width*dpr,c,true);drawerSegs(drawerRef.handle||[],styles.get("__drawer_handle").color,styles.get("__drawer_handle").width*dpr,c,true);const hp=drawerRef.absolute?drawerRef.handle_pos:[0,0,0];if(hp)point(drawerPoint(hp,!drawerRef.absolute),styles.get("__drawer_handle").color,styles.get("__drawer_handle").pointSize*dpr,c)}
-function draw(){const dpr=window.devicePixelRatio||1,w=Math.max(1,Math.floor(innerWidth*dpr)),h=Math.max(1,Math.floor(innerHeight*dpr));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}ctx.clearRect(0,0,w,h);const c=cam();for(const layer of DATA.layers){if(!vis.get(layer.name))continue;const st=layerStyle(layer);for(const seg of layer.segments){if(layer.line!==false)line(seg.points,st.color,st.width*dpr,c,layer.dash);if(showDots&&layer.markers!==false)for(const p of seg.points)point(p,st.color,st.pointSize*dpr,c)}}drawDrawerRef(c);updateLegend()}
-function styleRow(label,value,min,max,step,onInput){const row=document.createElement("label");row.className="layer-style";const name=document.createElement("span");name.textContent=label;const input=document.createElement("input");input.type="range";input.min=min;input.max=max;input.step=step;input.value=value;const val=document.createElement("span");val.textContent=(+value).toFixed(1);input.oninput=()=>{val.textContent=(+input.value).toFixed(1);onInput(+input.value);maybeDraw()};row.append(name,input,val);return row}
-function colorRow(value,onInput){const row=document.createElement("label");row.className="layer-style";const name=document.createElement("span");name.textContent="Color";const input=document.createElement("input");input.type="color";input.value=value;const val=document.createElement("span");val.textContent="";input.oninput=()=>{onInput(input.value);maybeDraw()};row.append(name,input,val);return row}
-function updateLegend(){const root=document.getElementById("legend");if(!root)return;const rows=[];for(const layer of DATA.layers){if(!vis.get(layer.name)||!layer.segments.length)continue;const st=layerStyle(layer);rows.push({name:layer.name,color:st.color,count:layer.segments.length})}if(drawerRef&&drawDrawer)rows.push({name:"drawer reference",color:styles.get("__drawer_box")?styles.get("__drawer_box").color:"#0f766e",count:(drawerRef.drawer||[]).length+(drawerRef.cabinet||[]).length});if(!rows.length){root.hidden=true;return}root.hidden=false;root.innerHTML="<div class=\"legend-title\">Legend</div>"+rows.map(r=>"<div class=\"legend-row\"><span class=\"legend-line\" style=\"color:"+r.color+"\"></span><span>"+r.name+"</span><span class=\"legend-count\">"+r.count+"</span></div>").join("")}
-function setupLayerControls(){const root=document.getElementById("layers");for(const layer of DATA.layers){const st={...defaultLayerStyle(layer),...((savedState.layerStyles||{})[layer.name]||{})};styles.set(layer.name,st);const defaultVisible=layer.visible!==false&&!layer.name.toLowerCase().includes("objective");const visible=(savedState.layerVis&&savedState.layerVis[layer.name]!==undefined)?!!savedState.layerVis[layer.name]:defaultVisible;vis.set(layer.name,visible);const row=document.createElement("div");row.className="layer";const main=document.createElement("label");main.className="layer-main";const cb=document.createElement("input");cb.type="checkbox";cb.checked=visible;cb.onchange=()=>{vis.set(layer.name,cb.checked);maybeDraw()};const sw=document.createElement("span");sw.className="sw";sw.style.background=st.color;const nm=document.createElement("span");nm.textContent=layer.name;const ct=document.createElement("span");ct.className="count";ct.textContent=layer.segments.length+" seg";main.append(cb,sw,nm,ct);row.appendChild(main);row.appendChild(colorRow(st.color,v=>{st.color=v;sw.style.background=v}));row.appendChild(styleRow("Line",st.width,.1,12,.1,v=>st.width=v));row.appendChild(styleRow("Dots",st.pointSize,.5,14,.5,v=>st.pointSize=v));root.appendChild(row)}}
-function setupFrameDiagnostics(){const root=document.getElementById("frameDiagnostics"),d=DATA.frameDiagnostics;if(!root||!d)return;if(!d.count){root.textContent=d.note||"No frame diagnostics available.";root.hidden=false;return}const w=d.worst||{};root.innerHTML="<strong>Frame check</strong><br>MuJoCo world execution vs safety-model FK: mean "+Number(d.mean_norm||0).toFixed(4)+" m, max "+Number(d.max_norm||0).toFixed(4)+" m over "+d.count+" comparisons.<br>Worst: "+(w.label||"unknown")+" at timestep "+(w.step??"?")+", diff ["+((w.diff||[]).map(v=>Number(v).toFixed(4)).join(", "))+"] m.<br>"+(d.note||"");root.hidden=false}
-function setupDrawerControls(){const saved=savedState.layerStyles||{};styles.set("__drawer_cabinet",{color:"#64748b",width:.5,pointSize:1,...(saved.__drawer_cabinet||{})});styles.set("__drawer_box",{color:"#0f766e",width:.5,pointSize:1,...(saved.__drawer_box||{})});styles.set("__drawer_handle",{color:"#111827",width:.5,pointSize:1,...(saved.__drawer_handle||{})});const root=document.getElementById("drawerControls");if(!root)return;if(!drawerRef){root.hidden=true;return}root.innerHTML="<h2>Drawer reference</h2>";const visible=document.createElement("label");visible.className="dot-toggle";visible.innerHTML="<input type='checkbox'> Show drawer";visible.querySelector("input").checked=drawDrawer;visible.querySelector("input").onchange=e=>{drawDrawer=e.target.checked;maybeDraw()};root.appendChild(visible);for(const key of [["__drawer_cabinet","Cabinet"],["__drawer_box","Drawer"],["__drawer_handle","Handle"]]){const st=styles.get(key[0]);root.appendChild(colorRow(st.color,v=>st.color=v));root.lastChild.firstChild.textContent=key[1];root.appendChild(styleRow("Line",st.width,.1,12,.1,v=>st.width=v))}const defs=drawerRef.absolute?[["x","X",-0.35,0.35,drawerOffset[0]],["y","Y",-0.35,0.35,drawerOffset[1]],["z","Z",-0.25,0.25,drawerOffset[2]]]:[["open","Open",-0.05,0.55,drawerOpen],["x","X",-0.35,0.35,drawerOffset[0]],["y","Y",-0.35,0.35,drawerOffset[1]],["z","Z",-0.25,0.25,drawerOffset[2]]];for(const d of defs){const row=document.createElement("label");row.className="drawer-control";const name=document.createElement("span");name.textContent=d[1];const slider=document.createElement("input");slider.type="range";slider.min=d[2];slider.max=d[3];slider.step=.005;slider.value=d[4];const val=document.createElement("span");val.textContent=(+slider.value).toFixed(3);slider.oninput=()=>{const v=+slider.value;val.textContent=v.toFixed(3);if(d[0]==="open")drawerOpen=v;else drawerOffset[{x:0,y:1,z:2}[d[0]]]=v;maybeDraw()};row.append(name,slider,val);root.appendChild(row)}}
-function setPanelHidden(hidden){panelHidden=!!hidden;document.getElementById("panel").hidden=panelHidden;document.getElementById("showPanel").hidden=!panelHidden;saveSettings()}
-function setup(){document.getElementById("title").textContent=DATA.title||"SafeChunk 3D trajectories";const dots=document.getElementById("dots");dots.checked=showDots;dots.onchange=e=>{showDots=e.target.checked;maybeDraw()};const mode=document.getElementById("dragMode");mode.value=dragMode;mode.onchange=e=>{dragMode=e.target.value;saveSettings()};document.getElementById("pauseRedraw").onchange=e=>{pauseRedraw=e.target.checked;if(!pauseRedraw)draw()};document.getElementById("clearSettings").onclick=()=>{localStorage.removeItem(STORE_KEY);location.reload()};setupFrameDiagnostics();setupDrawerControls();setupLayerControls();setPanelHidden(panelHidden);document.getElementById("hidePanel").onclick=()=>setPanelHidden(true);document.getElementById("showPanel").onclick=()=>setPanelHidden(false)}
-canvas.onmousedown=e=>{drag=true;pan=dragMode==="pan"||e.shiftKey||e.button===2;lx=e.clientX;ly=e.clientY};canvas.oncontextmenu=e=>e.preventDefault();window.onmouseup=()=>drag=false;window.onmousemove=e=>{if(!drag)return;const dx=e.clientX-lx,dy=e.clientY-ly;lx=e.clientX;ly=e.clientY;if(pan){const c=cam(),f=dist/Math.max(300,Math.min(canvas.width,canvas.height));target=add(target,add(mul(c.r,-dx*f),mul(c.u,dy*f)))}else{yaw+=dx*.006;pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*.006))}draw()};window.onkeydown=e=>{if(["INPUT","SELECT","TEXTAREA"].includes(document.activeElement&&document.activeElement.tagName))return;const c=cam(),step=dist*.045;let used=true;if(e.key==="ArrowLeft")target=add(target,mul(c.r,-step));else if(e.key==="ArrowRight")target=add(target,mul(c.r,step));else if(e.key==="ArrowUp")target=add(target,mul(c.u,step));else if(e.key==="ArrowDown")target=add(target,mul(c.u,-step));else if(e.key==="a"||e.key==="A")yaw-=.08;else if(e.key==="d"||e.key==="D")yaw+=.08;else if(e.key==="w"||e.key==="W")pitch=Math.max(-1.45,Math.min(1.45,pitch+.08));else if(e.key==="s"||e.key==="S")pitch=Math.max(-1.45,Math.min(1.45,pitch-.08));else used=false;if(used){e.preventDefault();draw()}};canvas.onwheel=e=>{e.preventDefault();dist=Math.max(.03,dist*Math.exp(e.deltaY*.001));draw()};window.onresize=()=>{if(!pauseRedraw)draw()};document.getElementById("reset").onclick=reset;document.getElementById("shot").onclick=()=>{const a=document.createElement("a");a.download=(DATA.title||"safechunk_trajectory").replace(/[^a-z0-9]+/gi,"_").toLowerCase()+".png";a.href=canvas.toDataURL("image/png");a.click()};setup();reset();
-</script>
-</body>
-</html>"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(template.replace("__DATA__", payload_json))
-    return str(path)
-
-def _save_chunk_trajectory_viewer(path: Path, title: str, trace_records: list[dict], human_samples: list[dict], executed_samples: list[dict], max_events: int):
-    return _save_chunk_trajectory_canvas_viewer(
-        path,
-        title,
-        trace_records,
-        human_samples,
-        executed_samples,
-        max_events,
-    )
-
-    try:
-        import plotly.graph_objects as go
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "Could not import plotly for interactive trajectory viewer; "
-            "writing canvas fallback: %s",
-            exc,
-        )
-        return _save_chunk_trajectory_canvas_viewer(
-            path,
-            title,
-            trace_records,
-            human_samples,
-            executed_samples,
-            max_events,
-        )
-
-    layers = _chunk_trajectory_viewer_layers(
-        trace_records,
-        human_samples,
-        executed_samples,
-        max_events,
-    )
-    if not any(segment.get("points") for layer in layers for segment in layer.get("segments", [])):
-        return None
-
-    fig = go.Figure()
-    for layer in layers:
-        _add_plotly_segments(
-            fig,
-            go,
-            layer.get("segments", []),
-            name=layer.get("name", "trajectory"),
-            color=layer.get("color", "#111827"),
-            width=int(layer.get("width", 3)),
-            dash=layer.get("dash"),
-            line=bool(layer.get("line", True)),
-            markers=bool(layer.get("markers", True)),
-        )
-
-    fig.update_layout(
-        title=title,
-        scene={"xaxis_title": "x world", "yaxis_title": "y world", "zaxis_title": "z world", "aspectmode": "data"},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "groupclick": "togglegroup"},
-        margin={"l": 0, "r": 0, "t": 70, "b": 0},
-        template="plotly_white",
-    )
-    config = {"displaylogo": False, "toImageButtonOptions": {"format": "png", "filename": Path(path).stem, "height": 1000, "width": 1400, "scale": 2}}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.write_html(path, include_plotlyjs=True, full_html=True, config=config)
-    return str(path)
-
-def _horizon_risk_gap(current_h, horizon_min_clearance, eps: float = 1e-9):
-    if current_h is None or horizon_min_clearance is None:
-        return None, None, None
-    current = float(current_h)
-    horizon = float(horizon_min_clearance)
-    if not np.isfinite(current) or not np.isfinite(horizon):
-        return None, None, None
-    clearance_drop = current - horizon
-    risk_gap = max(0.0, clearance_drop)
-    return float(risk_gap), bool(risk_gap > eps), float(clearance_drop)
-
-
-def _chunk_horizon_h_monitor_fallback(safety_info: dict, violation_threshold: float):
-    """Map chunk/PACS horizon clearance onto the legacy h-monitor fields."""
-    min_clearance = _safe_info_get(safety_info, "min_clearance")
-    if min_clearance is None:
-        return None, None, None
-    try:
-        min_h = float(min_clearance)
-    except (TypeError, ValueError):
-        return None, None, None
-    if not np.isfinite(min_h):
-        return None, None, None
-
-    h_values = None
-    min_clearances = _safe_info_get(safety_info, "min_clearances")
-    if min_clearances is not None:
-        try:
-            values = np.asarray(min_clearances, dtype=np.float32).reshape(-1)
-            values = values[np.isfinite(values)]
-            if values.size:
-                h_values = values.astype(float).tolist()
-        except Exception:  # noqa: BLE001
-            h_values = None
-    if h_values is None:
-        h_values = [min_h]
-
-    threshold = float(violation_threshold)
-    unsafe_count = _safe_info_get(safety_info, "unsafe_count")
-    try:
-        unsafe_count = int(unsafe_count) if unsafe_count is not None else None
-    except (TypeError, ValueError):
-        unsafe_count = None
-    first_violation = _safe_info_get(safety_info, "first_violation")
-    try:
-        first_violation = int(first_violation) if first_violation is not None else None
-    except (TypeError, ValueError):
-        first_violation = None
-
-    h_violation = bool(
-        (unsafe_count is not None and unsafe_count > 0)
-        or (first_violation is not None and first_violation >= 0)
-        or min_h < threshold
-    )
-    return min_h, h_values, h_violation
-
-
-def _metric_safety_violation(metric: StepMetrics) -> bool:
-    if metric.h_violation is not None:
-        return bool(metric.h_violation)
-    return False
-
-
-def _metric_is_brake_step(metric: StepMetrics) -> bool:
-    mode = metric.safety_mode
-    source = metric.deformation_source
-    if mode in {
-        "horizon_brake",
-        "verified_failsafe",
-        "unverified_emergency_failsafe",
-        "pause_on_unsafe",
-        "pause_and_restart",
-        "stop",
-    }:
-        return True
-    if source == "horizon_brake" and mode != "horizon_brake_intended_step":
-        return True
-    if source == "path_consistent_brake" and mode != "path_consistent_brake_intended_step":
-        return True
-    return metric.pause_reason is not None
-
-
-def _metric_is_deformation_step(metric: StepMetrics) -> bool:
-    mode = metric.safety_mode
-    source = metric.deformation_source
-    if mode in {"horizon_deform", "chunk_deform", "emergency_deform_away"}:
-        return True
-    return source == "chunk_deform"
-
-
-def _resume_latency_after_human_exit(metrics: list[StepMetrics], default_dt: float = 0.05):
-    if not metrics:
-        return None
-    phases = [m.human_phase for m in metrics]
-    if "done" not in phases or not any(phase in {"enter", "hold", "exit"} for phase in phases):
-        return None
-
-    first_done = next(i for i, phase in enumerate(phases) if phase == "done")
-    for resume_idx in range(first_done, len(metrics)):
-        if not _metric_is_brake_step(metrics[resume_idx]) and not _metric_is_deformation_step(metrics[resume_idx]):
-            return float((resume_idx - first_done) * default_dt)
-    return None
-
-def summarise_chunk_episode(metrics: list[StepMetrics], diagnostics_cfg: Optional[dict[str, float]] = None) -> dict:
-    summary = summarise_episode(metrics)
-    if len(metrics) == 0:
-        return summary
-
-    diagnostics_cfg = dict(diagnostics_cfg or {})
-    large_arm_delta_threshold = float(diagnostics_cfg.get("large_arm_delta_threshold", 3.0))
-    large_base_delta_threshold = float(diagnostics_cfg.get("large_base_delta_threshold", 0.5))
-    low_act_ratio_threshold = float(diagnostics_cfg.get("low_act_ratio_threshold", 0.3))
-    high_fallback_ratio_threshold = float(diagnostics_cfg.get("high_fallback_ratio_threshold", 0.5))
-    success_threshold = float(diagnostics_cfg.get("success_threshold", 0.9))
-
-    chunk_arm_delta = np.asarray([m.chunk_arm_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_non_arm_delta = np.asarray([m.chunk_non_arm_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_full_delta = np.asarray([m.chunk_full_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_interventions = np.asarray([m.intervention_active for m in metrics], dtype=np.float32)
-    chunk_modified_fraction = np.asarray([m.chunk_modified_fraction or 0.0 for m in metrics], dtype=np.float32)
-    chunk_modified_steps = np.asarray([m.chunk_modified_steps or 0 for m in metrics], dtype=np.float32)
-    chunk_mean_step_arm_delta = np.asarray([m.chunk_mean_step_arm_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_max_step_arm_delta = np.asarray([m.chunk_max_step_arm_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_future_edit_fraction = np.asarray([m.chunk_future_edit_fraction or 0.0 for m in metrics], dtype=np.float32)
-    chunk_first_edit_fraction = np.asarray([m.chunk_first_edit_fraction or 0.0 for m in metrics], dtype=np.float32)
-    chunk_safe_arm_variation = np.asarray([m.chunk_safe_arm_variation or 0.0 for m in metrics], dtype=np.float32)
-    chunk_nominal_arm_variation = np.asarray([m.chunk_nominal_arm_variation or 0.0 for m in metrics], dtype=np.float32)
-    chunk_arm_variation_delta = np.asarray([m.chunk_arm_variation_delta or 0.0 for m in metrics], dtype=np.float32)
-    chunk_edit_variation = np.asarray([m.chunk_edit_variation or 0.0 for m in metrics], dtype=np.float32)
-    path_mean_deviation = np.asarray([m.path_mean_deviation for m in metrics if m.path_mean_deviation is not None], dtype=np.float32)
-    path_max_deviation = np.asarray([m.path_max_deviation for m in metrics if m.path_max_deviation is not None], dtype=np.float32)
-    path_final_deviation = np.asarray([m.path_final_deviation for m in metrics if m.path_final_deviation is not None], dtype=np.float32)
-    chunk_preemptive_interventions = np.asarray([bool(m.chunk_preemptive_intervention) for m in metrics], dtype=np.float32)
-    horizon_risk_gaps = [m.horizon_risk_gap for m in metrics if m.horizon_risk_gap is not None]
-    horizon_clearance_drops = [m.horizon_clearance_drop for m in metrics if m.horizon_clearance_drop is not None]
-    horizon_risk_gap_active = [m.horizon_risk_gap_active for m in metrics if m.horizon_risk_gap_active is not None]
-    horizon_only_risk = [
-        bool(m.horizon_risk_gap_active) and not bool(m.h_violation)
-        for m in metrics
-        if m.horizon_risk_gap_active is not None and m.h_violation is not None
-    ]
-    first_modified_steps = [m.chunk_first_modified_step for m in metrics if m.chunk_first_modified_step is not None]
-    deform_norms = [m.deformation_norm for m in metrics if m.deformation_norm is not None]
-    deform_safe = [m.deform_safe for m in metrics if m.deform_safe is not None]
-    optimized_records = [m for m in metrics if m.optimized_accepted is not None]
-    optimized_attempts = [m.optimized_accepted for m in optimized_records]
-    optimized_safe = [bool(m.deform_safe) for m in optimized_records]
-    recoverable_checks = [
-        bool(m.is_recoverable) for m in optimized_records if m.is_recoverable is not None
-    ]
-    fallback_steps = [m.fallback_used for m in metrics if m.fallback_used is not None]
-    rejection_causes = [m.rejection_cause for m in optimized_records]
-    deform_stage_checks = [m.deform_stage_accepted for m in metrics if m.deform_stage_accepted is not None]
-    recover_checks = [m.recover_accepted for m in metrics if m.recover_accepted is not None]
-    recover_reject_reasons = [
-        m.recover_reject_reason
-        for m in metrics
-        if m.recover_reject_reason is not None
-    ]
-
-    def _count_strings(values):
-        items = [str(value) for value in values if value is not None]
-        return {item: items.count(item) for item in sorted(set(items))}
-    direct_rejoin_attempted_steps = int(
-        np.sum([bool(m.direct_rejoin_attempted) for m in metrics])
-    )
-    direct_rejoin_rejected_steps = int(
-        np.sum([bool(m.direct_rejoin_rejected) for m in metrics])
-    )
-    detour_rejoin_attempted_steps = int(
-        np.sum([bool(m.detour_rejoin_attempted) for m in metrics])
-    )
-    detour_rejoin_accepted_steps = int(
-        np.sum([bool(m.detour_rejoin_accepted) for m in metrics])
-    )
-    delayed_rejoin_active_steps = int(
-        np.sum([bool(m.delayed_rejoin_active) for m in metrics])
-    )
-    repeated_unsafe_target_steps = int(
-        np.sum([bool(m.repeated_unsafe_target) for m in metrics])
-    )
-    post_recovery_act_window_steps = int(
-        np.sum([bool(m.post_recovery_act_window_active) for m in metrics])
-    )
-    post_recovery_act_window_interrupted_steps = int(
-        np.sum([bool(m.post_recovery_act_window_interrupted) for m in metrics])
-    )
-    cached_motion = [m.cached_motion_active for m in metrics if m.cached_motion_active is not None]
-    resumed_indices = [
-        m.resumed_from_cached_index
-        for m in metrics
-        if m.resumed_from_cached_index is not None
-    ]
-
-    def finite_metric(name):
-        vals = [getattr(m, name) for m in metrics if getattr(m, name) is not None]
-        vals = [float(v) for v in vals if np.isfinite(float(v))]
-        return np.asarray(vals, dtype=np.float32)
-
-    q_rejoin_dist = finite_metric("q_rejoin_dist")
-    qd_rejoin_dist = finite_metric("qd_rejoin_dist")
-    ee_rejoin_dist = finite_metric("ee_rejoin_dist")
-    rejoin_q_eval_time_ms = finite_metric("rejoin_q_eval_time_ms")
-    rejoin_qd_eval_time_ms = finite_metric("rejoin_qd_eval_time_ms")
-    ee_nom_cache_time_ms = finite_metric("ee_nom_cache_time_ms")
-    ee_final_check_time_ms = finite_metric("ee_final_check_time_ms")
-    deform_stage_min_clearance = finite_metric("deform_stage_min_clearance")
-    recover_min_clearance = finite_metric("recover_min_clearance")
-    recover_rejoin_loss = finite_metric("recover_rejoin_loss")
-    recover_path_min_clearance = finite_metric("recover_path_min_clearance")
-    recover_immediate_clearance = finite_metric("recover_immediate_clearance")
-    recover_prefix_min_clearance = finite_metric("recover_prefix_min_clearance")
-    committed_clearance_prediction_error = finite_metric("clearance_prediction_error")
-    committed_planned_vs_actual_q_error = finite_metric("planned_vs_actual_q_error")
-    committed_human_motion_since_plan = finite_metric("human_motion_since_plan")
-    committed_accepted_clearance_margin = finite_metric("accepted_clearance_margin")
-    committed_state_error = finite_metric("committed_state_error")
-    planning_vs_replay_clearance_post_error = finite_metric(
-        "planning_vs_replay_clearance_post_error"
-    )
-    planning_vs_replay_human_error = finite_metric("planning_vs_replay_human_error")
-    actual_vs_planned_post_q_error = finite_metric("actual_vs_planned_post_q_error")
-    recover_projection_on_nominal = finite_metric("recover_projection_on_nominal")
-    recover_cosine_to_nominal = finite_metric("recover_cosine_to_nominal")
-    recover_direction_cosine = finite_metric("recover_direction_cosine")
-    recover_direction_loss = finite_metric("recover_direction_loss")
-    recover_ordered_pose_loss = finite_metric("recover_ordered_pose_loss")
-    recover_ordered_delta_loss = finite_metric("recover_ordered_delta_loss")
-    recover_ordered_loss = finite_metric("recover_ordered_loss")
-    recover_task_progress_score = finite_metric("recover_task_progress_score")
-    cem_iterations_run = finite_metric("cem_iterations_run")
-    yield_cem_iterations_run = finite_metric("yield_cem_iterations_run")
-    return_cem_iterations_run = finite_metric("return_cem_iterations_run")
-    hold_horizon_min_clearance = finite_metric("hold_horizon_min_clearance")
-    pacs_background_min_clearance = finite_metric("pacs_background_min_clearance")
-    pacs_background_arm_delta = finite_metric("pacs_background_arm_delta")
-    pacs_background_chunk_arm_delta = finite_metric("pacs_background_chunk_arm_delta")
-    pacs_background_chunk_modified_fraction = finite_metric("pacs_background_chunk_modified_fraction")
-    pacs_background_retiming_arm_delta = finite_metric("pacs_background_retiming_arm_delta")
-    pacs_background_retiming_chunk_arm_delta = finite_metric("pacs_background_retiming_chunk_arm_delta")
-    pacs_background_retiming_changed_fraction = finite_metric("pacs_background_retiming_changed_fraction")
-    retiming_norm = finite_metric("retiming_norm")
-    task_progress = finite_metric("task_progress")
-    task_progress_delta = finite_metric("task_progress_delta")
-    total_steps = len(metrics)
-    act_step_flags = np.asarray([bool(m.act_step) for m in metrics], dtype=np.bool_)
-    deform_step_flags = np.asarray([bool(m.deform_step) for m in metrics], dtype=np.bool_)
-    recover_step_flags = np.asarray([bool(m.recover_step) for m in metrics], dtype=np.bool_)
-    brake_step_flags = np.asarray([bool(m.brake_step) for m in metrics], dtype=np.bool_)
-    fallback_step_flags = np.asarray([bool(m.fallback_step) for m in metrics], dtype=np.bool_)
-    optimized_attempt_step_flags = np.asarray([bool(m.optimized_attempt_step) for m in metrics], dtype=np.bool_)
-    optimized_accepted_step_flags = np.asarray([bool(m.optimized_accepted_step) for m in metrics], dtype=np.bool_)
-    temporary_wait_steps = int(np.sum([bool(m.temporary_wait_step) for m in metrics]))
-    resume_after_wait_count = int(np.sum([bool(m.resume_act_after_wait) for m in metrics]))
-    deform_after_persistent_block_count = int(np.sum([bool(m.deform_after_persistent_block) for m in metrics]))
-    deform_suppressed_by_temporary_wait_count = int(
-        np.sum([bool(m.deform_suppressed_by_temporary_wait) for m in metrics])
-    )
-    recovery_optimization_skipped_steps = int(
-        np.sum([bool(m.recovery_optimization_skipped) for m in metrics])
-    )
-    recovery_failure_streak_vals = [
-        int(m.recovery_failure_streak_max)
-        for m in metrics
-        if m.recovery_failure_streak_max is not None
-    ]
-    recovery_failure_streak_max = (
-        int(np.max(recovery_failure_streak_vals))
-        if recovery_failure_streak_vals
-        else 0
-    )
-
-    def max_int_metric(name):
-        vals = [
-            int(getattr(m, name))
-            for m in metrics
-            if getattr(m, name) is not None
-        ]
-        return int(np.max(vals)) if vals else 0
-
-    deform_replan_count = max_int_metric("deform_replan_count")
-    recover_replan_count = max_int_metric("recover_replan_count")
-    recovery_replan_count = max_int_metric("recovery_replan_count")
-    recovery_optimization_skipped_count = max_int_metric(
-        "recovery_optimization_skipped_count"
-    )
-    stale_recovery_suppressed_count = max_int_metric("stale_recovery_suppressed_count")
-    recovery_target_infeasible_count = max_int_metric("recovery_target_infeasible_count")
-    emergency_brake_steps = max_int_metric("emergency_brake_steps")
-    optimized_candidate_count = max_int_metric("optimized_candidate_count")
-    optimized_solution_count = max_int_metric("optimized_solution_count")
-    fallback_candidate_count = max_int_metric("fallback_candidate_count")
-    fallback_candidate_accepted_count = max_int_metric("fallback_candidate_accepted_count")
-    optimized_rejected_count = max_int_metric("optimized_rejected_count")
-    deform_candidate_count = max_int_metric("deform_candidate_count")
-    deform_accepted_count = max_int_metric("deform_accepted_count")
-    deform_rejected_count = max_int_metric("deform_rejected_count")
-    recover_candidate_count = max_int_metric("recover_candidate_count")
-    recover_accepted_count = max_int_metric("recover_accepted_count")
-    recover_rejected_count = max_int_metric("recover_rejected_count")
-    safe_corridor_recovery_count = max_int_metric("safe_corridor_recovery_count")
-    direct_rejoin_attempt_count = max_int_metric("direct_rejoin_attempt_count")
-    direct_rejoin_reject_count = max_int_metric("direct_rejoin_reject_count")
-    detour_rejoin_attempt_count = max_int_metric("detour_rejoin_attempt_count")
-    detour_rejoin_accept_count = max_int_metric("detour_rejoin_accept_count")
-    delayed_rejoin_count = max_int_metric("delayed_rejoin_count")
-    recover_path_unsafe_count = max_int_metric("recover_path_unsafe_count")
-    recovery_path_failure_streak_max = max_int_metric("recovery_path_failure_streak_max")
-    repeated_unsafe_target_count = max_int_metric("repeated_unsafe_target_count")
-    post_recovery_act_window_count = max_int_metric("post_recovery_act_window_count")
-    post_recovery_act_window_interrupted_count = max_int_metric("post_recovery_act_window_interrupted_count")
-    safe_prefix_accepted_count = max_int_metric("safe_prefix_accepted_count")
-    first_action_only_accepted_count = max_int_metric("first_action_only_accepted_count")
-    immediate_hard_reject_count = max_int_metric("immediate_hard_reject_count")
-    no_safe_prefix_reject_count = max_int_metric("no_safe_prefix_reject_count")
-    horizon_margin_reject_count = max_int_metric("horizon_margin_reject_count")
-    accepted_deform_steps = max_int_metric("accepted_deform_steps")
-    accepted_recover_steps = max_int_metric("accepted_recover_steps")
-    fallback_brake_after_reject_count = max_int_metric("fallback_brake_after_reject_count")
-    nominal_rejoin_available_count = max_int_metric("nominal_rejoin_available_count")
-    nominal_rejoin_suppressed_count = max_int_metric("nominal_rejoin_suppressed_count")
-    stale_nominal_rejoin_suppressed_count = max_int_metric("stale_nominal_rejoin_suppressed_count")
-    nominal_prefix_unsafe_suppressed_count = max_int_metric("nominal_prefix_unsafe_suppressed_count")
-    recover_positive_projection_count = max_int_metric("recover_positive_projection_count")
-    recover_nonpositive_projection_count = max_int_metric("recover_nonpositive_projection_count")
-    emergency_deform_away_steps = max_int_metric("emergency_deform_away_steps")
-    emergency_deform_away_count = max_int_metric("emergency_deform_away_count")
-    hold_unsafe_count = max_int_metric("hold_unsafe_count")
-    hold_predicted_contact_count = max_int_metric("hold_predicted_contact_count")
-    contact_during_hold_count = max_int_metric("contact_during_hold_count")
-    contact_during_brake_count = max_int_metric("contact_during_brake_count")
-    contact_during_deform_count = max_int_metric("contact_during_deform_count")
-    contact_during_recover_count = max_int_metric("contact_during_recover_count")
-
-    def mean_progress_for(flag_name):
-        vals = [
-            m.task_progress_delta
-            for m in metrics
-            if bool(getattr(m, flag_name))
-            and m.task_progress_delta is not None
-            and np.isfinite(float(m.task_progress_delta))
-        ]
-        return float(np.mean(vals)) if vals else None
-
-    act_steps = int(np.sum(act_step_flags))
-    deform_steps = int(np.sum(deform_step_flags))
-    recover_steps = int(np.sum(recover_step_flags))
-    brake_step_count = int(np.sum(brake_step_flags))
-    fallback_step_count = int(np.sum(fallback_step_flags))
-    pacs_background_check_only_steps = int(
-        np.sum([bool(m.pacs_background_check_only) for m in metrics])
-    )
-    pacs_background_brake_steps = int(
-        np.sum([bool(m.pacs_background_brake_step) for m in metrics])
-    )
-    pacs_background_act_steps = int(
-        np.sum([bool(m.pacs_background_act_step) for m in metrics])
-    )
-    optimized_attempt_steps = int(np.sum(optimized_attempt_step_flags))
-    optimized_accepted_steps = int(np.sum(optimized_accepted_step_flags))
-    committed_chunk_started_count = int(
-        np.sum([bool(m.committed_chunk_started) for m in metrics])
-    )
-    committed_chunk_completed_count = int(
-        np.sum([bool(m.committed_chunk_completed) for m in metrics])
-    )
-    committed_state_mismatch_abort_count = int(
-        np.sum([bool(m.committed_aborted_due_to_state_mismatch) for m in metrics])
-    )
-    committed_state_mismatch_recovered_count = int(
-        np.sum([bool(m.committed_state_mismatch_recovered) for m in metrics])
-    )
-    committed_suffix_replan_attempt_count = int(
-        np.sum([bool(m.committed_suffix_replan_attempted) for m in metrics])
-    )
-    committed_suffix_replan_accepted_count = int(
-        np.sum([bool(m.committed_suffix_replan_accepted) for m in metrics])
-    )
-    committed_suffix_replan_rejected_count = int(
-        np.sum([bool(m.committed_suffix_replan_rejected) for m in metrics])
-    )
-    committed_suffix_replan_reject_reason_counts = _count_strings(
-        [m.committed_suffix_replan_reject_reason for m in metrics]
-    )
-    committed_opportunistic_resume_count = int(
-        np.sum([bool(m.committed_opportunistic_resume) for m in metrics])
-    )
-    committed_released_for_act_resume_count = int(
-        np.sum([bool(m.committed_released_for_act_resume) for m in metrics])
-    )
-    committed_recovery_budget_exit_count = int(
-        np.sum([bool(m.committed_recovery_budget_exit) for m in metrics])
-    )
-    committed_replan_due_to_recovery_budget_count = int(
-        np.sum([bool(m.committed_replan_due_to_recovery_budget) for m in metrics])
-    )
-    committed_chunk_abort_count = int(
-        np.sum(
-            [
-                bool(m.committed_aborted_due_to_safety)
-                or bool(m.committed_aborted_due_to_state_mismatch)
-                for m in metrics
-            ]
-        )
-    )
-    committed_repaired_step_count = int(
-        np.sum([bool(m.committed_repaired_step) for m in metrics])
-    )
-    committed_abort_due_to_human_motion_count = int(
-        np.sum([bool(m.committed_abort_due_to_human_motion) for m in metrics])
-    )
-    committed_abort_due_to_prediction_error_count = int(
-        np.sum([bool(m.committed_abort_due_to_prediction_error) for m in metrics])
-    )
-    committed_abort_due_to_safety_semantics_mismatch_count = int(
-        np.sum(
-            [
-                bool(m.committed_abort_due_to_safety_semantics_mismatch)
-                for m in metrics
-            ]
-        )
-    )
-    committed_deform_steps_executed = int(
-        np.sum([m.deform_steps_executed or 0 for m in metrics])
-    )
-    committed_recover_steps_executed = int(
-        np.sum([m.recover_steps_executed or 0 for m in metrics])
-    )
-    resume_from_committed_rejoin_count = int(
-        np.sum([bool(m.resume_from_committed_rejoin) for m in metrics])
-    )
-    recovery_action_history_reset_count = int(
-        np.sum([bool(m.recovery_action_history_reset) for m in metrics])
-    )
-    contact_during_hold_count = int(np.sum([bool(m.contact_during_hold) for m in metrics]))
-    contact_during_brake_count = int(np.sum([bool(m.contact_during_brake) for m in metrics]))
-    contact_during_deform_count = int(np.sum([bool(m.contact_during_deform) for m in metrics]))
-    contact_during_recover_count = int(np.sum([bool(m.contact_during_recover) for m in metrics]))
-    act_ratio = float(act_steps / total_steps) if total_steps else None
-    safety_mode_ratio = (
-        float((deform_steps + recover_steps + brake_step_count + fallback_step_count) / total_steps)
-        if total_steps
-        else None
-    )
-    fallback_ratio = float(fallback_step_count / total_steps) if total_steps else None
-    final_task_progress = float(task_progress[-1]) if task_progress.size else None
-    max_task_progress = float(np.max(task_progress)) if task_progress.size else None
-    mean_chunk_arm_delta_for_failure = float(np.mean(chunk_arm_delta)) if chunk_arm_delta.size else 0.0
-    accepted_recover_chunks_not_executed = bool(
-        recover_checks and np.sum(recover_checks) > 0 and recover_steps == 0
-    )
-    diagnostic_warning = (
-        "accepted_recover_chunks_not_executed"
-        if accepted_recover_chunks_not_executed
-        else None
-    )
-
-    if act_ratio is not None and act_ratio < low_act_ratio_threshold:
-        likely_failure_cause = "low_act_utilization"
-    elif (
-        max_task_progress is not None
-        and final_task_progress is not None
-        and max_task_progress > success_threshold * 0.7
-        and final_task_progress < max_task_progress * 0.5
-    ):
-        likely_failure_cause = "progress_lost_after_intervention"
-    elif mean_chunk_arm_delta_for_failure > large_arm_delta_threshold:
-        likely_failure_cause = (
-            "large_retiming_delta_ood"
-            if metrics[0].condition == "path_consistent_brake"
-            else "large_deformation_ood"
-        )
-    elif fallback_ratio is not None and fallback_ratio > high_fallback_ratio_threshold:
-        likely_failure_cause = "fallback_braking_timeout"
-    else:
-        likely_failure_cause = "unknown"
-
-    modes = [m.safety_mode for m in metrics]
-    pacs_background_modes = [m.pacs_background_safety_mode for m in metrics]
-    pause_reasons = [m.pause_reason for m in metrics]
-    sources = [m.deformation_source for m in metrics]
-    robot_human_distances = [m.min_robot_human_distance for m in metrics if m.min_robot_human_distance is not None]
-    drawer_open_distances = [m.drawer_open_distance for m in metrics if m.drawer_open_distance is not None]
-    safety_violations = [_metric_safety_violation(m) for m in metrics]
-    brake_steps = [_metric_is_brake_step(m) for m in metrics]
-    deformation_steps = [_metric_is_deformation_step(m) for m in metrics]
-    phase_reanchor_steps = [m.safety_mode == "phase_reanchor" for m in metrics]
-    gripper_latched_steps = int(np.sum([bool(m.gripper_latched) for m in metrics]))
-    post_recovery_task_guard_steps = int(
-        np.sum([bool(m.post_recovery_task_guard_active) for m in metrics])
-    )
-    post_recovery_reanchor_started_count = int(
-        np.sum([bool(m.post_recovery_reanchor_started) for m in metrics])
-    )
-    post_recovery_progress_regression_count = int(
-        np.sum(
-            [
-                (m.post_recovery_progress_regression or 0.0) > 0.0
-                for m in metrics
-            ]
-        )
-    )
-
-    def rate(values, target):
-        return float(np.mean([v == target for v in values])) if values else None
-
-    env_step_time_ms = np.asarray([m.env_step_time_ms for m in metrics], dtype=np.float32)
-    policy_obs_adapt_time_ms = np.asarray([m.policy_obs_adapt_time_ms for m in metrics], dtype=np.float32)
-    policy_action_time_ms = np.asarray([m.policy_action_time_ms for m in metrics], dtype=np.float32)
-    policy_obs_update_time_ms = np.asarray([m.policy_obs_update_time_ms for m in metrics], dtype=np.float32)
-    policy_total_time_ms = policy_obs_adapt_time_ms + policy_action_time_ms + policy_obs_update_time_ms
-    step_wall_time_ms = np.asarray([1000.0 * m.step_wall_time_s for m in metrics], dtype=np.float32)
-    filter_time_ms = np.asarray([m.filter_time_ms for m in metrics], dtype=np.float32)
-    monitor_time_ms = np.asarray([m.monitor_time_ms for m in metrics], dtype=np.float32)
-    residual_time_ms = np.maximum(
-        0.0,
-        step_wall_time_ms
-        - filter_time_ms
-        - monitor_time_ms
-        - env_step_time_ms
-        - policy_total_time_ms,
-    )
-
-    summary.update(
-        {
-            "mean_env_step_time_ms": float(np.mean(env_step_time_ms)),
-            "p50_env_step_time_ms": float(np.percentile(env_step_time_ms, 50)),
-            "p95_env_step_time_ms": float(np.percentile(env_step_time_ms, 95)),
-            "max_env_step_time_ms": float(np.max(env_step_time_ms)),
-            "mean_policy_obs_adapt_time_ms": float(np.mean(policy_obs_adapt_time_ms)),
-            "p50_policy_obs_adapt_time_ms": float(np.percentile(policy_obs_adapt_time_ms, 50)),
-            "p95_policy_obs_adapt_time_ms": float(np.percentile(policy_obs_adapt_time_ms, 95)),
-            "max_policy_obs_adapt_time_ms": float(np.max(policy_obs_adapt_time_ms)),
-            "mean_policy_action_time_ms": float(np.mean(policy_action_time_ms)),
-            "p50_policy_action_time_ms": float(np.percentile(policy_action_time_ms, 50)),
-            "p95_policy_action_time_ms": float(np.percentile(policy_action_time_ms, 95)),
-            "max_policy_action_time_ms": float(np.max(policy_action_time_ms)),
-            "mean_policy_obs_update_time_ms": float(np.mean(policy_obs_update_time_ms)),
-            "p50_policy_obs_update_time_ms": float(np.percentile(policy_obs_update_time_ms, 50)),
-            "p95_policy_obs_update_time_ms": float(np.percentile(policy_obs_update_time_ms, 95)),
-            "max_policy_obs_update_time_ms": float(np.max(policy_obs_update_time_ms)),
-            "mean_policy_total_time_ms": float(np.mean(policy_total_time_ms)),
-            "p50_policy_total_time_ms": float(np.percentile(policy_total_time_ms, 50)),
-            "p95_policy_total_time_ms": float(np.percentile(policy_total_time_ms, 95)),
-            "max_policy_total_time_ms": float(np.max(policy_total_time_ms)),
-            "mean_latency_residual_ms": float(np.mean(residual_time_ms)),
-            "p50_latency_residual_ms": float(np.percentile(residual_time_ms, 50)),
-            "p95_latency_residual_ms": float(np.percentile(residual_time_ms, 95)),
-            "max_latency_residual_ms": float(np.max(residual_time_ms)),
-            "mean_chunk_arm_delta": float(np.mean(chunk_arm_delta)),
-            "max_chunk_arm_delta": float(np.max(chunk_arm_delta)),
-            "mean_chunk_non_arm_delta": float(np.mean(chunk_non_arm_delta)),
-            "max_chunk_non_arm_delta": float(np.max(chunk_non_arm_delta)),
-            "mean_chunk_full_delta": float(np.mean(chunk_full_delta)),
-            "max_chunk_full_delta": float(np.max(chunk_full_delta)),
-            "chunk_intervention_frequency": float(np.mean(chunk_interventions)),
-            "mean_chunk_modified_fraction": float(np.mean(chunk_modified_fraction)),
-            "mean_chunk_modified_steps": float(np.mean(chunk_modified_steps)),
-            "mean_chunk_first_modified_step": float(np.mean(first_modified_steps)) if first_modified_steps else None,
-            "mean_chunk_mean_step_arm_delta": float(np.mean(chunk_mean_step_arm_delta)),
-            "max_chunk_step_arm_delta": float(np.max(chunk_max_step_arm_delta)),
-            "mean_chunk_future_edit_fraction": float(np.mean(chunk_future_edit_fraction)),
-            "mean_chunk_first_edit_fraction": float(np.mean(chunk_first_edit_fraction)),
-            "mean_chunk_safe_arm_variation": float(np.mean(chunk_safe_arm_variation)),
-            "mean_chunk_nominal_arm_variation": float(np.mean(chunk_nominal_arm_variation)),
-            "mean_chunk_arm_variation_delta": float(np.mean(chunk_arm_variation_delta)),
-            "mean_chunk_edit_variation": float(np.mean(chunk_edit_variation)),
-            "mean_path_deviation": float(np.mean(path_mean_deviation)) if path_mean_deviation.size else None,
-            "max_path_deviation": float(np.max(path_max_deviation)) if path_max_deviation.size else None,
-            "mean_final_path_deviation": float(np.mean(path_final_deviation)) if path_final_deviation.size else None,
-            "chunk_preemptive_intervention_frequency": float(np.mean(chunk_preemptive_interventions)),
-            "mean_horizon_risk_gap": float(np.mean(horizon_risk_gaps)) if horizon_risk_gaps else None,
-            "max_horizon_risk_gap": float(np.max(horizon_risk_gaps)) if horizon_risk_gaps else None,
-            "mean_horizon_clearance_drop": float(np.mean(horizon_clearance_drops)) if horizon_clearance_drops else None,
-            "horizon_risk_gap_rate": float(np.mean(horizon_risk_gap_active)) if horizon_risk_gap_active else None,
-            "horizon_only_risk_rate": float(np.mean(horizon_only_risk)) if horizon_only_risk else None,
-            "mean_deformation_norm": float(np.mean(deform_norms)) if deform_norms else None,
-            "mean_retiming_norm": float(np.mean(retiming_norm)) if retiming_norm.size else None,
-            "deform_safe_rate": float(np.mean(deform_safe)) if deform_safe else None,
-            "optimized_attempts": int(len(optimized_records)),
-            "optimized_safe_count": int(np.sum(optimized_safe)) if optimized_records else 0,
-            "optimized_recoverable_count": int(np.sum(recoverable_checks)) if recoverable_checks else 0,
-            "optimized_accepted_count": int(np.sum(optimized_attempts)) if optimized_attempts else 0,
-            "rejected_unsafe_count": int(np.sum([c == "unsafe" for c in rejection_causes])),
-            "rejected_unrecoverable_count": int(np.sum([c == "unrecoverable" for c in rejection_causes])),
-            "rejected_both_count": int(np.sum([c == "unsafe_and_unrecoverable" for c in rejection_causes])),
-            "fallback_used_count": int(np.sum(fallback_steps)) if fallback_steps else 0,
-            "deform_stage_accepted_count": int(np.sum(deform_stage_checks)) if deform_stage_checks else 0,
-            "recover_accepted_count": int(np.sum(recover_checks)) if recover_checks else 0,
-            "cached_motion_active_count": int(np.sum(cached_motion)) if cached_motion else 0,
-            "resumed_from_cached_count": int(len(resumed_indices)),
-            "mean_deform_stage_min_clearance": float(np.mean(deform_stage_min_clearance)) if deform_stage_min_clearance.size else None,
-            "mean_recover_min_clearance": float(np.mean(recover_min_clearance)) if recover_min_clearance.size else None,
-            "mean_recover_rejoin_loss": float(np.mean(recover_rejoin_loss)) if recover_rejoin_loss.size else None,
-            "mean_recover_path_min_clearance": float(np.mean(recover_path_min_clearance)) if recover_path_min_clearance.size else None,
-            "min_recover_path_min_clearance": float(np.min(recover_path_min_clearance)) if recover_path_min_clearance.size else None,
-            "mean_recover_immediate_clearance": float(np.mean(recover_immediate_clearance)) if recover_immediate_clearance.size else None,
-            "mean_recover_prefix_min_clearance": float(np.mean(recover_prefix_min_clearance)) if recover_prefix_min_clearance.size else None,
-            "optimized_attempt_count": int(len(optimized_attempts)),
-            "optimized_accept_rate": float(np.mean(optimized_attempts)) if optimized_attempts else None,
-            "recoverable_rate": float(np.mean(recoverable_checks)) if recoverable_checks else None,
-            "fallback_used_rate": float(np.mean(fallback_steps)) if fallback_steps else None,
-            "mean_q_rejoin_dist": float(np.mean(q_rejoin_dist)) if q_rejoin_dist.size else None,
-            "max_q_rejoin_dist": float(np.max(q_rejoin_dist)) if q_rejoin_dist.size else None,
-            "mean_qd_rejoin_dist": float(np.mean(qd_rejoin_dist)) if qd_rejoin_dist.size else None,
-            "max_qd_rejoin_dist": float(np.max(qd_rejoin_dist)) if qd_rejoin_dist.size else None,
-            "mean_ee_rejoin_dist": float(np.mean(ee_rejoin_dist)) if ee_rejoin_dist.size else None,
-            "max_ee_rejoin_dist": float(np.max(ee_rejoin_dist)) if ee_rejoin_dist.size else None,
-            "mean_rejoin_q_eval_time_ms": float(np.mean(rejoin_q_eval_time_ms)) if rejoin_q_eval_time_ms.size else None,
-            "mean_rejoin_qd_eval_time_ms": float(np.mean(rejoin_qd_eval_time_ms)) if rejoin_qd_eval_time_ms.size else None,
-            "mean_ee_nom_cache_time_ms": float(np.mean(ee_nom_cache_time_ms)) if ee_nom_cache_time_ms.size else None,
-            "mean_ee_final_check_time_ms": float(np.mean(ee_final_check_time_ms)) if ee_final_check_time_ms.size else None,
-            "act_steps": act_steps,
-            "deform_steps": deform_steps,
-            "recover_steps": recover_steps,
-            "brake_steps": brake_step_count,
-            "fallback_steps": fallback_step_count,
-            "pacs_background_check_only_steps": pacs_background_check_only_steps,
-            "pacs_background_brake_steps": pacs_background_brake_steps,
-            "pacs_background_act_steps": pacs_background_act_steps,
-            "pacs_background_check_only_rate": (
-                float(pacs_background_check_only_steps / total_steps) if total_steps else None
-            ),
-            "pacs_background_brake_rate": (
-                float(pacs_background_brake_steps / total_steps) if total_steps else None
-            ),
-            "pacs_background_act_rate": (
-                float(pacs_background_act_steps / total_steps) if total_steps else None
-            ),
-            "mean_pacs_background_min_clearance": (
-                float(np.mean(pacs_background_min_clearance))
-                if pacs_background_min_clearance.size
-                else None
-            ),
-            "min_pacs_background_min_clearance": (
-                float(np.min(pacs_background_min_clearance))
-                if pacs_background_min_clearance.size
-                else None
-            ),
-            "mean_pacs_background_arm_delta": (
-                float(np.mean(pacs_background_arm_delta))
-                if pacs_background_arm_delta.size
-                else None
-            ),
-            "mean_pacs_background_chunk_arm_delta": (
-                float(np.mean(pacs_background_chunk_arm_delta))
-                if pacs_background_chunk_arm_delta.size
-                else None
-            ),
-            "mean_pacs_background_chunk_modified_fraction": (
-                float(np.mean(pacs_background_chunk_modified_fraction))
-                if pacs_background_chunk_modified_fraction.size
-                else None
-            ),
-            "mean_pacs_background_retiming_arm_delta": (
-                float(np.mean(pacs_background_retiming_arm_delta))
-                if pacs_background_retiming_arm_delta.size
-                else None
-            ),
-            "mean_pacs_background_retiming_chunk_arm_delta": (
-                float(np.mean(pacs_background_retiming_chunk_arm_delta))
-                if pacs_background_retiming_chunk_arm_delta.size
-                else None
-            ),
-            "mean_pacs_background_retiming_changed_fraction": (
-                float(np.mean(pacs_background_retiming_changed_fraction))
-                if pacs_background_retiming_changed_fraction.size
-                else None
-            ),
-            "pacs_background_path_consistent_brake_intended_rate": rate(
-                pacs_background_modes,
-                "path_consistent_brake_intended_step",
-            ),
-            "pacs_background_verified_failsafe_rate": rate(
-                pacs_background_modes,
-                "verified_failsafe",
-            ),
-            "pacs_background_unverified_emergency_failsafe_rate": rate(
-                pacs_background_modes,
-                "unverified_emergency_failsafe",
-            ),
-            "optimized_attempt_steps": optimized_attempt_steps,
-            "optimized_accepted_steps": optimized_accepted_steps,
-            "committed_chunk_started_count": committed_chunk_started_count,
-            "committed_chunk_completed_count": committed_chunk_completed_count,
-            "committed_chunk_abort_count": committed_chunk_abort_count,
-            "committed_repaired_step_count": committed_repaired_step_count,
-            "committed_abort_due_to_human_motion_count": committed_abort_due_to_human_motion_count,
-            "committed_abort_due_to_prediction_error_count": committed_abort_due_to_prediction_error_count,
-            "committed_abort_due_to_safety_semantics_mismatch_count": committed_abort_due_to_safety_semantics_mismatch_count,
-            "committed_state_mismatch_abort_count": committed_state_mismatch_abort_count,
-            "committed_state_mismatch_recovered_count": committed_state_mismatch_recovered_count,
-            "committed_suffix_replan_attempt_count": committed_suffix_replan_attempt_count,
-            "committed_suffix_replan_accepted_count": committed_suffix_replan_accepted_count,
-            "committed_suffix_replan_rejected_count": committed_suffix_replan_rejected_count,
-            "committed_suffix_replan_reject_reason_counts": committed_suffix_replan_reject_reason_counts,
-            "committed_opportunistic_resume_count": committed_opportunistic_resume_count,
-            "committed_released_for_act_resume_count": committed_released_for_act_resume_count,
-            "committed_recovery_budget_exit_count": committed_recovery_budget_exit_count,
-            "committed_replan_due_to_recovery_budget_count": committed_replan_due_to_recovery_budget_count,
-            "mean_planning_vs_replay_clearance_post_error": (
-                float(np.mean(planning_vs_replay_clearance_post_error))
-                if planning_vs_replay_clearance_post_error.size
-                else None
-            ),
-            "mean_planning_vs_replay_human_error": (
-                float(np.mean(planning_vs_replay_human_error))
-                if planning_vs_replay_human_error.size
-                else None
-            ),
-            "mean_actual_vs_planned_post_q_error": (
-                float(np.mean(actual_vs_planned_post_q_error))
-                if actual_vs_planned_post_q_error.size
-                else None
-            ),
-            "mean_committed_state_error": (
-                float(np.mean(committed_state_error))
-                if committed_state_error.size
-                else None
-            ),
-            "max_committed_state_error": (
-                float(np.max(committed_state_error))
-                if committed_state_error.size
-                else None
-            ),
-            "mean_committed_clearance_prediction_error": (
-                float(np.mean(committed_clearance_prediction_error))
-                if committed_clearance_prediction_error.size
-                else None
-            ),
-            "mean_committed_planned_vs_actual_q_error": (
-                float(np.mean(committed_planned_vs_actual_q_error))
-                if committed_planned_vs_actual_q_error.size
-                else None
-            ),
-            "mean_committed_human_motion_since_plan": (
-                float(np.mean(committed_human_motion_since_plan))
-                if committed_human_motion_since_plan.size
-                else None
-            ),
-            "mean_committed_accepted_clearance_margin": (
-                float(np.mean(committed_accepted_clearance_margin))
-                if committed_accepted_clearance_margin.size
-                else None
-            ),
-            "committed_deform_steps_executed": committed_deform_steps_executed,
-            "committed_recover_steps_executed": committed_recover_steps_executed,
-            "resume_from_committed_rejoin_count": resume_from_committed_rejoin_count,
-            "recovery_action_history_reset_count": recovery_action_history_reset_count,
-            "accepted_recover_chunks_not_executed": accepted_recover_chunks_not_executed,
-            "diagnostic_warning": diagnostic_warning,
-            "temporary_wait_steps": temporary_wait_steps,
-            "resume_after_wait_count": resume_after_wait_count,
-            "deform_after_persistent_block_count": deform_after_persistent_block_count,
-            "deform_suppressed_by_temporary_wait_count": deform_suppressed_by_temporary_wait_count,
-            "recovery_failure_streak_max": recovery_failure_streak_max,
-            "deform_replan_count": deform_replan_count,
-            "recover_replan_count": recover_replan_count,
-            "recovery_replan_count": recovery_replan_count,
-            "recovery_optimization_skipped_count": recovery_optimization_skipped_count,
-            "recovery_optimization_skipped_steps": recovery_optimization_skipped_steps,
-            "stale_recovery_suppressed_count": stale_recovery_suppressed_count,
-            "recovery_target_infeasible_count": recovery_target_infeasible_count,
-            "emergency_brake_steps": emergency_brake_steps,
-            "optimized_candidate_count": optimized_candidate_count,
-            "optimized_solution_count": optimized_solution_count,
-            "fallback_candidate_count": fallback_candidate_count,
-            "fallback_candidate_accepted_count": fallback_candidate_accepted_count,
-            "optimized_rejected_count": optimized_rejected_count,
-            "deform_candidate_count": deform_candidate_count,
-            "deform_accepted_count": deform_accepted_count,
-            "deform_rejected_count": deform_rejected_count,
-            "recover_candidate_count": recover_candidate_count,
-            "recover_accepted_count": recover_accepted_count,
-            "recover_rejected_count": recover_rejected_count,
-            "safe_corridor_recovery_count": safe_corridor_recovery_count,
-            "direct_rejoin_attempt_count": direct_rejoin_attempt_count,
-            "direct_rejoin_reject_count": direct_rejoin_reject_count,
-            "detour_rejoin_attempt_count": detour_rejoin_attempt_count,
-            "detour_rejoin_accept_count": detour_rejoin_accept_count,
-            "delayed_rejoin_count": delayed_rejoin_count,
-            "recover_path_unsafe_count": recover_path_unsafe_count,
-            "recovery_path_failure_streak_max": recovery_path_failure_streak_max,
-            "repeated_unsafe_target_count": repeated_unsafe_target_count,
-            "post_recovery_act_window_count": post_recovery_act_window_count,
-            "post_recovery_act_window_interrupted_count": post_recovery_act_window_interrupted_count,
-            "direct_rejoin_attempted_steps": direct_rejoin_attempted_steps,
-            "direct_rejoin_rejected_steps": direct_rejoin_rejected_steps,
-            "detour_rejoin_attempted_steps": detour_rejoin_attempted_steps,
-            "detour_rejoin_accepted_steps": detour_rejoin_accepted_steps,
-            "delayed_rejoin_active_steps": delayed_rejoin_active_steps,
-            "repeated_unsafe_target_steps": repeated_unsafe_target_steps,
-            "post_recovery_act_window_steps": post_recovery_act_window_steps,
-            "post_recovery_act_window_interrupted_steps": post_recovery_act_window_interrupted_steps,
-            "recover_reject_reason_counts": {
-                reason: recover_reject_reasons.count(reason)
-                for reason in sorted(set(recover_reject_reasons))
-            },
-            "safe_prefix_accepted_count": safe_prefix_accepted_count,
-            "first_action_only_accepted_count": first_action_only_accepted_count,
-            "immediate_hard_reject_count": immediate_hard_reject_count,
-            "no_safe_prefix_reject_count": no_safe_prefix_reject_count,
-            "horizon_margin_reject_count": horizon_margin_reject_count,
-            "accepted_deform_steps": accepted_deform_steps,
-            "accepted_recover_steps": accepted_recover_steps,
-            "fallback_brake_after_reject_count": fallback_brake_after_reject_count,
-            "nominal_rejoin_available_count": nominal_rejoin_available_count,
-            "nominal_rejoin_suppressed_count": nominal_rejoin_suppressed_count,
-            "stale_nominal_rejoin_suppressed_count": stale_nominal_rejoin_suppressed_count,
-            "nominal_prefix_unsafe_suppressed_count": nominal_prefix_unsafe_suppressed_count,
-            "recover_positive_projection_count": recover_positive_projection_count,
-            "recover_nonpositive_projection_count": recover_nonpositive_projection_count,
-            "mean_recover_projection_on_nominal": (
-                float(np.mean(recover_projection_on_nominal))
-                if recover_projection_on_nominal.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_projection_on_nominal")))
-                    if finite_metric("mean_recover_projection_on_nominal").size
-                    else None
-                )
-            ),
-            "mean_recover_cosine_to_nominal": (
-                float(np.mean(recover_cosine_to_nominal))
-                if recover_cosine_to_nominal.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_cosine_to_nominal")))
-                    if finite_metric("mean_recover_cosine_to_nominal").size
-                    else None
-                )
-            ),
-            "mean_recover_direction_cosine": (
-                float(np.mean(recover_direction_cosine))
-                if recover_direction_cosine.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_direction_cosine")))
-                    if finite_metric("mean_recover_direction_cosine").size
-                    else None
-                )
-            ),
-            "mean_recover_direction_loss": (
-                float(np.mean(recover_direction_loss))
-                if recover_direction_loss.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_direction_loss")))
-                    if finite_metric("mean_recover_direction_loss").size
-                    else None
-                )
-            ),
-            "mean_recover_task_progress_score": (
-                float(np.mean(recover_task_progress_score))
-                if recover_task_progress_score.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_task_progress_score")))
-                    if finite_metric("mean_recover_task_progress_score").size
-                    else None
-                )
-            ),
-            "mean_recover_ordered_pose_loss": (
-                float(np.mean(recover_ordered_pose_loss))
-                if recover_ordered_pose_loss.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_ordered_pose_loss")))
-                    if finite_metric("mean_recover_ordered_pose_loss").size
-                    else None
-                )
-            ),
-            "mean_recover_ordered_delta_loss": (
-                float(np.mean(recover_ordered_delta_loss))
-                if recover_ordered_delta_loss.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_ordered_delta_loss")))
-                    if finite_metric("mean_recover_ordered_delta_loss").size
-                    else None
-                )
-            ),
-            "mean_recover_ordered_loss": (
-                float(np.mean(recover_ordered_loss))
-                if recover_ordered_loss.size
-                else (
-                    float(np.mean(finite_metric("mean_recover_ordered_loss")))
-                    if finite_metric("mean_recover_ordered_loss").size
-                    else None
-                )
-            ),
-            "mean_cem_iterations_run": (
-                float(np.mean(cem_iterations_run)) if cem_iterations_run.size else None
-            ),
-            "max_cem_iterations_run": (
-                int(np.max(cem_iterations_run)) if cem_iterations_run.size else None
-            ),
-            "cem_early_stopped_count": int(
-                np.sum([bool(m.cem_early_stopped) for m in metrics])
-            ),
-            "mean_yield_cem_iterations_run": (
-                float(np.mean(yield_cem_iterations_run))
-                if yield_cem_iterations_run.size
-                else None
-            ),
-            "mean_return_cem_iterations_run": (
-                float(np.mean(return_cem_iterations_run))
-                if return_cem_iterations_run.size
-                else None
-            ),
-            "yield_cem_early_stopped_count": int(
-                np.sum([bool(m.yield_cem_early_stopped) for m in metrics])
-            ),
-            "return_cem_early_stopped_count": int(
-                np.sum([bool(m.return_cem_early_stopped) for m in metrics])
-            ),
-            "hold_unsafe_count": hold_unsafe_count,
-            "hold_predicted_contact_count": hold_predicted_contact_count,
-            "emergency_deform_away_steps": emergency_deform_away_steps,
-            "emergency_deform_away_count": emergency_deform_away_count,
-            "contact_during_hold_count": contact_during_hold_count,
-            "contact_during_brake_count": contact_during_brake_count,
-            "contact_during_deform_count": contact_during_deform_count,
-            "contact_during_recover_count": contact_during_recover_count,
-            "mean_hold_horizon_min_clearance": (
-                float(np.mean(hold_horizon_min_clearance))
-                if hold_horizon_min_clearance.size
-                else None
-            ),
-            "min_hold_horizon_min_clearance": (
-                float(np.min(hold_horizon_min_clearance))
-                if hold_horizon_min_clearance.size
-                else None
-            ),
-            "act_ratio": act_ratio,
-            "safety_mode_ratio": safety_mode_ratio,
-            "fallback_ratio": fallback_ratio,
-            "mean_task_progress": float(np.mean(task_progress)) if task_progress.size else None,
-            "max_task_progress": max_task_progress,
-            "final_task_progress": final_task_progress,
-            "mean_task_progress_delta": float(np.mean(task_progress_delta)) if task_progress_delta.size else None,
-            "mean_progress_during_act": mean_progress_for("act_step"),
-            "mean_progress_during_deform": mean_progress_for("deform_step"),
-            "mean_progress_during_recover": mean_progress_for("recover_step"),
-            "mean_progress_during_brake": mean_progress_for("brake_step"),
-            "mean_progress_during_fallback": mean_progress_for("fallback_step"),
-            "num_progress_regressions": int(np.sum(task_progress_delta < -1e-6)) if task_progress_delta.size else 0,
-            "num_large_arm_delta_events": int(
-                np.sum([m.per_step_arm_delta_norm > large_arm_delta_threshold for m in metrics])
-            ),
-            "num_large_base_delta_events": int(
-                np.sum([m.per_step_base_delta_norm > large_base_delta_threshold for m in metrics])
-            ),
-            "large_arm_delta_threshold": large_arm_delta_threshold,
-            "large_base_delta_threshold": large_base_delta_threshold,
-            "low_act_ratio_threshold": low_act_ratio_threshold,
-            "high_fallback_ratio_threshold": high_fallback_ratio_threshold,
-            "task_success_threshold": success_threshold,
-            "likely_failure_cause": likely_failure_cause,
-            "pass_through_rate": rate(modes, "pass_through"),
-            "horizon_brake_rate": rate(modes, "horizon_brake"),
-            "path_consistent_brake_rate": rate(modes, "path_consistent_brake"),
-            "path_consistent_brake_intended_rate": rate(modes, "path_consistent_brake_intended_step"),
-            "horizon_brake_intended_rate": rate(modes, "horizon_brake_intended_step"),
-            "verified_failsafe_rate": rate(modes, "verified_failsafe"),
-            "unverified_emergency_failsafe_rate": rate(modes, "unverified_emergency_failsafe"),
-            "horizon_deform_rate": rate(modes, "horizon_deform"),
-            "sequential_oscbf_rate": rate(modes, "sequential_oscbf"),
-            "pause_on_unsafe_rate": rate(modes, "pause_on_unsafe"),
-            "pause_and_restart_rate": rate(modes, "pause_and_restart"),
-            "phase_reanchor_rate": rate(modes, "phase_reanchor"),
-            "phase_reanchor_source_rate": rate(sources, "phase_reanchor"),
-            "phase_reanchor_steps": int(np.sum(phase_reanchor_steps)),
-            "gripper_latched_steps": gripper_latched_steps,
-            "post_recovery_task_guard_steps": post_recovery_task_guard_steps,
-            "post_recovery_reanchor_started_count": post_recovery_reanchor_started_count,
-            "post_recovery_progress_regression_count": post_recovery_progress_regression_count,
-            "pause_current_clearance_rate": rate(pause_reasons, "current_clearance"),
-            "pause_horizon_clearance_rate": rate(pause_reasons, "horizon_clearance"),
-            "pause_deform_clearance_rate": rate(pause_reasons, "deform_clearance"),
-            "chunk_deform_source_rate": rate(sources, "chunk_deform"),
-            "sequential_oscbf_source_rate": rate(sources, "sequential_oscbf"),
-            "min_robot_human_distance": float(np.min(robot_human_distances)) if robot_human_distances else None,
-            "num_safety_violations": int(np.sum(safety_violations)),
-            "num_filter_activations": int(np.sum(chunk_interventions)),
-            "total_brake_steps": int(np.sum(brake_steps)),
-            "total_deformation_steps": int(np.sum(deformation_steps)),
-            "task_success": bool(any(m.success for m in metrics)),
-            "drawer_open_distance": float(drawer_open_distances[-1]) if drawer_open_distances else None,
-            "resume_latency_after_human_exit": _resume_latency_after_human_exit(metrics),
-        }
-    )
-    return summary
-
-
-def summarise_all_chunk_episodes(episode_summaries: list[dict]) -> dict:
-    summary = summarise_all_episodes(episode_summaries)
-
-    def mean_of(key):
-        vals = [s[key] for s in episode_summaries if s.get(key) is not None]
-        return float(np.mean(vals)) if vals else None
-
-    def max_of(key):
-        vals = [s[key] for s in episode_summaries if s.get(key) is not None]
-        return float(np.max(vals)) if vals else None
-
-    def min_of(key):
-        vals = [s[key] for s in episode_summaries if s.get(key) is not None]
-        return float(np.min(vals)) if vals else None
-
-    def sum_of(key):
-        vals = [s[key] for s in episode_summaries if s.get(key) is not None]
-        return int(np.sum(vals)) if vals else None
-
-    def _merge_count_dicts(summaries, key):
-        merged = {}
-        for item in summaries:
-            counts = item.get(key)
-            if not isinstance(counts, dict):
-                continue
-            for name, value in counts.items():
-                try:
-                    value = int(value)
-                except (TypeError, ValueError):
-                    continue
-                merged[str(name)] = merged.get(str(name), 0) + value
-        return merged
-
-    summary.update(
-        {
-            "mean_chunk_arm_delta": mean_of("mean_chunk_arm_delta"),
-            "max_chunk_arm_delta_over_episodes": max_of("max_chunk_arm_delta"),
-            "mean_chunk_intervention_frequency": mean_of("chunk_intervention_frequency"),
-            "mean_chunk_modified_fraction": mean_of("mean_chunk_modified_fraction"),
-            "mean_chunk_modified_steps": mean_of("mean_chunk_modified_steps"),
-            "mean_chunk_first_modified_step": mean_of("mean_chunk_first_modified_step"),
-            "mean_chunk_mean_step_arm_delta": mean_of("mean_chunk_mean_step_arm_delta"),
-            "max_chunk_step_arm_delta_over_episodes": max_of("max_chunk_step_arm_delta"),
-            "mean_chunk_future_edit_fraction": mean_of("mean_chunk_future_edit_fraction"),
-            "mean_chunk_first_edit_fraction": mean_of("mean_chunk_first_edit_fraction"),
-            "mean_chunk_safe_arm_variation": mean_of("mean_chunk_safe_arm_variation"),
-            "mean_chunk_nominal_arm_variation": mean_of("mean_chunk_nominal_arm_variation"),
-            "mean_chunk_arm_variation_delta": mean_of("mean_chunk_arm_variation_delta"),
-            "mean_chunk_edit_variation": mean_of("mean_chunk_edit_variation"),
-            "mean_path_deviation": mean_of("mean_path_deviation"),
-            "max_path_deviation_over_episodes": max_of("max_path_deviation"),
-            "mean_final_path_deviation": mean_of("mean_final_path_deviation"),
-            "mean_chunk_preemptive_intervention_frequency": mean_of("chunk_preemptive_intervention_frequency"),
-            "mean_horizon_risk_gap": mean_of("mean_horizon_risk_gap"),
-            "max_horizon_risk_gap_over_episodes": max_of("max_horizon_risk_gap"),
-            "mean_horizon_clearance_drop": mean_of("mean_horizon_clearance_drop"),
-            "mean_horizon_risk_gap_rate": mean_of("horizon_risk_gap_rate"),
-            "mean_horizon_only_risk_rate": mean_of("horizon_only_risk_rate"),
-            "mean_deformation_norm": mean_of("mean_deformation_norm"),
-            "mean_deform_safe_rate": mean_of("deform_safe_rate"),
-            "optimized_attempts": sum_of("optimized_attempts"),
-            "optimized_safe_count": sum_of("optimized_safe_count"),
-            "optimized_recoverable_count": sum_of("optimized_recoverable_count"),
-            "optimized_accepted_count": sum_of("optimized_accepted_count"),
-            "rejected_unsafe_count": sum_of("rejected_unsafe_count"),
-            "rejected_unrecoverable_count": sum_of("rejected_unrecoverable_count"),
-            "rejected_both_count": sum_of("rejected_both_count"),
-            "fallback_used_count": sum_of("fallback_used_count"),
-            "deform_stage_accepted_count": sum_of("deform_stage_accepted_count"),
-            "recover_accepted_count": sum_of("recover_accepted_count"),
-            "recovery_optimization_skipped_count": sum_of(
-                "recovery_optimization_skipped_count"
-            ),
-            "recovery_optimization_skipped_steps": sum_of(
-                "recovery_optimization_skipped_steps"
-            ),
-            "cached_motion_active_count": sum_of("cached_motion_active_count"),
-            "resumed_from_cached_count": sum_of("resumed_from_cached_count"),
-            "mean_deform_stage_min_clearance": mean_of("mean_deform_stage_min_clearance"),
-            "mean_recover_min_clearance": mean_of("mean_recover_min_clearance"),
-            "mean_recover_rejoin_loss": mean_of("mean_recover_rejoin_loss"),
-            "mean_recover_path_min_clearance": mean_of("mean_recover_path_min_clearance"),
-            "min_recover_path_min_clearance": min_of("min_recover_path_min_clearance"),
-            "mean_recover_immediate_clearance": mean_of("mean_recover_immediate_clearance"),
-            "mean_recover_prefix_min_clearance": mean_of("mean_recover_prefix_min_clearance"),
-            "total_optimized_attempt_count": sum_of("optimized_attempt_count"),
-            "mean_optimized_accept_rate": mean_of("optimized_accept_rate"),
-            "mean_recoverable_rate": mean_of("recoverable_rate"),
-            "mean_fallback_used_rate": mean_of("fallback_used_rate"),
-            "mean_q_rejoin_dist": mean_of("mean_q_rejoin_dist"),
-            "max_q_rejoin_dist_over_episodes": max_of("max_q_rejoin_dist"),
-            "mean_qd_rejoin_dist": mean_of("mean_qd_rejoin_dist"),
-            "max_qd_rejoin_dist_over_episodes": max_of("max_qd_rejoin_dist"),
-            "mean_ee_rejoin_dist": mean_of("mean_ee_rejoin_dist"),
-            "max_ee_rejoin_dist_over_episodes": max_of("max_ee_rejoin_dist"),
-            "mean_rejoin_q_eval_time_ms": mean_of("mean_rejoin_q_eval_time_ms"),
-            "mean_rejoin_qd_eval_time_ms": mean_of("mean_rejoin_qd_eval_time_ms"),
-            "mean_env_step_time_ms": mean_of("mean_env_step_time_ms"),
-            "p50_env_step_time_ms": mean_of("p50_env_step_time_ms"),
-            "p95_env_step_time_ms": mean_of("p95_env_step_time_ms"),
-            "max_env_step_time_ms_over_episodes": max_of("max_env_step_time_ms"),
-            "mean_policy_obs_adapt_time_ms": mean_of("mean_policy_obs_adapt_time_ms"),
-            "p50_policy_obs_adapt_time_ms": mean_of("p50_policy_obs_adapt_time_ms"),
-            "p95_policy_obs_adapt_time_ms": mean_of("p95_policy_obs_adapt_time_ms"),
-            "max_policy_obs_adapt_time_ms_over_episodes": max_of("max_policy_obs_adapt_time_ms"),
-            "mean_policy_action_time_ms": mean_of("mean_policy_action_time_ms"),
-            "p50_policy_action_time_ms": mean_of("p50_policy_action_time_ms"),
-            "p95_policy_action_time_ms": mean_of("p95_policy_action_time_ms"),
-            "max_policy_action_time_ms_over_episodes": max_of("max_policy_action_time_ms"),
-            "mean_policy_obs_update_time_ms": mean_of("mean_policy_obs_update_time_ms"),
-            "p50_policy_obs_update_time_ms": mean_of("p50_policy_obs_update_time_ms"),
-            "p95_policy_obs_update_time_ms": mean_of("p95_policy_obs_update_time_ms"),
-            "max_policy_obs_update_time_ms_over_episodes": max_of("max_policy_obs_update_time_ms"),
-            "mean_policy_total_time_ms": mean_of("mean_policy_total_time_ms"),
-            "p50_policy_total_time_ms": mean_of("p50_policy_total_time_ms"),
-            "p95_policy_total_time_ms": mean_of("p95_policy_total_time_ms"),
-            "max_policy_total_time_ms_over_episodes": max_of("max_policy_total_time_ms"),
-            "mean_latency_residual_ms": mean_of("mean_latency_residual_ms"),
-            "p50_latency_residual_ms": mean_of("p50_latency_residual_ms"),
-            "p95_latency_residual_ms": mean_of("p95_latency_residual_ms"),
-            "max_latency_residual_ms_over_episodes": max_of("max_latency_residual_ms"),
-            "mean_ee_nom_cache_time_ms": mean_of("mean_ee_nom_cache_time_ms"),
-            "mean_ee_final_check_time_ms": mean_of("mean_ee_final_check_time_ms"),
-            "act_steps": sum_of("act_steps"),
-            "deform_steps": sum_of("deform_steps"),
-            "recover_steps": sum_of("recover_steps"),
-            "brake_steps": sum_of("brake_steps"),
-            "fallback_steps": sum_of("fallback_steps"),
-            "pacs_background_check_only_steps": sum_of("pacs_background_check_only_steps"),
-            "pacs_background_brake_steps": sum_of("pacs_background_brake_steps"),
-            "pacs_background_act_steps": sum_of("pacs_background_act_steps"),
-            "mean_pacs_background_check_only_rate": mean_of("pacs_background_check_only_rate"),
-            "mean_pacs_background_brake_rate": mean_of("pacs_background_brake_rate"),
-            "mean_pacs_background_act_rate": mean_of("pacs_background_act_rate"),
-            "mean_pacs_background_min_clearance": mean_of("mean_pacs_background_min_clearance"),
-            "min_pacs_background_min_clearance": min_of("min_pacs_background_min_clearance"),
-            "mean_pacs_background_arm_delta": mean_of("mean_pacs_background_arm_delta"),
-            "mean_pacs_background_chunk_arm_delta": mean_of("mean_pacs_background_chunk_arm_delta"),
-            "mean_pacs_background_chunk_modified_fraction": mean_of("mean_pacs_background_chunk_modified_fraction"),
-            "mean_pacs_background_retiming_arm_delta": mean_of("mean_pacs_background_retiming_arm_delta"),
-            "mean_pacs_background_retiming_chunk_arm_delta": mean_of("mean_pacs_background_retiming_chunk_arm_delta"),
-            "mean_pacs_background_retiming_changed_fraction": mean_of("mean_pacs_background_retiming_changed_fraction"),
-            "mean_pacs_background_path_consistent_brake_intended_rate": mean_of("pacs_background_path_consistent_brake_intended_rate"),
-            "mean_pacs_background_verified_failsafe_rate": mean_of("pacs_background_verified_failsafe_rate"),
-            "mean_pacs_background_unverified_emergency_failsafe_rate": mean_of("pacs_background_unverified_emergency_failsafe_rate"),
-            "optimized_attempt_steps": sum_of("optimized_attempt_steps"),
-            "optimized_accepted_steps": sum_of("optimized_accepted_steps"),
-            "committed_chunk_started_count": sum_of("committed_chunk_started_count"),
-            "committed_chunk_completed_count": sum_of("committed_chunk_completed_count"),
-            "committed_chunk_abort_count": sum_of("committed_chunk_abort_count"),
-            "committed_repaired_step_count": sum_of("committed_repaired_step_count"),
-            "committed_abort_due_to_human_motion_count": sum_of("committed_abort_due_to_human_motion_count"),
-            "committed_abort_due_to_prediction_error_count": sum_of("committed_abort_due_to_prediction_error_count"),
-            "committed_abort_due_to_safety_semantics_mismatch_count": sum_of("committed_abort_due_to_safety_semantics_mismatch_count"),
-            "committed_state_mismatch_abort_count": sum_of("committed_state_mismatch_abort_count"),
-            "committed_state_mismatch_recovered_count": sum_of("committed_state_mismatch_recovered_count"),
-            "committed_suffix_replan_attempt_count": sum_of("committed_suffix_replan_attempt_count"),
-            "committed_suffix_replan_accepted_count": sum_of("committed_suffix_replan_accepted_count"),
-            "committed_suffix_replan_rejected_count": sum_of("committed_suffix_replan_rejected_count"),
-            "committed_opportunistic_resume_count": sum_of("committed_opportunistic_resume_count"),
-            "committed_released_for_act_resume_count": sum_of("committed_released_for_act_resume_count"),
-            "committed_recovery_budget_exit_count": sum_of("committed_recovery_budget_exit_count"),
-            "committed_replan_due_to_recovery_budget_count": sum_of("committed_replan_due_to_recovery_budget_count"),
-            "committed_suffix_replan_reject_reason_counts": _merge_count_dicts(
-                episode_summaries,
-                "committed_suffix_replan_reject_reason_counts",
-            ),
-            "mean_planning_vs_replay_clearance_post_error": mean_of("mean_planning_vs_replay_clearance_post_error"),
-            "mean_planning_vs_replay_human_error": mean_of("mean_planning_vs_replay_human_error"),
-            "mean_actual_vs_planned_post_q_error": mean_of("mean_actual_vs_planned_post_q_error"),
-            "mean_committed_state_error": mean_of("mean_committed_state_error"),
-            "max_committed_state_error": max_of("max_committed_state_error"),
-            "mean_committed_clearance_prediction_error": mean_of("mean_committed_clearance_prediction_error"),
-            "mean_committed_planned_vs_actual_q_error": mean_of("mean_committed_planned_vs_actual_q_error"),
-            "mean_committed_human_motion_since_plan": mean_of("mean_committed_human_motion_since_plan"),
-            "mean_committed_accepted_clearance_margin": mean_of("mean_committed_accepted_clearance_margin"),
-            "committed_deform_steps_executed": sum_of("committed_deform_steps_executed"),
-            "committed_recover_steps_executed": sum_of("committed_recover_steps_executed"),
-            "resume_from_committed_rejoin_count": sum_of("resume_from_committed_rejoin_count"),
-            "recovery_action_history_reset_count": sum_of("recovery_action_history_reset_count"),
-            "accepted_recover_chunks_not_executed": any(
-                bool(s.get("accepted_recover_chunks_not_executed"))
-                for s in episode_summaries
-            ),
-            "diagnostic_warning": (
-                "accepted_recover_chunks_not_executed"
-                if any(bool(s.get("accepted_recover_chunks_not_executed")) for s in episode_summaries)
-                else None
-            ),
-            "temporary_wait_steps": sum_of("temporary_wait_steps"),
-            "resume_after_wait_count": sum_of("resume_after_wait_count"),
-            "deform_after_persistent_block_count": sum_of("deform_after_persistent_block_count"),
-            "deform_suppressed_by_temporary_wait_count": sum_of("deform_suppressed_by_temporary_wait_count"),
-            "recovery_failure_streak_max": max_of("recovery_failure_streak_max"),
-            "deform_replan_count": max_of("deform_replan_count"),
-            "recover_replan_count": max_of("recover_replan_count"),
-            "recovery_replan_count": max_of("recovery_replan_count"),
-            "stale_recovery_suppressed_count": max_of("stale_recovery_suppressed_count"),
-            "recovery_target_infeasible_count": max_of("recovery_target_infeasible_count"),
-            "emergency_brake_steps": max_of("emergency_brake_steps"),
-            "optimized_candidate_count": max_of("optimized_candidate_count"),
-            "optimized_solution_count": max_of("optimized_solution_count"),
-            "fallback_candidate_count": max_of("fallback_candidate_count"),
-            "fallback_candidate_accepted_count": max_of("fallback_candidate_accepted_count"),
-            "optimized_rejected_count": max_of("optimized_rejected_count"),
-            "deform_candidate_count": max_of("deform_candidate_count"),
-            "deform_accepted_count": max_of("deform_accepted_count"),
-            "deform_rejected_count": max_of("deform_rejected_count"),
-            "recover_candidate_count": max_of("recover_candidate_count"),
-            "recover_accepted_count": max_of("recover_accepted_count"),
-            "recover_rejected_count": max_of("recover_rejected_count"),
-            "safe_corridor_recovery_count": max_of("safe_corridor_recovery_count"),
-            "direct_rejoin_attempt_count": max_of("direct_rejoin_attempt_count"),
-            "direct_rejoin_reject_count": max_of("direct_rejoin_reject_count"),
-            "detour_rejoin_attempt_count": max_of("detour_rejoin_attempt_count"),
-            "detour_rejoin_accept_count": max_of("detour_rejoin_accept_count"),
-            "delayed_rejoin_count": max_of("delayed_rejoin_count"),
-            "recover_path_unsafe_count": max_of("recover_path_unsafe_count"),
-            "recovery_path_failure_streak_max": max_of("recovery_path_failure_streak_max"),
-            "repeated_unsafe_target_count": max_of("repeated_unsafe_target_count"),
-            "post_recovery_act_window_count": max_of("post_recovery_act_window_count"),
-            "post_recovery_act_window_interrupted_count": max_of("post_recovery_act_window_interrupted_count"),
-            "direct_rejoin_attempted_steps": sum_of("direct_rejoin_attempted_steps"),
-            "direct_rejoin_rejected_steps": sum_of("direct_rejoin_rejected_steps"),
-            "detour_rejoin_attempted_steps": sum_of("detour_rejoin_attempted_steps"),
-            "detour_rejoin_accepted_steps": sum_of("detour_rejoin_accepted_steps"),
-            "delayed_rejoin_active_steps": sum_of("delayed_rejoin_active_steps"),
-            "repeated_unsafe_target_steps": sum_of("repeated_unsafe_target_steps"),
-            "post_recovery_act_window_steps": sum_of("post_recovery_act_window_steps"),
-            "post_recovery_act_window_interrupted_steps": sum_of("post_recovery_act_window_interrupted_steps"),
-            "safe_prefix_accepted_count": max_of("safe_prefix_accepted_count"),
-            "first_action_only_accepted_count": max_of("first_action_only_accepted_count"),
-            "immediate_hard_reject_count": max_of("immediate_hard_reject_count"),
-            "no_safe_prefix_reject_count": max_of("no_safe_prefix_reject_count"),
-            "horizon_margin_reject_count": max_of("horizon_margin_reject_count"),
-            "accepted_deform_steps": max_of("accepted_deform_steps"),
-            "accepted_recover_steps": max_of("accepted_recover_steps"),
-            "fallback_brake_after_reject_count": max_of("fallback_brake_after_reject_count"),
-            "nominal_rejoin_available_count": max_of("nominal_rejoin_available_count"),
-            "nominal_rejoin_suppressed_count": max_of("nominal_rejoin_suppressed_count"),
-            "stale_nominal_rejoin_suppressed_count": max_of("stale_nominal_rejoin_suppressed_count"),
-            "nominal_prefix_unsafe_suppressed_count": max_of("nominal_prefix_unsafe_suppressed_count"),
-            "recover_positive_projection_count": max_of("recover_positive_projection_count"),
-            "recover_nonpositive_projection_count": max_of("recover_nonpositive_projection_count"),
-            "mean_recover_projection_on_nominal": mean_of("mean_recover_projection_on_nominal"),
-            "mean_recover_cosine_to_nominal": mean_of("mean_recover_cosine_to_nominal"),
-            "mean_recover_direction_cosine": mean_of("mean_recover_direction_cosine"),
-            "mean_recover_direction_loss": mean_of("mean_recover_direction_loss"),
-            "mean_recover_task_progress_score": mean_of("mean_recover_task_progress_score"),
-            "mean_recover_ordered_pose_loss": mean_of("mean_recover_ordered_pose_loss"),
-            "mean_recover_ordered_delta_loss": mean_of("mean_recover_ordered_delta_loss"),
-            "mean_recover_ordered_loss": mean_of("mean_recover_ordered_loss"),
-            "mean_cem_iterations_run": mean_of("mean_cem_iterations_run"),
-            "max_cem_iterations_run": max_of("max_cem_iterations_run"),
-            "cem_early_stopped_count": sum_of("cem_early_stopped_count"),
-            "mean_yield_cem_iterations_run": mean_of("mean_yield_cem_iterations_run"),
-            "mean_return_cem_iterations_run": mean_of("mean_return_cem_iterations_run"),
-            "yield_cem_early_stopped_count": sum_of("yield_cem_early_stopped_count"),
-            "return_cem_early_stopped_count": sum_of("return_cem_early_stopped_count"),
-            "hold_unsafe_count": max_of("hold_unsafe_count"),
-            "hold_predicted_contact_count": max_of("hold_predicted_contact_count"),
-            "emergency_deform_away_steps": max_of("emergency_deform_away_steps"),
-            "emergency_deform_away_count": max_of("emergency_deform_away_count"),
-            "contact_during_hold_count": max_of("contact_during_hold_count"),
-            "contact_during_brake_count": max_of("contact_during_brake_count"),
-            "contact_during_deform_count": max_of("contact_during_deform_count"),
-            "contact_during_recover_count": max_of("contact_during_recover_count"),
-            "mean_hold_horizon_min_clearance": mean_of("mean_hold_horizon_min_clearance"),
-            "min_hold_horizon_min_clearance": min(
-                [s.get("min_hold_horizon_min_clearance") for s in episode_summaries if s.get("min_hold_horizon_min_clearance") is not None],
-                default=None,
-            ),
-            "mean_act_ratio": mean_of("act_ratio"),
-            "mean_safety_mode_ratio": mean_of("safety_mode_ratio"),
-            "mean_fallback_ratio": mean_of("fallback_ratio"),
-            "mean_task_progress": mean_of("mean_task_progress"),
-            "max_task_progress": max_of("max_task_progress"),
-            "final_task_progress": mean_of("final_task_progress"),
-            "mean_task_progress_delta": mean_of("mean_task_progress_delta"),
-            "mean_progress_during_act": mean_of("mean_progress_during_act"),
-            "mean_progress_during_deform": mean_of("mean_progress_during_deform"),
-            "mean_progress_during_recover": mean_of("mean_progress_during_recover"),
-            "mean_progress_during_brake": mean_of("mean_progress_during_brake"),
-            "mean_progress_during_fallback": mean_of("mean_progress_during_fallback"),
-            "num_progress_regressions": sum_of("num_progress_regressions"),
-            "num_large_arm_delta_events": sum_of("num_large_arm_delta_events"),
-            "num_large_base_delta_events": sum_of("num_large_base_delta_events"),
-            "likely_failure_cause": (
-                episode_summaries[-1].get("likely_failure_cause")
-                if len(episode_summaries) == 1
-                else None
-            ),
-            "likely_failure_cause_counts": {
-                cause: sum(1 for s in episode_summaries if s.get("likely_failure_cause") == cause)
-                for cause in sorted({s.get("likely_failure_cause") for s in episode_summaries if s.get("likely_failure_cause") is not None})
-            },
-            "mean_pass_through_rate": mean_of("pass_through_rate"),
-            "mean_horizon_brake_rate": mean_of("horizon_brake_rate"),
-            "mean_path_consistent_brake_rate": mean_of("path_consistent_brake_rate"),
-            "mean_path_consistent_brake_intended_rate": mean_of("path_consistent_brake_intended_rate"),
-            "mean_horizon_brake_intended_rate": mean_of("horizon_brake_intended_rate"),
-            "mean_verified_failsafe_rate": mean_of("verified_failsafe_rate"),
-            "mean_unverified_emergency_failsafe_rate": mean_of("unverified_emergency_failsafe_rate"),
-            "mean_horizon_deform_rate": mean_of("horizon_deform_rate"),
-            "mean_sequential_oscbf_rate": mean_of("sequential_oscbf_rate"),
-            "mean_pause_on_unsafe_rate": mean_of("pause_on_unsafe_rate"),
-            "mean_pause_and_restart_rate": mean_of("pause_and_restart_rate"),
-            "mean_phase_reanchor_rate": mean_of("phase_reanchor_rate"),
-            "mean_phase_reanchor_source_rate": mean_of("phase_reanchor_source_rate"),
-            "total_phase_reanchor_steps": sum_of("phase_reanchor_steps"),
-            "total_gripper_latched_steps": sum_of("gripper_latched_steps"),
-            "total_post_recovery_task_guard_steps": sum_of("post_recovery_task_guard_steps"),
-            "total_post_recovery_reanchor_started_count": sum_of("post_recovery_reanchor_started_count"),
-            "total_post_recovery_progress_regression_count": sum_of("post_recovery_progress_regression_count"),
-            "mean_chunk_deform_source_rate": mean_of("chunk_deform_source_rate"),
-            "mean_sequential_oscbf_source_rate": mean_of("sequential_oscbf_source_rate"),
-            "min_robot_human_distance": min_of("min_robot_human_distance"),
-            "mean_min_robot_human_distance": mean_of("min_robot_human_distance"),
-            "total_safety_violations": sum_of("num_safety_violations"),
-            "total_filter_activations": sum_of("num_filter_activations"),
-            "total_brake_steps": sum_of("total_brake_steps"),
-            "total_deformation_steps": sum_of("total_deformation_steps"),
-            "task_success_rate": mean_of("task_success"),
-            "mean_drawer_open_distance": mean_of("drawer_open_distance"),
-            "mean_resume_latency_after_human_exit": mean_of("resume_latency_after_human_exit"),
-        }
-    )
-    return summary
-
-
 def main():
     args = parse_args()
+    if args.eval_config:
+        print("eval_config:", _flatten_eval_config_paths(args.eval_config))
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -8562,19 +3811,13 @@ def main():
             f"final_clear_max_joint_speed={args.human_arm_final_clear_max_joint_speed}",
             f"final_clear_carrier_xy={args.human_arm_final_clear_carrier_xy}",
         )
-    if args.disable_human_arm_collisions or args.visual_only_human_arm:
+    if args.visual_only_human_arm:
         disabled = _disable_human_arm_collisions(env)
-        label = (
-            "visual_only_human_arm"
-            if args.visual_only_human_arm
-            else "disable_human_arm_collisions"
+        print(f"visual_only_human_arm: disabled_physical_contact_geoms={disabled}")
+        print(
+            "visual_only_human_arm: actual contact response is disabled; "
+            "use h_violation/min_robot_human_distance as the collision check."
         )
-        print(f"{label}: disabled_physical_contact_geoms={disabled}")
-        if args.visual_only_human_arm:
-            print(
-                "visual_only_human_arm: actual contact response is disabled; "
-                "use h_violation/min_robot_human_distance as the collision check."
-            )
     elif args.enable_human_arm_collisions:
         enabled = _enable_human_arm_collisions(env)
         print(f"enable_human_arm_collisions: enabled_physical_contact_geoms={enabled}")
@@ -8631,14 +3874,12 @@ def main():
                 "Safety env action shape does not match task env action shape: "
                 f"safety={safety_env_action_shape}, task={env_action_shape}."
             )
-        if args.disable_human_arm_collisions or args.visual_only_human_arm:
+        if args.visual_only_human_arm:
             disabled = _disable_human_arm_collisions(safety_env)
-            label = (
-                "visual_only_human_arm"
-                if args.visual_only_human_arm
-                else "disable_human_arm_collisions"
+            print(
+                "safety_env visual_only_human_arm: "
+                f"disabled_physical_contact_geoms={disabled}"
             )
-            print(f"safety_env {label}: disabled_physical_contact_geoms={disabled}")
         elif args.enable_human_arm_collisions:
             enabled = _enable_human_arm_collisions(safety_env)
             print(
@@ -8681,9 +3922,26 @@ def main():
         and args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}
     )
     chunk_trajectory_jsonl_path = output_root / "chunk_trajectory_traces.jsonl"
+    mpc_replay_diagnostics_jsonl_path = output_root / "mpc_replay_diagnostics.jsonl"
+    nominal_rollout_diagnostics_jsonl_path = output_root / "nominal_rollout_diagnostics.jsonl"
     human_arm_trajectory_jsonl_path = output_root / "human_arm_trajectory.jsonl"
     executed_policy_trajectory_jsonl_path = output_root / "executed_policy_trajectory.jsonl"
     trajectory_plot_dir = output_root / "trajectory_viewers"
+    mpc_replay_diagnostic_logging_enabled = bool(
+        getattr(args, "log_mpc_replay_diagnostics", False)
+        and args.condition in {"chunk_deform", "sequential_oscbf", "path_consistent_brake"}
+    )
+    nominal_rollout_diagnostic_logging_enabled = bool(
+        mpc_replay_diagnostic_logging_enabled
+        and args.condition in {"chunk_deform", "sequential_oscbf", "path_consistent_brake"}
+    )
+    nominal_rollout_diagnostics_max_events = int(
+        getattr(
+            args,
+            "nominal_rollout_diagnostics_max_events",
+            max(1000, int(getattr(args, "mpc_replay_diagnostics_max_events", 300))),
+        )
+    )
     if trajectory_logging_enabled and args.plot_chunk_trajectories_3d:
         trajectory_plot_dir.mkdir(parents=True, exist_ok=True)
 
@@ -8697,6 +3955,14 @@ def main():
     print("video_time_base:", args.video_time_base)
     print("stop_video_at_steps:", video_stop_steps)
     print("log_chunk_trajectories:", trajectory_logging_enabled)
+    print("log_mpc_replay_diagnostics:", mpc_replay_diagnostic_logging_enabled)
+    if mpc_replay_diagnostic_logging_enabled:
+        print("mpc_replay_diagnostics_jsonl:", mpc_replay_diagnostics_jsonl_path)
+        print("mpc_replay_diagnostics_max_events:", args.mpc_replay_diagnostics_max_events)
+    print("log_nominal_rollout_diagnostics:", nominal_rollout_diagnostic_logging_enabled)
+    if nominal_rollout_diagnostic_logging_enabled:
+        print("nominal_rollout_diagnostics_jsonl:", nominal_rollout_diagnostics_jsonl_path)
+        print("nominal_rollout_diagnostics_max_events:", nominal_rollout_diagnostics_max_events)
     if trajectory_logging_enabled:
         print("chunk_trajectory_jsonl:", chunk_trajectory_jsonl_path)
         print("human_arm_trajectory_jsonl:", human_arm_trajectory_jsonl_path)
@@ -8730,10 +3996,13 @@ def main():
     path_consistent_background_check_only = bool(
         path_consistent_brake_eval_config.get("background_check_only", False)
     )
+    safety_filter_cfg = _args_safety_filter(args)
     barrier_operator_min_clearance = (
-        path_consistent_brake_eval_config.get("min_clearance", args.chunk_min_clearance)
+        path_consistent_brake_eval_config.get(
+            "min_clearance", safety_filter_cfg.get("min_clearance", 0.12)
+        )
         if args.condition == "path_consistent_brake"
-        else args.chunk_min_clearance
+        else safety_filter_cfg.get("min_clearance", 0.12)
     )
 
     print("\n=== Creating barrier safety operator/filter ===")
@@ -8741,10 +4010,16 @@ def main():
     horizon_operator = HorizonOSCBFOperator(
         oscbf,
         min_clearance=barrier_operator_min_clearance,
-        dt=0.05,
-        predict_human_motion=args.chunk_horizon_predict_human_motion,
-        human_prediction_max_time=args.chunk_human_motion_prediction_max_time,
-        human_prediction_max_speed=args.chunk_human_motion_prediction_max_speed,
+        dt=float(safety_filter_cfg.get("dt", 0.05)),
+        predict_human_motion=bool(
+            safety_filter_cfg.get("horizon_predict_human_motion", True)
+        ),
+        human_prediction_max_time=safety_filter_cfg.get(
+            "human_motion_prediction_max_time", 0.25
+        ),
+        human_prediction_max_speed=safety_filter_cfg.get(
+            "human_motion_prediction_max_speed", 3.0
+        ),
     )
     safechunk = make_safechunk_filter(args, horizon_operator, oscbf=oscbf)
     print("condition:", args.condition)
@@ -8754,33 +4029,40 @@ def main():
     print("arm indices:", oscbf.bigym_action_arm_indices.tolist())
     if args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}:
         print("chunk controlled indices:", safechunk.controlled_action_indices.tolist())
-        print("chunk_deform_mode:", safechunk.mode)
-        print("chunk_deformation_enabled:", safechunk.deformation_enabled)
-        print("chunk_deformation_scales:", safechunk.chunk_deformation_scales)
-        print("recoverable_deform_enabled:", safechunk.recoverable_deform_enabled)
-        print("recoverable_inner_rejoin_metric:", safechunk.inner_rejoin_metric)
-        print("recoverable_final_rejoin_metric:", safechunk.final_rejoin_metric)
-        print("recoverable_q_rejoin_threshold:", safechunk.q_rejoin_threshold)
-        print("recoverable_ee_rejoin_threshold:", safechunk.ee_rejoin_threshold)
-        print("recoverable_cache_nominal_ee:", safechunk.cache_nominal_ee)
-        print("recoverable_ee_rejoin_in_inner_loop:", safechunk.ee_rejoin_in_inner_loop)
-        print("recoverable_explicit_recovery:", safechunk.explicit_return)
-        print("explicit_recovery_commit_accepted_chunks:", safechunk.commit_accepted_chunks)
-        print("explicit_recovery_committed_chunk_safety_check:", safechunk.committed_chunk_safety_check)
-        print("explicit_recovery_committed_min_clearance_for_abort:", safechunk.committed_min_clearance_for_abort)
-        print("explicit_recovery_repair_committed_action:", safechunk.repair_committed_action)
-        print("explicit_recovery_monotonic_committed_repair:", safechunk.monotonic_committed_repair)
-        print("explicit_recovery_committed_execution_margin:", safechunk.committed_execution_margin)
-        print("explicit_recovery_committed_state_error_threshold:", safechunk.committed_state_error_threshold)
-        print("explicit_recovery_committed_state_error_action:", safechunk.committed_state_error_action)
+        print("chunk_deform_mode:", safechunk.deform.mode)
+        print("chunk_deformation_enabled:", safechunk.deform.deformation_enabled)
+        print("chunk_deformation_scales:", safechunk.deform.chunk_deformation_scales)
+        print("recoverable_deform_enabled:", safechunk.recovery.recoverable_deform_enabled)
+        print("recoverable_inner_rejoin_metric:", safechunk.recovery.inner_rejoin_metric)
+        print("recoverable_final_rejoin_metric:", safechunk.recovery.final_rejoin_metric)
+        print("recoverable_q_rejoin_threshold:", safechunk.recovery.q_rejoin_threshold)
+        print("recoverable_ee_rejoin_threshold:", safechunk.recovery.ee_rejoin_threshold)
+        print("recoverable_cache_nominal_ee:", safechunk.recovery.cache_nominal_ee)
+        print("recoverable_ee_rejoin_in_inner_loop:", safechunk.recovery.ee_rejoin_in_inner_loop)
+        print("recoverable_explicit_recovery:", safechunk.recovery.explicit_return)
+        print("explicit_recovery_commit_accepted_chunks:", safechunk.recovery.commit_accepted_chunks)
+        print("explicit_recovery_committed_chunk_safety_check:", safechunk.recovery.committed_chunk_safety_check)
+        print("explicit_recovery_committed_min_clearance_for_abort:", safechunk.recovery.committed_min_clearance_for_abort)
+        print(
+            "explicit_recovery_committed_deform_min_clearance_for_abort:",
+            safechunk.recovery.committed_deform_min_clearance_for_abort,
+        )
+        print("explicit_recovery_repair_committed_action:", safechunk.recovery.repair_committed_action)
+        print("explicit_recovery_monotonic_committed_repair:", safechunk.recovery.monotonic_committed_repair)
+        print("explicit_recovery_committed_execution_margin:", safechunk.recovery.committed_execution_margin)
+        print("explicit_recovery_committed_state_error_threshold:", safechunk.recovery.committed_state_error_threshold)
+        print("explicit_recovery_committed_state_error_action:", safechunk.recovery.committed_state_error_action)
         print(
             "explicit_recovery_committed_state_mismatch_abort_requires_unsafe:",
-            safechunk.committed_state_mismatch_abort_requires_unsafe,
+            safechunk.recovery.committed_state_mismatch_abort_requires_unsafe,
         )
-        print("recoverable_deform_horizon:", safechunk.yield_horizon)
-        print("recoverable_recover_horizon:", safechunk.return_horizon)
-        print("recoverable_use_ee_final_check:", safechunk.use_ee_final_check)
-        print("optimized_debug_safety_feasibility:", safechunk.debug_safety_feasibility)
+        print("explicit_recovery_mpc_recovery_enabled:", safechunk.recovery.mpc_recovery_enabled)
+        print("explicit_recovery_mpc_recovery_horizon:", safechunk.recovery.mpc_recovery_horizon)
+        print("explicit_recovery_mpc_recovery_prefix_len:", safechunk.recovery.mpc_recovery_prefix_len)
+        print("recoverable_deform_horizon:", safechunk.recovery.deform_horizon)
+        print("recoverable_recover_horizon:", safechunk.recovery.return_horizon)
+        print("recoverable_use_ee_final_check:", safechunk.recovery.use_ee_final_check)
+        print("optimized_debug_safety_feasibility:", safechunk.deform.debug_safety_feasibility)
         print("chunk_horizon_predict_human_motion:", horizon_operator.predict_human_motion)
         print("chunk_human_motion_prediction_max_time:", horizon_operator.human_prediction_max_time)
         print("chunk_human_motion_prediction_max_speed:", horizon_operator.human_prediction_max_speed)
@@ -8789,14 +4071,26 @@ def main():
         print("diagnostics_large_base_delta_threshold:", args.diagnostics_large_base_delta_threshold)
         print("diagnostics_low_act_ratio_threshold:", args.diagnostics_low_act_ratio_threshold)
         print("diagnostics_high_fallback_ratio_threshold:", args.diagnostics_high_fallback_ratio_threshold)
-        print("recoverable_brake_if_unrecoverable:", safechunk.brake_if_unrecoverable)
-        print("sequential_oscbf_fallback:", safechunk.sequential_oscbf_fallback)
+        print("recoverable_brake_if_unrecoverable:", safechunk.recovery.brake_if_unrecoverable)
+        print("sequential_oscbf_fallback:", safechunk.deform.sequential_oscbf_fallback)
 
+
+    phase_reanchor_nominal_windows = _load_phase_reanchor_nominal_windows(args)
+    if phase_reanchor_nominal_windows:
+        print(
+            "phase_reanchor_nominal_windows:",
+            f"count={len(phase_reanchor_nominal_windows)}",
+            f"source={phase_reanchor_nominal_windows[0].get('source')}",
+        )
+    elif bool(getattr(args, "phase_reanchor_nominal_window_enabled", False)):
+        print("phase_reanchor_nominal_windows: unavailable")
 
     all_step_metrics: list[StepMetrics] = []
     saved_action_episodes = []
     all_episode_summaries: list[dict] = []
     all_chunk_trajectory_records: list[dict] = []
+    all_mpc_replay_diagnostic_records: list[dict] = []
+    all_nominal_rollout_diagnostic_records: list[dict] = []
     all_human_arm_trajectory_samples: list[dict] = []
     all_executed_policy_trajectory_samples: list[dict] = []
     trajectory_plot_paths: list[str] = []
@@ -8814,55 +4108,84 @@ def main():
         episode_bar.set_postfix(episodes_left=args.episodes)
 
     try:
-        for episode in range(args.episodes):
+        episode_index_offset = int(getattr(args, "episode_index_offset", 0))
+        for episode_local in range(args.episodes):
+            episode = episode_index_offset + episode_local
             print(f"\n========== Episode {episode} ==========")
 
             reset_seed = args.seed + episode
-            if policy_env is None:
-                obs, info = env.reset(seed=reset_seed)
-                if args.freeze_human_arm:
-                    frozen = _freeze_human_arm(env)
-                    print(f"freeze_human_arm: episode={episode} frozen={frozen}")
-                else:
-                    challenged = _configure_human_arm_challenge(env, args)
-                    if challenged and episode == 0:
-                        print(f"human_arm_challenge: episode={episode} configured={challenged}")
-                if args.hide_human_arm_policy_obs:
-                    policy_obs = _policy_obs_with_hidden_human_arm(env, obs)
-                else:
-                    policy_obs = obs
-            else:
-                obs, info = env.reset(seed=reset_seed)
-                if args.freeze_human_arm:
-                    frozen = _freeze_human_arm(env)
-                    print(f"freeze_human_arm: episode={episode} frozen={frozen}")
-                else:
-                    challenged = _configure_human_arm_challenge(env, args)
-                    if challenged and episode == 0:
-                        print(f"human_arm_challenge: episode={episode} configured={challenged}")
-                policy_obs, _policy_info = policy_env.reset(seed=reset_seed)
 
-            safety_runtime_env = safety_env if safety_env is not None else env
-            if safety_env is not None:
-                safety_env.reset(seed=reset_seed)
-                sync_counts = _sync_named_mujoco_state(env, safety_env)
-                legs_synced = _sync_animated_legs(safety_env, is_moving=False)
-                if args.freeze_human_arm:
-                    frozen = _freeze_human_arm(safety_env)
-                    print(f"safety_env freeze_human_arm: episode={episode} frozen={frozen}")
+            def _reset_episode_envs_for_eval(*, announce: bool):
+                if policy_env is None:
+                    reset_obs, reset_info = env.reset(seed=reset_seed)
+                    if args.freeze_human_arm:
+                        frozen = _freeze_human_arm(env)
+                        if announce:
+                            print(f"freeze_human_arm: episode={episode} frozen={frozen}")
+                    else:
+                        challenged = _configure_human_arm_challenge(env, args)
+                        if challenged and episode == 0 and announce:
+                            print(f"human_arm_challenge: episode={episode} configured={challenged}")
+                    if args.hide_human_arm_policy_obs:
+                        reset_policy_obs = _policy_obs_with_hidden_human_arm(env, reset_obs)
+                    else:
+                        reset_policy_obs = reset_obs
                 else:
-                    challenged = _configure_human_arm_challenge(safety_env, args)
-                    if challenged and episode == 0:
-                        print(f"safety_env human_arm_challenge: episode={episode} configured={challenged}")
-                if episode == 0:
-                    print(
-                        "safety_env mirrored_state: "
-                        f"joints={sync_counts['joints']} actuators={sync_counts['actuators']} "
-                        f"animated_legs={legs_synced}"
-                    )
+                    reset_obs, reset_info = env.reset(seed=reset_seed)
+                    if args.freeze_human_arm:
+                        frozen = _freeze_human_arm(env)
+                        if announce:
+                            print(f"freeze_human_arm: episode={episode} frozen={frozen}")
+                    else:
+                        challenged = _configure_human_arm_challenge(env, args)
+                        if challenged and episode == 0 and announce:
+                            print(f"human_arm_challenge: episode={episode} configured={challenged}")
+                    reset_policy_obs, _policy_info = policy_env.reset(seed=reset_seed)
+
+                reset_safety_runtime_env = safety_env if safety_env is not None else env
+                if safety_env is not None:
+                    safety_env.reset(seed=reset_seed)
+                    sync_counts = _sync_named_mujoco_state(env, safety_env)
+                    legs_synced = _sync_animated_legs(safety_env, is_moving=False)
+                    if args.freeze_human_arm:
+                        frozen = _freeze_human_arm(safety_env)
+                        if announce:
+                            print(f"safety_env freeze_human_arm: episode={episode} frozen={frozen}")
+                    else:
+                        challenged = _configure_human_arm_challenge(safety_env, args)
+                        if challenged and episode == 0 and announce:
+                            print(f"safety_env human_arm_challenge: episode={episode} configured={challenged}")
+                    if episode == 0 and announce:
+                        print(
+                            "safety_env mirrored_state: "
+                            f"joints={sync_counts['joints']} actuators={sync_counts['actuators']} "
+                            f"animated_legs={legs_synced}"
+                        )
+                return reset_obs, reset_info, reset_policy_obs, reset_safety_runtime_env
+
+            obs, info, policy_obs, safety_runtime_env = _reset_episode_envs_for_eval(
+                announce=True,
+            )
             video_recorder.init(safety_runtime_env, enabled=args.record_video)
             episode_metrics: list[StepMetrics] = []
+            ablation_force_planned_recovery_q_done = False
+            pending_ablation_policy_obs_history = None
+            pending_ablation_resume_diag = None
+            pending_ablation_force_q_sequence = None
+            pending_ablation_force_q_sequence_qvel = None
+            pending_ablation_force_q_sequence_index = 0
+            pending_ablation_force_q_sequence_history = None
+            pending_ablation_force_q_sequence_indices = None
+            pending_ablation_force_q_sequence_target_action = None
+            pending_ablation_force_q_sequence_target_action_source = None
+            ablation_pure_act_resume_steps_left = 0
+            ablation_pure_act_resume_total_steps = max(
+                0,
+                int(getattr(args, "ablation_force_planned_recovery_q_pure_act_resume_steps", 0)),
+            )
             episode_chunk_trajectory_records: list[dict] = []
+            episode_mpc_replay_diagnostic_records: list[dict] = []
+            episode_nominal_rollout_diagnostic_records: list[dict] = []
             episode_human_arm_trajectory_samples: list[dict] = []
             episode_executed_policy_trajectory_samples: list[dict] = []
             if trajectory_logging_enabled:
@@ -8882,27 +4205,112 @@ def main():
             policy_step = 0
             human_done_clear_steps = 0
             action_history_reset_after_exit = False
+            visual_history_reset_after_exit = False
+            human_exit_resume_started = False
+            human_exit_resume_start_step = None
+            human_exit_resume_action_reset_count = 0
+            human_exit_resume_visual_reset_count = 0
             pause_restart_reset_after_exit = False
             initial_pause_restart_reset = False
             last_safety_intervention_active = False
             last_diagnostic_step_mode = None
+            last_rollout_residual_state = None
+            last_rollout_residual_l2 = None
+            last_rollout_residual_max_abs = None
+            last_rollout_residual_base_l2 = None
+            last_rollout_residual_arm_l2 = None
+            last_rollout_prediction_untrusted = False
             phase_reanchor_steps_left = 0
             phase_reanchor_cooldown_left = 0
             phase_reanchor_drawer_history = []
             phase_reanchor_reset_after_step = False
+            phase_reanchor_best_target_distance = None
+            phase_reanchor_best_target_signature = None
+            phase_reanchor_best_control_distance = None
+            phase_reanchor_best_control_signature = None
+            phase_reanchor_taskspace_worsen_count = 0
+            phase_reanchor_suppress_q_servo_steps_left = 0
+            phase_reanchor_live_extension_count = 0
+            phase_reanchor_bridge_preload_start_progress = None
+            phase_reanchor_bridge_preload_count = 0
+            phase_reanchor_bridge_preload_validated_latched = False
+            phase_reanchor_bridge_preload_reason_last = None
+            phase_reanchor_bridge_preload_progress_delta_last = None
+            phase_reanchor_bridge_preload_handle_dist_last = None
+            phase_reanchor_early_release_grace_left = 0
             post_recovery_task_guard_steps_left = 0
             post_recovery_task_guard_reason = None
             post_recovery_task_guard_best_progress = None
             post_recovery_progress_regression = None
             post_recovery_reanchor_started = False
+            post_recovery_no_progress_count = 0
+            post_recovery_mid_progress_no_progress_count = 0
+            post_recovery_mid_progress_best_progress = None
+            post_recovery_mid_progress_best_distance = None
+            post_recovery_mid_progress_distance_regression = None
+            post_recovery_mid_progress_reseed_count = 0
+            post_recovery_mid_progress_reseed_triggered = False
+            post_recovery_mid_progress_reseed_reset_count = 0
+            post_recovery_mid_progress_reseed_reason = None
+            post_recovery_mid_progress_prior_action_seed_count = 0
+            post_recovery_mid_progress_prior_action_seed_step = None
+            post_recovery_mid_progress_prior_action_seed_age = None
+            last_progressing_act_chunk = None
+            last_progressing_act_chunk_step = None
+            post_recovery_no_progress_triggered = False
+            post_recovery_no_progress_target_distance = None
+            recovery_policy_obs_history = []
+            post_recovery_act_bridge_steps_left = 0
+            post_recovery_act_bridge_progress_best = None
+            post_recovery_act_bridge_no_progress_count = 0
+            post_recovery_act_bridge_total_steps = max(
+                0,
+                int(getattr(args, "post_recovery_act_bridge_steps", 0)),
+            )
+            post_recovery_seed_fresh_act_history_pending = False
+            last_recovery_first_action_for_bridge = None
+            last_recovery_action_step_for_bridge = None
+            handoff_release_first_action_for_bridge = None
+            handoff_release_action_step_for_bridge = None
+            handoff_release_executed_action_for_bridge = None
             if hasattr(safechunk, "reset"):
                 safechunk.reset()
+            # Human-motion prediction carries previous capsule velocity. Clear it
+            # at every episode boundary so sequence mode matches isolated mode.
+            if hasattr(horizon_operator, "reset_human_motion_prediction"):
+                horizon_operator.reset_human_motion_prediction()
+            precomputed_step0_filter = None
             if episode == 0:
                 warm_h1state = extract_h1_state(env)
                 warm_q = np.asarray(warm_h1state.q_full, dtype=np.float32).reshape(-1)
                 warm_qd = np.asarray(warm_h1state.qd_full, dtype=np.float32).reshape(-1)
                 warm_obs = _chunk_obs_with_q(obs, warm_q)
+                warm_task_state = (
+                    _diagnostic_task_state(env)
+                    if args.diagnostics_enabled
+                    else {"task_progress": None}
+                )
+                warm_task_progress = warm_task_state.get("task_progress")
                 horizon_operator.set_context(safety_runtime_env, warm_obs, warm_q, warm_qd)
+                if args.condition in {
+                    "oscbf",
+                    "sequential",
+                    "sequential_oscbf",
+                    "chunk_deform",
+                    "path_consistent_brake",
+                }:
+                    cbf_warmup_t0 = time.perf_counter()
+                    cbf_warmup_info = _warmup_oscbf_cbf_paths(
+                        oscbf,
+                        safety_runtime_env,
+                        warm_obs,
+                        warm_q,
+                        warm_qd,
+                    )
+                    cbf_warmup_info["wall_time_ms"] = float(
+                        1000.0 * (time.perf_counter() - cbf_warmup_t0)
+                    )
+                    print("oscbf_cbf_warmup_info:", cbf_warmup_info)
                 if args.live_h_monitor:
                     warm_monitor_t0 = time.perf_counter()
                     compute_oscbf_h_monitor(
@@ -8920,7 +4328,7 @@ def main():
                     args.condition == "chunk_deform"
                     and getattr(safechunk, "mode", None) == "optimized"
                 ):
-                    warmup_info = safechunk.warmup_optimizer(warm_obs)
+                    warmup_info = safechunk.deform.warmup_optimizer(warm_obs)
                     print(
                         "safechunk_optimizer_warmup_time_ms:",
                         f"{warmup_info.get('optimizer_warmup_time_ms', 0.0):.3f}",
@@ -9029,7 +4437,7 @@ def main():
                                 args.condition == "chunk_deform"
                                 and getattr(safechunk, "mode", None) == "optimized"
                             ):
-                                policy_warmup_info = safechunk.warmup_optimizer(
+                                policy_warmup_info = safechunk.deform.warmup_optimizer(
                                     warm_obs,
                                     nominal_chunk=warm_nominal_chunk,
                                 )
@@ -9045,7 +4453,7 @@ def main():
                                 )
                                 live_warmup_t0 = time.perf_counter()
                             if args.condition in {"sequential", "sequential_oscbf"}:
-                                safechunk.deform_chunk_with_oscbf(
+                                safechunk.deform.deform_chunk_with_oscbf(
                                     warm_obs,
                                     warm_nominal_chunk,
                                     env=safety_runtime_env,
@@ -9053,24 +4461,261 @@ def main():
                                     qd_full=warm_qd,
                                 )
                             else:
-                                safechunk.filter_chunk(
+                                live_warm_chunk, live_warm_info = safechunk.filter_chunk(
                                     warm_obs,
                                     warm_nominal_chunk,
                                     env=safety_runtime_env,
                                     q_full=warm_q,
                                     qd_full=warm_qd,
-                                    task_progress=None,
+                                    task_progress=warm_task_progress,
                                     live_monitor_min_h=None,
                                     live_monitor_h_violation=False,
                                 )
+                                if (
+                                    args.condition == "chunk_deform"
+                                    and getattr(safechunk, "mode", None) == "optimized"
+                                    and replay_actions is None
+                                    and args.initial_pause_restart_steps <= 0
+                                ):
+                                    precomputed_step0_filter = {
+                                        "env_action": np.asarray(warm_env_action).copy(),
+                                        "nominal_chunk": np.asarray(warm_nominal_chunk).copy(),
+                                        "safe_chunk": np.asarray(live_warm_chunk).copy(),
+                                        "safety_info": dict(live_warm_info or {}),
+                                    }
+                            if hasattr(safechunk, "synchronize_accelerator"):
+                                safechunk.synchronize_accelerator()
                             print(
                                 "chunk_filter_live_warmup_time_ms:",
                                 f"{1000.0 * (time.perf_counter() - live_warmup_t0):.3f}",
                             )
+                            if (
+                                args.condition == "chunk_deform"
+                                and getattr(safechunk, "mode", None) == "optimized"
+                                and replay_actions is None
+                                and args.initial_pause_restart_steps <= 0
+                            ):
+                                post_step_warmup_info = {"attempted": True}
+                                try:
+                                    if hasattr(safechunk, "reset"):
+                                        safechunk.reset()
+                                    post_step_t0 = time.perf_counter()
+
+                                    dummy_h1state = extract_h1_state(env)
+                                    dummy_q = np.asarray(dummy_h1state.q_full, dtype=np.float32).reshape(-1)
+                                    dummy_qd = np.asarray(dummy_h1state.qd_full, dtype=np.float32).reshape(-1)
+                                    dummy_obs = _chunk_obs_with_q(obs, dummy_q)
+                                    dummy_task_state = (
+                                        _diagnostic_task_state(env)
+                                        if args.diagnostics_enabled
+                                        else {"task_progress": None}
+                                    )
+                                    dummy_policy_obs_for_action = _adapt_policy_obs_to_space(
+                                        policy_obs,
+                                        policy_observation_space,
+                                    )
+                                    dummy_env_action = policy_action(
+                                        ws,
+                                        dummy_policy_obs_for_action,
+                                        step=0,
+                                    )
+                                    dummy_env_action = normalise_env_action_shape(
+                                        dummy_env_action,
+                                        env_action_shape,
+                                    )
+                                    dummy_nominal_chunk, dummy_was_single = _as_chunk(dummy_env_action)
+                                    horizon_operator.set_context(
+                                        safety_runtime_env,
+                                        dummy_obs,
+                                        dummy_q,
+                                        dummy_qd,
+                                    )
+                                    first_filter_t0 = time.perf_counter()
+                                    dummy_safe_chunk, dummy_first_info = safechunk.filter_chunk(
+                                        dummy_obs,
+                                        dummy_nominal_chunk,
+                                        env=safety_runtime_env,
+                                        q_full=dummy_q,
+                                        qd_full=dummy_qd,
+                                        task_progress=dummy_task_state.get("task_progress"),
+                                        live_monitor_min_h=None,
+                                        live_monitor_h_violation=False,
+                                    )
+                                    first_filter_time_ms = 1000.0 * (
+                                        time.perf_counter() - first_filter_t0
+                                    )
+                                    dummy_safe_env_action = _restore_action_shape(
+                                        np.asarray(dummy_safe_chunk, dtype=np.float32),
+                                        dummy_was_single,
+                                    )
+                                    obs_after_dummy, _dummy_reward, _dummy_terminated, _dummy_truncated, _dummy_info = env.step(
+                                        dummy_safe_env_action
+                                    )
+                                    if policy_env is None:
+                                        if args.hide_human_arm_policy_obs:
+                                            policy_obs_after_dummy = _policy_obs_with_hidden_human_arm(
+                                                env,
+                                                obs_after_dummy,
+                                                prev_policy_obs=policy_obs,
+                                            )
+                                        else:
+                                            policy_obs_after_dummy = obs_after_dummy
+                                    else:
+                                        policy_obs_after_dummy, _policy_reward, _policy_terminated, _policy_truncated, _policy_info = policy_env.step(
+                                            dummy_safe_env_action
+                                        )
+                                    if safety_env is not None:
+                                        _sync_named_mujoco_state(env, safety_env)
+                                        _sync_animated_legs(safety_env, is_moving=True)
+
+                                    dummy_h1state_after = extract_h1_state(env)
+                                    dummy_q_after = np.asarray(dummy_h1state_after.q_full, dtype=np.float32).reshape(-1)
+                                    dummy_qd_after = np.asarray(dummy_h1state_after.qd_full, dtype=np.float32).reshape(-1)
+                                    dummy_obs_after = _chunk_obs_with_q(obs_after_dummy, dummy_q_after)
+                                    dummy_task_state_after = (
+                                        _diagnostic_task_state(env)
+                                        if args.diagnostics_enabled
+                                        else {"task_progress": None}
+                                    )
+                                    dummy_policy_obs_after_for_action = _adapt_policy_obs_to_space(
+                                        policy_obs_after_dummy,
+                                        policy_observation_space,
+                                    )
+                                    dummy_env_action_after = policy_action(
+                                        ws,
+                                        dummy_policy_obs_after_for_action,
+                                        step=1,
+                                    )
+                                    dummy_env_action_after = normalise_env_action_shape(
+                                        dummy_env_action_after,
+                                        env_action_shape,
+                                    )
+                                    dummy_nominal_chunk_after, _dummy_was_single_after = _as_chunk(
+                                        dummy_env_action_after
+                                    )
+                                    horizon_operator.set_context(
+                                        safety_runtime_env,
+                                        dummy_obs_after,
+                                        dummy_q_after,
+                                        dummy_qd_after,
+                                    )
+                                    second_filter_t0 = time.perf_counter()
+                                    dummy_second_chunk, dummy_second_info = safechunk.filter_chunk(
+                                        dummy_obs_after,
+                                        dummy_nominal_chunk_after,
+                                        env=safety_runtime_env,
+                                        q_full=dummy_q_after,
+                                        qd_full=dummy_qd_after,
+                                        task_progress=dummy_task_state_after.get("task_progress"),
+                                        live_monitor_min_h=None,
+                                        live_monitor_h_violation=False,
+                                    )
+                                    second_filter_time_ms = 1000.0 * (
+                                        time.perf_counter() - second_filter_t0
+                                    )
+                                    if hasattr(safechunk, "synchronize_accelerator"):
+                                        safechunk.synchronize_accelerator()
+                                    post_step_warmup_info.update(
+                                        {
+                                            "compiled": True,
+                                            "time_ms": float(1000.0 * (time.perf_counter() - post_step_t0)),
+                                            "first_filter_time_ms": float(first_filter_time_ms),
+                                            "second_filter_time_ms": float(second_filter_time_ms),
+                                            "first_mode": dummy_first_info.get("mode"),
+                                            "second_mode": dummy_second_info.get("mode"),
+                                            "first_explicit_optimizer_time_ms": dummy_first_info.get("explicit_optimizer_time_ms"),
+                                            "second_explicit_optimizer_time_ms": dummy_second_info.get("explicit_optimizer_time_ms"),
+                                            "second_deform_gradient_initial_batch_cost_time_ms": dummy_second_info.get("deform_gradient_initial_batch_cost_time_ms"),
+                                            "second_return_gradient_initial_batch_cost_time_ms": dummy_second_info.get("return_gradient_initial_batch_cost_time_ms"),
+                                        }
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    post_step_warmup_info.update(
+                                        {
+                                            "compiled": False,
+                                            "reason": f"{type(exc).__name__}: {exc}",
+                                        }
+                                    )
+                                finally:
+                                    obs, info, policy_obs, safety_runtime_env = _reset_episode_envs_for_eval(
+                                        announce=False,
+                                    )
+                                    video_recorder.init(
+                                        safety_runtime_env,
+                                        enabled=args.record_video,
+                                    )
+                                    policy_step = 0
+                                    precomputed_step0_filter = None
+                                    if hasattr(safechunk, "reset"):
+                                        safechunk.reset()
+                                    try:
+                                        rewarm_t0 = time.perf_counter()
+                                        rewarm_h1state = extract_h1_state(env)
+                                        rewarm_q = np.asarray(rewarm_h1state.q_full, dtype=np.float32).reshape(-1)
+                                        rewarm_qd = np.asarray(rewarm_h1state.qd_full, dtype=np.float32).reshape(-1)
+                                        rewarm_obs = _chunk_obs_with_q(obs, rewarm_q)
+                                        rewarm_task_state = (
+                                            _diagnostic_task_state(env)
+                                            if args.diagnostics_enabled
+                                            else {"task_progress": None}
+                                        )
+                                        rewarm_policy_obs = _adapt_policy_obs_to_space(
+                                            policy_obs,
+                                            policy_observation_space,
+                                        )
+                                        rewarm_env_action = policy_action(
+                                            ws,
+                                            rewarm_policy_obs,
+                                            step=0,
+                                        )
+                                        rewarm_env_action = normalise_env_action_shape(
+                                            rewarm_env_action,
+                                            env_action_shape,
+                                        )
+                                        rewarm_nominal_chunk, _rewarm_was_single = _as_chunk(
+                                            rewarm_env_action
+                                        )
+                                        horizon_operator.set_context(
+                                            safety_runtime_env,
+                                            rewarm_obs,
+                                            rewarm_q,
+                                            rewarm_qd,
+                                        )
+                                        rewarm_safe_chunk, rewarm_info = safechunk.filter_chunk(
+                                            rewarm_obs,
+                                            rewarm_nominal_chunk,
+                                            env=safety_runtime_env,
+                                            q_full=rewarm_q,
+                                            qd_full=rewarm_qd,
+                                            task_progress=rewarm_task_state.get("task_progress"),
+                                            live_monitor_min_h=None,
+                                            live_monitor_h_violation=False,
+                                        )
+                                        if hasattr(safechunk, "synchronize_accelerator"):
+                                            safechunk.synchronize_accelerator()
+                                        precomputed_step0_filter = {
+                                            "env_action": np.asarray(rewarm_env_action).copy(),
+                                            "nominal_chunk": np.asarray(rewarm_nominal_chunk).copy(),
+                                            "safe_chunk": np.asarray(rewarm_safe_chunk).copy(),
+                                            "safety_info": dict(rewarm_info or {}),
+                                        }
+                                        post_step_warmup_info["step0_recache_time_ms"] = float(
+                                            1000.0 * (time.perf_counter() - rewarm_t0)
+                                        )
+                                    except Exception as exc:  # noqa: BLE001
+                                        post_step_warmup_info["step0_recache_failed"] = (
+                                            f"{type(exc).__name__}: {exc}"
+                                        )
+                                        if hasattr(safechunk, "reset"):
+                                            safechunk.reset()
+                                print(
+                                    "safechunk_post_step_live_warmup_info:",
+                                    post_step_warmup_info,
+                                )
                     except Exception as exc:  # noqa: BLE001
                         print(f"chunk_filter_live_warmup_failed: {exc}")
                     finally:
-                        if hasattr(safechunk, "reset"):
+                        if hasattr(safechunk, "reset") and precomputed_step0_filter is None:
                             safechunk.reset()
             episode_wall_t0 = time.perf_counter()
             last_step_wall_t = episode_wall_t0
@@ -9160,17 +4805,32 @@ def main():
                 phase_reanchor_state = None
                 phase_reanchor_drawer_progress = None
                 phase_reanchor_reset_after_step = False
-                if args.phase_reanchor or args.post_recovery_task_guard:
+                phase_context_control_enabled = bool(
+                    args.phase_reanchor
+                    or args.post_recovery_task_guard
+                )
+                if phase_context_control_enabled:
                     if phase_reanchor_cooldown_left > 0:
                         phase_reanchor_cooldown_left -= 1
-                    phase_reanchor_state = _phase_reanchor_state(env, args)
-                    if phase_reanchor_state is not None:
-                        drawer_fraction = phase_reanchor_state.get("drawer_open_fraction")
-                        if drawer_fraction is not None and np.isfinite(float(drawer_fraction)):
-                            phase_reanchor_drawer_history.append(float(drawer_fraction))
+                    if phase_reanchor_early_release_grace_left > 0:
+                        phase_reanchor_early_release_grace_left -= 1
+                phase_reanchor_state = _phase_reanchor_state(env, args)
+                if phase_reanchor_state is not None and phase_context_control_enabled:
+                    drawer_fraction = phase_reanchor_state.get("drawer_open_fraction")
+                    if drawer_fraction is not None and np.isfinite(float(drawer_fraction)):
+                        phase_reanchor_drawer_history.append(float(drawer_fraction))
 
                 post_recovery_progress_regression = None
                 post_recovery_reanchor_started = False
+                post_recovery_no_progress_triggered = False
+                post_recovery_mid_progress_reseed_triggered = False
+                post_recovery_mid_progress_reseed_reset_count = 0
+                post_recovery_mid_progress_reseed_reason = None
+                post_recovery_mid_progress_prior_action_seed_count = 0
+                post_recovery_mid_progress_prior_action_seed_step = None
+                post_recovery_mid_progress_prior_action_seed_age = None
+                post_recovery_no_progress_target_distance = None
+                post_recovery_no_progress_distance_source = None
                 post_recovery_task_guard_ready = False
                 post_recovery_task_guard_phase_reason = None
                 if args.post_recovery_task_guard:
@@ -9202,7 +4862,375 @@ def main():
                             post_recovery_task_guard_reason = "progress_regression:" + str(
                                 post_recovery_task_guard_phase_reason
                             )
+                    no_progress_enabled = bool(
+                        getattr(args, "post_recovery_no_progress_reanchor", False)
+                    )
+                    no_progress_start_step = int(
+                        getattr(args, "post_recovery_no_progress_start_step", 90)
+                    )
+                    no_progress_patience = max(
+                        1,
+                        int(getattr(args, "post_recovery_no_progress_patience", 8)),
+                    )
+                    no_progress_max_progress = float(
+                        getattr(args, "post_recovery_no_progress_max_progress", 0.04)
+                    )
+                    no_progress_min_target_distance = float(
+                        getattr(args, "post_recovery_no_progress_min_target_distance", 0.62)
+                    )
+                    if phase_reanchor_state is not None:
+                        distance_source_request = str(
+                            getattr(args, "post_recovery_no_progress_distance_source", "measurement")
+                        )
+                        distance_keys = {
+                            "measurement": ("ee_to_handle_dist", "measurement"),
+                            "control": ("control_ee_to_handle_dist", "control"),
+                            "site": ("site_ee_to_handle_dist", "site"),
+                            "gripper": ("gripper_to_handle_dist", "gripper"),
+                        }
+                        distance_key, distance_source = distance_keys.get(
+                            distance_source_request,
+                            ("ee_to_handle_dist", "measurement"),
+                        )
+                        try:
+                            post_recovery_no_progress_target_distance = float(
+                                phase_reanchor_state.get(distance_key)
+                            )
+                            if not np.isfinite(post_recovery_no_progress_target_distance):
+                                post_recovery_no_progress_target_distance = None
+                            else:
+                                post_recovery_no_progress_distance_source = distance_source
+                        except (TypeError, ValueError):
+                            post_recovery_no_progress_target_distance = None
+                        if post_recovery_no_progress_target_distance is None and distance_key != "ee_to_handle_dist":
+                            try:
+                                post_recovery_no_progress_target_distance = float(
+                                    phase_reanchor_state.get("ee_to_handle_dist")
+                                )
+                                if not np.isfinite(post_recovery_no_progress_target_distance):
+                                    post_recovery_no_progress_target_distance = None
+                                else:
+                                    post_recovery_no_progress_distance_source = "measurement_fallback"
+                            except (TypeError, ValueError):
+                                post_recovery_no_progress_target_distance = None
+                    if post_recovery_act_bridge_steps_left > 0:
+                        bridge_progress_value = None
+                        try:
+                            bridge_progress_value = float(task_state_before.get("drawer_open_distance"))
+                            if not np.isfinite(bridge_progress_value):
+                                bridge_progress_value = None
+                        except (TypeError, ValueError):
+                            bridge_progress_value = None
+                        if bridge_progress_value is None:
+                            bridge_progress_value = progress_before
+                        if bridge_progress_value is not None and np.isfinite(float(bridge_progress_value)):
+                            bridge_progress_value = float(bridge_progress_value)
+                            bridge_epsilon = float(
+                                getattr(args, "post_recovery_act_bridge_no_progress_epsilon", 1e-5)
+                            )
+                            if (
+                                post_recovery_act_bridge_progress_best is None
+                                or bridge_progress_value > post_recovery_act_bridge_progress_best + bridge_epsilon
+                            ):
+                                post_recovery_act_bridge_progress_best = bridge_progress_value
+                                post_recovery_act_bridge_no_progress_count = 0
+                            else:
+                                post_recovery_act_bridge_no_progress_count += 1
+                            bridge_elapsed = int(
+                                max(
+                                    0,
+                                    int(post_recovery_act_bridge_total_steps)
+                                    - int(post_recovery_act_bridge_steps_left),
+                                )
+                            )
+                            if (
+                                bridge_elapsed >= int(
+                                    getattr(args, "post_recovery_act_bridge_no_progress_min_steps", 8)
+                                )
+                                and post_recovery_act_bridge_no_progress_count >= int(
+                                    getattr(args, "post_recovery_act_bridge_no_progress_patience", 8)
+                                )
+                                and phase_reanchor_steps_left <= 0
+                            ):
+                                post_recovery_no_progress_triggered = True
+                                post_recovery_task_guard_steps_left = max(
+                                    post_recovery_task_guard_steps_left,
+                                    int(args.post_recovery_task_guard_steps),
+                                )
+                                post_recovery_task_guard_reason = "post_bridge_no_drawer_progress"
+                                post_recovery_no_progress_count = 0
+                                phase_reanchor_cooldown_left = 0
+                                post_recovery_act_bridge_steps_left = 0
 
+                    no_progress_ready = bool(
+                        no_progress_enabled
+                        and post_recovery_task_guard_ready
+                        and phase_reanchor_cooldown_left <= 0
+                        and phase_reanchor_early_release_grace_left <= 1
+                        and step >= no_progress_start_step
+                        and progress_before is not None
+                        and progress_before <= no_progress_max_progress
+                        and post_recovery_no_progress_target_distance is not None
+                        and np.isfinite(post_recovery_no_progress_target_distance)
+                        and post_recovery_no_progress_target_distance
+                        >= no_progress_min_target_distance
+                    )
+                    if no_progress_ready:
+                        post_recovery_no_progress_count += 1
+                    else:
+                        post_recovery_no_progress_count = 0
+                    if post_recovery_no_progress_count >= no_progress_patience:
+                        post_recovery_no_progress_triggered = True
+                        post_recovery_task_guard_steps_left = max(
+                            post_recovery_task_guard_steps_left,
+                            int(args.post_recovery_task_guard_steps),
+                        )
+                        post_recovery_task_guard_reason = "no_progress:" + str(
+                            post_recovery_task_guard_phase_reason
+                        )
+                        post_recovery_no_progress_count = 0
+
+                    mid_progress_enabled = bool(
+                        getattr(args, "post_recovery_mid_progress_no_progress_reanchor", False)
+                    )
+                    mid_progress_min_progress = float(
+                        getattr(args, "post_recovery_mid_progress_min_progress", 0.35)
+                    )
+                    mid_progress_patience = max(
+                        1,
+                        int(getattr(args, "post_recovery_mid_progress_patience", 8)),
+                    )
+                    mid_progress_epsilon = float(
+                        getattr(args, "post_recovery_mid_progress_epsilon", 0.001)
+                    )
+                    mid_progress_distance_regression_threshold = float(
+                        getattr(args, "post_recovery_mid_progress_distance_regression", 0.06)
+                    )
+                    mid_progress_min_target_distance = float(
+                        getattr(args, "post_recovery_mid_progress_min_target_distance", 0.42)
+                    )
+                    reseed_budget_available = bool(
+                        post_recovery_mid_progress_reseed_count
+                        < max(
+                            0,
+                            int(
+                                getattr(
+                                    args,
+                                    "post_recovery_mid_progress_reseed_max_count",
+                                    1,
+                                )
+                            ),
+                        )
+                    )
+                    post_recovery_mid_progress_distance_regression = None
+                    mid_progress_ready = bool(
+                        mid_progress_enabled
+                        and post_recovery_task_guard_ready
+                        and phase_reanchor_cooldown_left <= 0
+                        and phase_reanchor_early_release_grace_left <= 1
+                        and phase_reanchor_steps_left <= 0
+                        and post_recovery_act_bridge_steps_left <= 0
+                        and not last_safety_intervention_active
+                        and step >= no_progress_start_step
+                        and progress_before is not None
+                        and progress_before >= mid_progress_min_progress
+                        and post_recovery_no_progress_target_distance is not None
+                        and np.isfinite(post_recovery_no_progress_target_distance)
+                    )
+                    if mid_progress_ready:
+                        progress_improved = (
+                            post_recovery_mid_progress_best_progress is None
+                            or progress_before
+                            > post_recovery_mid_progress_best_progress + mid_progress_epsilon
+                        )
+                        if progress_improved:
+                            post_recovery_mid_progress_best_progress = progress_before
+                            post_recovery_mid_progress_best_distance = (
+                                post_recovery_no_progress_target_distance
+                            )
+                            post_recovery_mid_progress_no_progress_count = 0
+                        else:
+                            if post_recovery_mid_progress_best_distance is None:
+                                post_recovery_mid_progress_best_distance = (
+                                    post_recovery_no_progress_target_distance
+                                )
+                            post_recovery_mid_progress_distance_regression = float(
+                                post_recovery_no_progress_target_distance
+                                - post_recovery_mid_progress_best_distance
+                            )
+                            if (
+                                post_recovery_mid_progress_distance_regression
+                                >= mid_progress_distance_regression_threshold
+                                and post_recovery_no_progress_target_distance
+                                >= mid_progress_min_target_distance
+                            ):
+                                post_recovery_mid_progress_no_progress_count += 1
+                            else:
+                                post_recovery_mid_progress_no_progress_count = 0
+                    else:
+                        post_recovery_mid_progress_no_progress_count = 0
+                        if progress_before is not None and progress_before < mid_progress_min_progress:
+                            post_recovery_mid_progress_best_progress = None
+                            post_recovery_mid_progress_best_distance = None
+
+                    if (
+                        post_recovery_mid_progress_no_progress_count
+                        >= mid_progress_patience
+                    ):
+                        post_recovery_no_progress_triggered = True
+                        mid_progress_phase = (
+                            str(phase_reanchor_state.get("phase"))
+                            if isinstance(phase_reanchor_state, dict)
+                            and phase_reanchor_state.get("phase") is not None
+                            else None
+                        )
+                        reseed_phases = {
+                            str(phase)
+                            for phase in getattr(
+                                args,
+                                "post_recovery_mid_progress_reseed_phases",
+                                ["pull"],
+                            )
+                        }
+                        reseed_enabled = bool(
+                            getattr(
+                                args,
+                                "post_recovery_mid_progress_reseed_action_history",
+                                False,
+                            )
+                            and mid_progress_phase in reseed_phases
+                            and reseed_budget_available
+                            and replay_actions is None
+                        )
+                        reseed_reset_count = 0
+                        if reseed_enabled:
+                            reseed_reset_count = _reset_action_sequence_history(env)
+                            if policy_env is not None:
+                                reseed_reset_count += _reset_action_sequence_history(
+                                    policy_env
+                                )
+                        if reseed_enabled and reseed_reset_count > 0:
+                            prior_action_seed_count = 0
+                            prior_action_seed_age = None
+                            prior_action_seed_step = None
+                            prior_action_enabled = bool(
+                                getattr(
+                                    args,
+                                    "post_recovery_mid_progress_reseed_prior_progress_action",
+                                    False,
+                                )
+                            )
+                            if (
+                                prior_action_enabled
+                                and last_progressing_act_chunk is not None
+                                and last_progressing_act_chunk_step is not None
+                            ):
+                                prior_action_seed_age = int(
+                                    step - last_progressing_act_chunk_step
+                                )
+                                if prior_action_seed_age <= max(
+                                    0,
+                                    int(
+                                        getattr(
+                                            args,
+                                            "post_recovery_mid_progress_reseed_prior_max_age",
+                                            8,
+                                        )
+                                    ),
+                                ):
+                                    seed_seen: set[int] = set()
+                                    for candidate in (env, policy_env):
+                                        if (
+                                            candidate is None
+                                            or id(candidate) in seed_seen
+                                        ):
+                                            continue
+                                        seed_seen.add(id(candidate))
+                                        prior_action_seed_count += int(
+                                            _seed_action_sequence_history_with_prior_act_chunk(
+                                                candidate,
+                                                last_progressing_act_chunk,
+                                            )
+                                        )
+                                    if prior_action_seed_count > 0:
+                                        prior_action_seed_step = int(
+                                            last_progressing_act_chunk_step
+                                        )
+                            bridge_steps = max(
+                                1,
+                                int(getattr(args, "post_recovery_act_bridge_steps", 4)),
+                            )
+                            post_recovery_act_bridge_total_steps = max(
+                                post_recovery_act_bridge_total_steps,
+                                bridge_steps,
+                            )
+                            post_recovery_act_bridge_steps_left = max(
+                                post_recovery_act_bridge_steps_left,
+                                bridge_steps,
+                            )
+                            post_recovery_act_bridge_progress_best = None
+                            post_recovery_act_bridge_no_progress_count = 0
+                            post_recovery_seed_fresh_act_history_pending = bool(
+                                prior_action_seed_count <= 0
+                                and getattr(
+                                    args,
+                                    "handoff_seed_action_history_from_fresh_act",
+                                    True,
+                                )
+                            )
+                            phase_reanchor_cooldown_left = max(
+                                phase_reanchor_cooldown_left,
+                                bridge_steps,
+                            )
+                            phase_reanchor_steps_left = 0
+                            post_recovery_task_guard_steps_left = 0
+                            recovery_policy_obs_history.clear()
+                            post_recovery_task_guard_reason = (
+                                "mid_progress_reseed:"
+                                + str(post_recovery_task_guard_phase_reason)
+                            )
+                            post_recovery_mid_progress_reseed_count += 1
+                            post_recovery_mid_progress_reseed_triggered = True
+                            post_recovery_mid_progress_reseed_reset_count = int(
+                                reseed_reset_count
+                            )
+                            post_recovery_mid_progress_reseed_reason = (
+                                "recent_progress_act_prior:"
+                                f"{mid_progress_phase}"
+                                if prior_action_seed_count > 0
+                                else f"fresh_act_reseed:{mid_progress_phase}"
+                            )
+                            post_recovery_mid_progress_prior_action_seed_count = int(
+                                prior_action_seed_count
+                            )
+                            post_recovery_mid_progress_prior_action_seed_step = (
+                                prior_action_seed_step
+                            )
+                            post_recovery_mid_progress_prior_action_seed_age = (
+                                prior_action_seed_age
+                            )
+                            post_recovery_mid_progress_best_progress = progress_before
+                            post_recovery_mid_progress_best_distance = (
+                                post_recovery_no_progress_target_distance
+                            )
+                        else:
+                            post_recovery_task_guard_steps_left = max(
+                                post_recovery_task_guard_steps_left,
+                                int(args.post_recovery_task_guard_steps),
+                            )
+                            post_recovery_task_guard_reason = (
+                                "mid_progress_no_progress:"
+                                + str(post_recovery_task_guard_phase_reason)
+                            )
+                        post_recovery_mid_progress_no_progress_count = 0
+
+                    if phase_reanchor_early_release_grace_left > 1:
+                        post_recovery_task_guard_steps_left = 0
+                        post_recovery_no_progress_count = 0
+                        post_recovery_mid_progress_no_progress_count = 0
+                        post_recovery_task_guard_reason = (
+                            f"suppressed:phase_reanchor_early_release_act_grace:{phase_reanchor_early_release_grace_left}"
+                        )
                     if post_recovery_task_guard_steps_left > 0:
                         if args.post_recovery_task_guard_force_gripper:
                             gripper_latched = True
@@ -9216,11 +5244,30 @@ def main():
                                 int(post_recovery_task_guard_steps_left),
                             )
                             phase_reanchor_cooldown_left = 0
+                            phase_reanchor_best_target_distance = None
+                            phase_reanchor_best_control_distance = None
+                            phase_reanchor_taskspace_worsen_count = 0
+                            phase_reanchor_suppress_q_servo_steps_left = 0
+                            post_recovery_mid_progress_best_progress = None
+                            post_recovery_mid_progress_best_distance = None
+                            phase_reanchor_bridge_preload_start_progress = None
+                            phase_reanchor_bridge_preload_count = 0
+                            phase_reanchor_bridge_preload_validated_latched = False
+                            phase_reanchor_bridge_preload_reason_last = None
+                            phase_reanchor_bridge_preload_progress_delta_last = None
+                            phase_reanchor_bridge_preload_handle_dist_last = None
                             post_recovery_reanchor_started = True
                         post_recovery_task_guard_steps_left = max(
                             0,
                             post_recovery_task_guard_steps_left - 1,
                         )
+
+                resume_affordance_context = _resume_affordance_context_from_task_state(
+                    task_state_before,
+                    phase_reanchor_state,
+                    gripper_latched=bool(gripper_latched),
+                    args=args,
+                )
 
                 if (
                     args.initial_pause_restart_steps > 0
@@ -9249,17 +5296,30 @@ def main():
 
                 policy_obs_adapt_time_ms = 0.0
                 policy_action_time_ms = 0.0
+                policy_obs_for_action = None
+                act_resume_diag_info = {}
+                act_resume_diag_target_first_action = None
+                use_precomputed_step0_filter = bool(
+                    step == 0
+                    and precomputed_step0_filter is not None
+                    and replay_actions is None
+                )
                 if replay_actions is None:
-                    policy_obs_adapt_t0 = time.perf_counter()
-                    policy_obs_for_action = _adapt_policy_obs_to_space(
-                        policy_obs,
-                        policy_observation_space,
-                    )
-                    policy_obs_adapt_time_ms = 1000.0 * (time.perf_counter() - policy_obs_adapt_t0)
-                    policy_action_t0 = time.perf_counter()
-                    env_action = policy_action(ws, policy_obs_for_action, step=policy_step)
-                    env_action = normalise_env_action_shape(env_action, env_action_shape)
-                    policy_action_time_ms = 1000.0 * (time.perf_counter() - policy_action_t0)
+                    if use_precomputed_step0_filter:
+                        env_action = np.asarray(
+                            precomputed_step0_filter["env_action"]
+                        ).copy()
+                    else:
+                        policy_obs_adapt_t0 = time.perf_counter()
+                        policy_obs_for_action = _adapt_policy_obs_to_space(
+                            policy_obs,
+                            policy_observation_space,
+                        )
+                        policy_obs_adapt_time_ms = 1000.0 * (time.perf_counter() - policy_obs_adapt_t0)
+                        policy_action_t0 = time.perf_counter()
+                        env_action = policy_action(ws, policy_obs_for_action, step=policy_step)
+                        env_action = normalise_env_action_shape(env_action, env_action_shape)
+                        policy_action_time_ms = 1000.0 * (time.perf_counter() - policy_action_t0)
                 else:
                     if episode >= replay_actions.shape[0] or step >= replay_actions.shape[1]:
                         print(
@@ -9268,6 +5328,64 @@ def main():
                         )
                         break
                     env_action = replay_actions[episode, step].copy()
+
+                if pending_ablation_resume_diag is not None and replay_actions is None:
+                    diag_seed_step = pending_ablation_resume_diag.get("seed_step")
+                    try:
+                        diag_target_age_steps = int(step) - int(diag_seed_step)
+                    except Exception:  # noqa: BLE001
+                        diag_target_age_steps = None
+                    act_resume_diag_info = {
+                        "act_resume_diag_active": True,
+                        "act_resume_diag_seed_step": diag_seed_step,
+                        "act_resume_diag_query_step": int(step),
+                        "act_resume_diag_target_age_steps": diag_target_age_steps,
+                        "act_resume_diag_target_action_source": pending_ablation_resume_diag.get("target_action_source"),
+                    }
+                    expected_low_dim = pending_ablation_resume_diag.get("seeded_low_dim_state")
+                    expected_policy_obs = pending_ablation_resume_diag.get("seeded_policy_obs_for_action")
+                    if isinstance(policy_obs_for_action, dict):
+                        if expected_low_dim is not None:
+                            current_low_dim = policy_obs_for_action.get("low_dim_state")
+                            act_resume_diag_info.update(
+                                _vector_compare_metrics(
+                                    current_low_dim,
+                                    expected_low_dim,
+                                    "act_resume_diag_policy_low_dim_vs_seed",
+                                )
+                            )
+                        if expected_policy_obs is not None:
+                            act_resume_diag_info.update(
+                                _policy_obs_snapshot_compare_metrics(
+                                    policy_obs_for_action,
+                                    expected_policy_obs,
+                                    "act_resume_diag_policy_obs_vs_seed",
+                                )
+                            )
+                    expected_visual_pose = pending_ablation_resume_diag.get("seeded_visual_pose_snapshot")
+                    if expected_visual_pose is not None:
+                        act_resume_diag_info.update(
+                            _mujoco_visual_pose_compare_metrics(
+                                _mujoco_visual_pose_snapshot(env),
+                                expected_visual_pose,
+                                "act_resume_diag_visual_pose_vs_seed",
+                            )
+                        )
+                    target_action = pending_ablation_resume_diag.get("target_action")
+                    act_resume_diag_target_first_action = _first_action_or_none(target_action)
+                    predicted_first_action = _first_action_or_none(env_action)
+                    act_resume_diag_info.update(
+                        _target_action_window_diagnostics(target_action, predicted_first_action)
+                    )
+                    if act_resume_diag_target_first_action is not None and predicted_first_action is not None:
+                        act_resume_diag_info.update(
+                            _vector_compare_metrics(
+                                predicted_first_action,
+                                act_resume_diag_target_first_action,
+                                "act_resume_diag_first_action_vs_target",
+                            )
+                        )
+                    pending_ablation_resume_diag = None
 
                 first_action = extract_first_action(env_action)
                 chunk_filter_mode = args.condition in {"sequential", "sequential_oscbf", "chunk_deform", "path_consistent_brake"}
@@ -9298,26 +5416,125 @@ def main():
                 valid_base_idx = base_idx[base_idx < first_action.shape[0]]
                 non_arm_idx = get_non_arm_indices(first_action.shape[0], arm_idx)
 
-                live_h_monitor_skipped = not bool(args.live_h_monitor)
+                post_recovery_act_bridge_active = bool(
+                    replay_actions is None
+                    and chunk_filter_mode
+                    and post_recovery_act_bridge_steps_left > 0
+                )
+                post_recovery_act_bridge_step_index = (
+                    None
+                    if not post_recovery_act_bridge_active
+                    else int(
+                        max(
+                            0,
+                            post_recovery_act_bridge_total_steps
+                            - post_recovery_act_bridge_steps_left,
+                        )
+                    )
+                )
+                action_bridge_info = {}
+                if post_recovery_act_bridge_active:
+                    fresh_action_seed_count = 0
+                    fresh_action_seed_reset_count = 0
+                    fresh_action_seed_source = None
+                    if (
+                        bool(getattr(args, "handoff_seed_action_history_from_fresh_act", True))
+                        and post_recovery_seed_fresh_act_history_pending
+                    ):
+                        seed_seen: set[int] = set()
+                        for candidate in (env, policy_env):
+                            if candidate is None or id(candidate) in seed_seen:
+                                continue
+                            seed_seen.add(id(candidate))
+                            try:
+                                fresh_action_seed_count += int(
+                                    _seed_action_sequence_history_with_nominal_actions(
+                                        candidate,
+                                        env_action,
+                                        history_window_len=max(
+                                            1,
+                                            int(getattr(args, "frame_stack", 4) or 4),
+                                        ),
+                                    )
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not seed post-recovery bridge action history "
+                                    "from fresh ACT chunk: %s",
+                                    exc,
+                                )
+                        if fresh_action_seed_count > 0:
+                            fresh_action_seed_source = (
+                                "fresh_act_env_action_single_contributor"
+                            )
+                            post_recovery_seed_fresh_act_history_pending = False
+                        else:
+                            fresh_action_seed_source = "fresh_act_seed_failed"
+                    action_bridge_info = _action_bridge_diagnostics(
+                        env=env,
+                        last_recovery_first_action=last_recovery_first_action_for_bridge,
+                        resume_first_action=first_action,
+                        arm_indices=arm_idx,
+                        gripper_index=args.gripper_latch_dim,
+                    )
+                    action_bridge_info.update(
+                        {
+                            "post_recovery_act_bridge_fresh_action_seed_pending": bool(
+                                post_recovery_seed_fresh_act_history_pending
+                            ),
+                            "post_recovery_act_bridge_fresh_action_seed_count": int(
+                                fresh_action_seed_count
+                            ),
+                            "post_recovery_act_bridge_fresh_action_seed_reset_count": int(
+                                fresh_action_seed_reset_count
+                            ),
+                            "post_recovery_act_bridge_fresh_action_seed_source": fresh_action_seed_source,
+                        }
+                    )
+
+                force_live_h_monitor_for_contact_rich = bool(args.condition == "chunk_deform")
+                live_h_monitor_skipped = not bool(args.live_h_monitor or force_live_h_monitor_for_contact_rich)
+                h_attribution_info = {}
+                current_h_violation_parts: set[str] = set()
+                horizon_violation_parts: set[str] = set()
+                live_h_monitor_info = {}
+                live_min_clearance = None
                 if live_h_monitor_skipped:
                     min_h = None
                     h_values = None
                     h_violation = False
+                    h_pair_label = None
                     monitor_time_ms = 0.0
                 else:
                     monitor_t0 = time.perf_counter()
-                    min_h, h_values, h_violation = compute_oscbf_h_monitor(
+                    min_h, h_values, h_violation, h_pair_label, live_h_monitor_info = compute_oscbf_full_arm_h_monitor(
                         filt=oscbf,
                         env=safety_runtime_env,
                         obs=obs,
                         q_full=q_full,
                         qd_full=qd_full,
+                        clearance_threshold=0.0,
+                        return_details=True,
                     )
+                    live_min_clearance = _safe_info_get(live_h_monitor_info, "live_min_clearance")
                     monitor_time_ms = 1000.0 * (time.perf_counter() - monitor_t0)
+                    if h_values is not None:
+                        h_attribution_info = _h_argmin_metadata(h_values)
+                        if h_pair_label is not None:
+                            h_attribution_info.update(_h_pair_label_metadata(h_pair_label))
+                        robot_part, _, _, _ = _parse_h_pair_label(h_pair_label)
+                        if h_violation and robot_part is not None:
+                            current_h_violation_parts = {robot_part}
 
                 filter_t0 = time.perf_counter()
                 safety_info = {}
                 chunk_trace_context = None
+                nominal_rollout_diagnostic_context = None
+                nominal_rollout_post_step_state = None
+                nominal_pred_q_next_for_feedback = None
+                nominal_rollout_shape_for_feedback = None
+                nominal_rollout_feedback_error = None
+                rollout_feedback = None
                 pacs_background_safety_info = None
                 pacs_background_chunk_for_metrics = None
 
@@ -9329,8 +5546,67 @@ def main():
                         "obs": chunk_obs,
                         "nominal_chunk": np.asarray(nominal_chunk, dtype=np.float32).copy(),
                     }
-                    if args.condition in {"sequential", "sequential_oscbf"}:
-                        safe_chunk, safety_info = safechunk.deform_chunk_with_oscbf(
+                    if (
+                        nominal_rollout_diagnostic_logging_enabled
+                        and len(all_nominal_rollout_diagnostic_records) < max(0, nominal_rollout_diagnostics_max_events)
+                    ):
+                        try:
+                            nominal_q_seq_feedback = np.asarray(
+                                safechunk.deform.rollout_nominal_chunk(chunk_obs, nominal_chunk),
+                                dtype=np.float32,
+                            )
+                            nominal_rollout_shape_for_feedback = list(nominal_q_seq_feedback.shape)
+                            nominal_pred_q_next_for_feedback = _first_rollout_state(nominal_q_seq_feedback)
+                        except Exception as exc:  # noqa: BLE001
+                            nominal_rollout_feedback_error = repr(exc)
+                        nominal_rollout_diagnostic_context = {
+                            "episode": int(episode),
+                            "step": int(step),
+                            "q_before": np.asarray(q_full, dtype=np.float32).reshape(-1).copy(),
+                            "qd_before": np.asarray(qd_full, dtype=np.float32).reshape(-1).copy(),
+                            "nominal_first_action": np.asarray(nominal_chunk[0], dtype=np.float32).reshape(-1).copy(),
+                            "nominal_action_shape": list(np.asarray(nominal_chunk).shape),
+                            "nominal_rollout_shape": nominal_rollout_shape_for_feedback,
+                            "nominal_pred_q_next": nominal_pred_q_next_for_feedback,
+                        }
+                        if nominal_rollout_feedback_error is not None:
+                            nominal_rollout_diagnostic_context["nominal_rollout_error"] = nominal_rollout_feedback_error
+                    if ablation_pure_act_resume_steps_left > 0:
+                        pure_steps_left_before = int(ablation_pure_act_resume_steps_left)
+                        pure_step_index = int(
+                            max(0, ablation_pure_act_resume_total_steps - pure_steps_left_before)
+                        )
+                        safe_chunk = np.asarray(nominal_chunk, dtype=np.float32).copy()
+                        safety_info = {
+                            "safety_mode": "ablation_pure_act_resume",
+                            "mode": "ablation_pure_act_resume",
+                            "deformation_source": "ablation_pure_act_resume",
+                            "deformation_norm": 0.0,
+                            "retiming_source": None,
+                            "retiming_norm": 0.0,
+                            "suppress_outer_pause": True,
+                            "ablation_pure_act_resume_enabled": bool(ablation_pure_act_resume_total_steps > 0),
+                            "ablation_pure_act_resume_active": True,
+                            "ablation_pure_act_resume_step_index": pure_step_index,
+                            "ablation_pure_act_resume_steps_left": pure_steps_left_before,
+                            "ablation_pure_act_resume_total_steps": int(ablation_pure_act_resume_total_steps),
+                        }
+                        ablation_pure_act_resume_steps_left = max(0, pure_steps_left_before - 1)
+                    elif use_precomputed_step0_filter and args.condition == "chunk_deform":
+                        safe_chunk = np.asarray(
+                            precomputed_step0_filter["safe_chunk"],
+                            dtype=np.float32,
+                        ).copy()
+                        safety_info = dict(precomputed_step0_filter["safety_info"])
+                        safety_info.update(
+                            {
+                                "precomputed_step0_filter_used": True,
+                                "precomputed_step0_filter_time_ms": 0.0,
+                            }
+                        )
+                        precomputed_step0_filter = None
+                    elif args.condition in {"sequential", "sequential_oscbf"}:
+                        safe_chunk, safety_info = safechunk.deform.deform_chunk_with_oscbf(
                             chunk_obs,
                             nominal_chunk,
                             env=safety_runtime_env,
@@ -9344,6 +5620,13 @@ def main():
                             "deformation_source": "sequential_oscbf",
                         })
                     else:
+                        handoff_history_snapshot_before = _action_sequence_history_snapshot(env)
+                        pre_filter_contact_pairs = robot_human_contact_pairs(safety_runtime_env)
+                        pre_filter_contact_count = (
+                            None
+                            if pre_filter_contact_pairs is None
+                            else len(pre_filter_contact_pairs)
+                        )
                         safe_chunk, safety_info = safechunk.filter_chunk(
                             chunk_obs,
                             nominal_chunk,
@@ -9351,9 +5634,17 @@ def main():
                             q_full=q_full,
                             qd_full=qd_full,
                             task_progress=task_state_before.get("task_progress"),
+                            resume_affordance_context=resume_affordance_context,
                             live_monitor_min_h=min_h,
+                            live_monitor_min_clearance=live_min_clearance,
                             live_monitor_h_violation=h_violation,
+                            live_monitor_available=bool(live_min_clearance is not None),
+                            robot_human_contact_count=pre_filter_contact_count,
                         )
+                        handoff_history_snapshot_after = _action_sequence_history_snapshot(env)
+                        if _safe_info_get(safety_info, "mpc_handoff_attempted"):
+                            safety_info = dict(safety_info)
+                            safety_info.update(_action_sequence_history_snapshot_delta(handoff_history_snapshot_before, handoff_history_snapshot_after))
                     if (
                         args.condition == "path_consistent_brake"
                         and path_consistent_background_check_only
@@ -9408,17 +5699,70 @@ def main():
                         safe_chunk = np.asarray(nominal_chunk, dtype=np.float32).copy()
 
                     if live_h_monitor_skipped:
-                        fallback_min_h, fallback_h_values, fallback_h_violation = (
-                            _chunk_horizon_h_monitor_fallback(
-                                safety_info,
-                                getattr(safechunk, "min_clearance", 0.0),
-                            )
+                        (
+                            fallback_min_h,
+                            fallback_h_values,
+                            fallback_h_violation,
+                            fallback_live_min_clearance,
+                            fallback_h_source,
+                        ) = _chunk_horizon_h_monitor_fallback(
+                            safety_info,
+                            0.0,
                         )
-                        if fallback_min_h is not None:
+                        if fallback_min_h is not None or fallback_live_min_clearance is not None:
                             min_h = fallback_min_h
                             h_values = fallback_h_values
                             h_violation = bool(fallback_h_violation)
-                            safety_info["h_monitor_source"] = "chunk_horizon_clearance"
+                            live_min_clearance = fallback_live_min_clearance
+                            safety_info["h_monitor_source"] = (
+                                "chunk_horizon_signed_clearance"
+                                if fallback_live_min_clearance is not None
+                                else "chunk_horizon_raw_h_debug_only"
+                            )
+                            safety_info["live_h_violation_source"] = f"fallback_{fallback_h_source}"
+                            safety_info["live_h_violation_threshold"] = 0.0
+                            if fallback_live_min_clearance is not None:
+                                safety_info["live_min_clearance"] = fallback_live_min_clearance
+
+                    if live_h_monitor_info:
+                        safety_info.update({
+                            key: value
+                            for key, value in live_h_monitor_info.items()
+                            if value is not None
+                        })
+
+                    should_compute_horizon_parts = False
+                    if not bool(_safe_info_get(safety_info, "precomputed_step0_filter_used")):
+                        min_clearances = _safe_info_get(safety_info, "min_clearances")
+                        try:
+                            min_clearances_array = np.asarray(min_clearances, dtype=np.float32)
+                            if min_clearances_array.size > 0 and np.isfinite(min_clearances_array).any() and np.any(
+                                min_clearances_array < 0.0
+                            ):
+                                should_compute_horizon_parts = True
+                        except Exception:  # noqa: BLE001
+                            if h_violation:
+                                should_compute_horizon_parts = True
+
+                    if should_compute_horizon_parts:
+                        try:
+                            planned_q_seq = np.asarray(
+                                safechunk.intervention.rollout_nominal_chunk(chunk_obs, nominal_chunk),
+                                dtype=np.float32,
+                            )
+                            horizon_h_result = _compute_full_arm_horizon_h_values(
+                                horizon_operator,
+                                chunk_obs,
+                                planned_q_seq,
+                            )
+                            if horizon_h_result is not None:
+                                horizon_h_values, horizon_h_labels = horizon_h_result
+                                horizon_violation_parts = _parts_from_horizon_h_values(
+                                    horizon_h_values,
+                                    horizon_h_labels,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("Could not compute horizon robot-part h violations: %s", exc)
 
                     safe_env_action = _restore_action_shape(
                         np.asarray(safe_chunk, dtype=np.float32),
@@ -9441,6 +5785,77 @@ def main():
                     safe_first_action = first_action.copy()
                     safe_env_action = env_action.copy()
 
+                if chunk_filter_mode:
+                    pass_through_idx = np.asarray(non_arm_idx, dtype=np.int64)
+                    pass_through_idx = pass_through_idx[
+                        (pass_through_idx >= 0)
+                        & (pass_through_idx < extract_first_action(safe_env_action).shape[0])
+                    ]
+                    chunk_passthrough_restore_delta = 0.0
+                    if pass_through_idx.size:
+                        restored_action = np.asarray(safe_env_action, dtype=np.float32).copy()
+                        reference_action = np.asarray(env_action, dtype=np.float32)
+                        reference_first_action = extract_first_action(reference_action)
+                        if restored_action.ndim == 1:
+                            before = restored_action[pass_through_idx].copy()
+                            restored_action[pass_through_idx] = reference_first_action[pass_through_idx]
+                            after = restored_action[pass_through_idx]
+                        else:
+                            before = restored_action[:, pass_through_idx].copy()
+                            if reference_action.ndim == 2 and reference_action.shape[0] == restored_action.shape[0]:
+                                restored_action[:, pass_through_idx] = reference_action[:, pass_through_idx]
+                            else:
+                                restored_action[:, pass_through_idx] = reference_first_action[pass_through_idx][None, :]
+                            after = restored_action[:, pass_through_idx]
+                        chunk_passthrough_restore_delta = float(np.linalg.norm(after - before))
+                        safe_env_action = restored_action
+                        safe_first_action = extract_first_action(safe_env_action)
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "chunk_passthrough_restored_indices": pass_through_idx.tolist(),
+                            "chunk_passthrough_restore_delta_norm": chunk_passthrough_restore_delta,
+                        }
+                    )
+
+                if replay_actions is None and _is_brake_or_fallback_execution(safety_info):
+                    pre_live_hold_action = np.asarray(safe_env_action, dtype=np.float32).copy()
+                    safe_env_action, brake_live_hold_indices, brake_live_hold_delta = (
+                        _hard_hold_action_from_live_robot(
+                            env,
+                            safe_env_action,
+                        )
+                    )
+                    pass_through_idx = np.asarray(non_arm_idx, dtype=np.int64)
+                    pass_through_idx = pass_through_idx[
+                        (pass_through_idx >= 0)
+                        & (pass_through_idx < extract_first_action(safe_env_action).shape[0])
+                    ]
+                    pass_through_restore_delta = 0.0
+                    if pass_through_idx.size:
+                        restored_action = np.asarray(safe_env_action, dtype=np.float32).copy()
+                        if restored_action.ndim == 1:
+                            before = restored_action[pass_through_idx].copy()
+                            restored_action[pass_through_idx] = pre_live_hold_action[pass_through_idx]
+                            after = restored_action[pass_through_idx]
+                        else:
+                            before = restored_action[:, pass_through_idx].copy()
+                            restored_action[:, pass_through_idx] = pre_live_hold_action[:, pass_through_idx]
+                            after = restored_action[:, pass_through_idx]
+                        pass_through_restore_delta = float(np.linalg.norm(after - before))
+                        safe_env_action = restored_action
+                    safe_first_action = extract_first_action(safe_env_action)
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "brake_live_robot_hold_current": bool(brake_live_hold_indices),
+                            "brake_live_robot_hold_action_indices": brake_live_hold_indices,
+                            "brake_live_robot_hold_delta_norm": float(brake_live_hold_delta),
+                            "brake_passthrough_restored_indices": pass_through_idx.tolist(),
+                            "brake_passthrough_restore_delta_norm": pass_through_restore_delta,
+                        }
+                    )
+
                 policy_hold_active = False
                 if args.pause_policy_step_on_brake and replay_actions is None:
                     policy_hold_active = _should_hold_policy_step(
@@ -9460,7 +5875,8 @@ def main():
                     args.initial_pause_restart_steps > 0
                     and step < args.initial_pause_restart_steps
                 )
-                pause_active, pause_reason = _should_pause_for_safety(args, min_h, safety_info)
+                current_pause_clearance = live_min_clearance if live_min_clearance is not None else min_h
+                pause_active, pause_reason = _should_pause_for_safety(args, current_pause_clearance, safety_info)
                 if bool(_safe_info_get(safety_info, "suppress_outer_pause")):
                     pause_active = False
                     pause_reason = None
@@ -9515,6 +5931,26 @@ def main():
                 filter_time_ms = 1000.0 * (time.perf_counter() - filter_t0)
 
                 assertion_idx = arm_idx
+                brake_hold_action_indices = _safe_info_get(safety_info, "brake_hold_action_indices")
+                brake_gripper_hold_indices = _safe_info_get(
+                    safety_info,
+                    "brake_gripper_hold_action_indices",
+                )
+                brake_live_hold_indices = _safe_info_get(
+                    safety_info,
+                    "brake_live_robot_hold_action_indices",
+                )
+                brake_assertion_indices = []
+                if brake_hold_action_indices is not None:
+                    brake_assertion_indices.extend(brake_hold_action_indices)
+                if brake_gripper_hold_indices is not None:
+                    brake_assertion_indices.extend(brake_gripper_hold_indices)
+                if brake_live_hold_indices is not None:
+                    brake_assertion_indices.extend(brake_live_hold_indices)
+                if brake_assertion_indices:
+                    assertion_idx = np.unique(
+                        np.asarray(brake_assertion_indices, dtype=np.int64)
+                    )
                 if pause_active and (pause_restart_active or initial_pause_restart_active):
                     assertion_idx = pause_action_idx
                 if chunk_filter_mode:
@@ -9541,6 +5977,19 @@ def main():
                         )
                         if should_start_reanchor:
                             phase_reanchor_steps_left = int(args.phase_reanchor_steps)
+                            phase_reanchor_best_target_distance = None
+                            phase_reanchor_best_target_signature = None
+                            phase_reanchor_best_control_distance = None
+                            phase_reanchor_best_control_signature = None
+                            phase_reanchor_taskspace_worsen_count = 0
+                            phase_reanchor_suppress_q_servo_steps_left = 0
+                            phase_reanchor_live_extension_count = 0
+                            phase_reanchor_bridge_preload_start_progress = None
+                            phase_reanchor_bridge_preload_count = 0
+                            phase_reanchor_bridge_preload_validated_latched = False
+                            phase_reanchor_bridge_preload_reason_last = None
+                            phase_reanchor_bridge_preload_progress_delta_last = None
+                            phase_reanchor_bridge_preload_handle_dist_last = None
                             reset_count = _reset_action_sequence_history(env)
                             if policy_env is not None:
                                 reset_count += _reset_action_sequence_history(policy_env)
@@ -9566,13 +6015,225 @@ def main():
                             phase_reanchor_cooldown_left = int(args.phase_reanchor_cooldown_steps)
                             phase_reanchor_reset_after_step = True
                         else:
+                            phase_reanchor_action_state = phase_reanchor_state
+                            live_taskspace_distance = None
+                            live_taskspace_guard_active = bool(
+                                getattr(args, "phase_reanchor_live_taskspace_guard", True)
+                            )
+                            live_taskspace_suppress_q_servo = False
+                            live_taskspace_suppress_q_servo_reason = None
+                            live_taskspace_stop_requested = False
+                            live_taskspace_stop_reason = None
+                            phase_reanchor_budget_hint = max(
+                                1,
+                                int(getattr(args, "phase_reanchor_steps", 1)),
+                                int(getattr(args, "post_recovery_task_guard_steps", 1)),
+                            )
+                            live_taskspace_elapsed_steps = max(
+                                0,
+                                phase_reanchor_budget_hint - int(phase_reanchor_steps_left),
+                            )
+                            live_taskspace_distance_source = None
+                            if phase_reanchor_state is not None:
+                                for _distance_key, _distance_source in (
+                                    ("ee_to_target_dist", "phase_target"),
+                                    ("ee_to_handle_dist", "handle"),
+                                ):
+                                    try:
+                                        live_taskspace_distance = float(
+                                            phase_reanchor_state.get(_distance_key)
+                                        )
+                                        if np.isfinite(live_taskspace_distance):
+                                            live_taskspace_distance_source = _distance_source
+                                            break
+                                    except (TypeError, ValueError):
+                                        live_taskspace_distance = None
+                            if (
+                                live_taskspace_guard_active
+                                and live_taskspace_distance is not None
+                                and np.isfinite(live_taskspace_distance)
+                            ):
+                                worsen_tolerance = float(
+                                    getattr(
+                                        args,
+                                        "phase_reanchor_live_taskspace_worsen_tolerance",
+                                        0.005,
+                                    )
+                                )
+                                worsen_patience = max(
+                                    1,
+                                    int(
+                                        getattr(
+                                            args,
+                                            "phase_reanchor_live_taskspace_worsen_patience",
+                                            1,
+                                        )
+                                    ),
+                                )
+                                guard_disable_steps = max(
+                                    1,
+                                    int(
+                                        getattr(
+                                            args,
+                                            "phase_reanchor_live_taskspace_guard_disable_steps",
+                                            6,
+                                        )
+                                    ),
+                                )
+                                taskspace_ready_dist = float(
+                                    getattr(args, "phase_reanchor_grasp_dist", 0.12)
+                                )
+                                control_taskspace_distance = None
+                                control_taskspace_distance_source = None
+                                for _control_key, _control_source in (
+                                    ("control_ee_to_target_dist", "control_phase_target"),
+                                    ("control_ee_to_handle_dist", "control_handle"),
+                                ):
+                                    try:
+                                        control_taskspace_distance = float(
+                                            phase_reanchor_state.get(_control_key)
+                                        )
+                                        if np.isfinite(control_taskspace_distance):
+                                            control_taskspace_distance_source = _control_source
+                                            break
+                                    except (TypeError, ValueError):
+                                        control_taskspace_distance = None
+                                control_distance_worsening = None
+                                phase_signature = str(phase_reanchor_state.get("phase", "unknown"))
+                                target_signature = (phase_signature, live_taskspace_distance_source)
+                                if phase_reanchor_best_target_signature != target_signature:
+                                    phase_reanchor_best_target_distance = None
+                                    phase_reanchor_taskspace_worsen_count = 0
+                                    phase_reanchor_best_target_signature = target_signature
+                                control_signature = (phase_signature, control_taskspace_distance_source)
+                                if phase_reanchor_best_control_signature != control_signature:
+                                    phase_reanchor_best_control_distance = None
+                                    phase_reanchor_best_control_signature = control_signature
+                                if control_taskspace_distance is not None:
+                                    if (
+                                        phase_reanchor_best_control_distance is None
+                                        or control_taskspace_distance
+                                        < phase_reanchor_best_control_distance - 0.5 * worsen_tolerance
+                                    ):
+                                        phase_reanchor_best_control_distance = float(control_taskspace_distance)
+                                        control_distance_worsening = False
+                                    else:
+                                        control_distance_worsening = bool(
+                                            phase_reanchor_best_control_distance is not None
+                                            and control_taskspace_distance
+                                            > phase_reanchor_best_control_distance + worsen_tolerance
+                                        )
+                                if (
+                                    phase_reanchor_best_target_distance is None
+                                    or live_taskspace_distance
+                                    < phase_reanchor_best_target_distance - 0.5 * worsen_tolerance
+                                ):
+                                    phase_reanchor_best_target_distance = float(live_taskspace_distance)
+                                    phase_reanchor_taskspace_worsen_count = 0
+                                elif (
+                                    phase_reanchor_best_target_distance is not None
+                                    and live_taskspace_distance
+                                    > phase_reanchor_best_target_distance + worsen_tolerance
+                                    and live_taskspace_distance > taskspace_ready_dist
+                                ):
+                                    if control_distance_worsening is False:
+                                        phase_reanchor_taskspace_worsen_count = 0
+                                    else:
+                                        phase_reanchor_taskspace_worsen_count += 1
+                                else:
+                                    phase_reanchor_taskspace_worsen_count = 0
+                                if phase_reanchor_taskspace_worsen_count >= worsen_patience:
+                                    release_target_limit = float(
+                                        getattr(args, "phase_reanchor_live_release_target_error", 0.16)
+                                    )
+                                    release_handle_limit = float(
+                                        getattr(args, "phase_reanchor_live_release_handle_dist", 0.24)
+                                    )
+                                    if live_taskspace_distance_source == "handle":
+                                        stop_ready_dist = max(taskspace_ready_dist, release_handle_limit + 0.12)
+                                    else:
+                                        stop_ready_dist = max(taskspace_ready_dist, release_target_limit + 0.12)
+                                    stop_near_release_band = bool(
+                                        phase_reanchor_best_target_distance is not None
+                                        and phase_reanchor_best_target_distance <= stop_ready_dist
+                                    )
+                                    if (
+                                        bool(getattr(args, "phase_reanchor_live_taskspace_stop_on_worsening", False))
+                                        and live_taskspace_elapsed_steps >= int(getattr(args, "phase_reanchor_live_taskspace_stop_min_steps", 12))
+                                        and stop_near_release_band
+                                    ):
+                                        live_taskspace_stop_requested = True
+                                        live_taskspace_stop_reason = "live_taskspace_worsening_near_release"
+                                        phase_reanchor_steps_left = min(phase_reanchor_steps_left, 1)
+                                    elif bool(getattr(args, "phase_reanchor_live_taskspace_stop_on_worsening", False)):
+                                        live_taskspace_stop_reason = "live_taskspace_worsening_far_from_release"
+                                    phase_reanchor_suppress_q_servo_steps_left = max(
+                                        phase_reanchor_suppress_q_servo_steps_left,
+                                        guard_disable_steps,
+                                    )
+                                    phase_reanchor_taskspace_worsen_count = 0
+                            if (
+                                bool(getattr(args, "phase_reanchor_suppress_q_servo_far_target", False))
+                                and live_taskspace_distance is not None
+                                and np.isfinite(live_taskspace_distance)
+                                and live_taskspace_distance
+                                > float(getattr(args, "phase_reanchor_q_servo_enable_target_dist", 0.24))
+                            ):
+                                phase_reanchor_suppress_q_servo_steps_left = max(
+                                    phase_reanchor_suppress_q_servo_steps_left,
+                                    1,
+                                )
+                                live_taskspace_suppress_q_servo_reason = "live_target_far"
+                            if phase_reanchor_suppress_q_servo_steps_left > 0:
+                                live_taskspace_suppress_q_servo = True
+                                if live_taskspace_suppress_q_servo_reason is None:
+                                    live_taskspace_suppress_q_servo_reason = "live_taskspace_worsening"
+                                phase_reanchor_suppress_q_servo_steps_left -= 1
+                            selected_nominal_window = _select_phase_reanchor_nominal_window(
+                                phase_reanchor_nominal_windows,
+                                q_full,
+                                oscbf,
+                                phase_reanchor_state,
+                                args,
+                            )
+                            if selected_nominal_window is not None:
+                                phase_reanchor_action_state = dict(phase_reanchor_state)
+                                phase_reanchor_action_state.update(
+                                    {
+                                        "nominal_reentry_q_window": selected_nominal_window.get("q_window"),
+                                        "nominal_reentry_action_window": selected_nominal_window.get("action_window"),
+                                        "nominal_reentry_source": selected_nominal_window.get("source"),
+                                        "nominal_reentry_episode": selected_nominal_window.get("episode"),
+                                        "nominal_reentry_start_step": selected_nominal_window.get("start_step"),
+                                        "nominal_reentry_end_step": selected_nominal_window.get("end_step"),
+                                        "nominal_reentry_window_steps": selected_nominal_window.get("steps"),
+                                        "nominal_reentry_current_q_l2": selected_nominal_window.get("current_q_l2"),
+                                        "nominal_reentry_selection": selected_nominal_window.get("selection"),
+                                        "nominal_reentry_selection_reason": selected_nominal_window.get("selection_reason"),
+                                        "nominal_reentry_live_target_distance": selected_nominal_window.get("live_target_distance"),
+                                        "nominal_reentry_suppress_q_servo": live_taskspace_suppress_q_servo,
+                                        "nominal_reentry_suppress_q_servo_reason": live_taskspace_suppress_q_servo_reason,
+                                        "live_taskspace_guard_distance": live_taskspace_distance,
+                                        "live_taskspace_guard_best_distance": phase_reanchor_best_target_distance,
+                                    }
+                                )
+                            elif isinstance(phase_reanchor_action_state, dict):
+                                phase_reanchor_action_state = dict(phase_reanchor_action_state)
+                                phase_reanchor_action_state.update(
+                                    {
+                                        "nominal_reentry_suppress_q_servo": live_taskspace_suppress_q_servo,
+                                        "nominal_reentry_suppress_q_servo_reason": live_taskspace_suppress_q_servo_reason,
+                                        "live_taskspace_guard_distance": live_taskspace_distance,
+                                        "live_taskspace_guard_best_distance": phase_reanchor_best_target_distance,
+                                    }
+                                )
                             reanchor_action, reanchor_info = _phase_reanchor_action(
                                 env,
                                 safe_env_action,
                                 q_full,
                                 oscbf,
                                 args,
-                                phase_reanchor_state,
+                                phase_reanchor_action_state,
                             )
                             if reanchor_action is None:
                                 phase_reanchor_steps_left = 0
@@ -9592,7 +6253,7 @@ def main():
                                     and hasattr(safechunk, "evaluate_candidate_acceptance")
                                 ):
                                     try:
-                                        reanchor_acceptance = safechunk.evaluate_candidate_acceptance(
+                                        reanchor_acceptance = safechunk.intervention.evaluate_candidate_acceptance(
                                             _chunk_obs_with_q(obs, q_full),
                                             reanchor_action,
                                             "deform",
@@ -9605,7 +6266,7 @@ def main():
                                             and reanchor_acceptance.get("safe_prefix_execution")
                                             and hasattr(safechunk, "_truncate_chunk_to_safe_prefix")
                                         ):
-                                            reanchor_to_execute = safechunk._truncate_chunk_to_safe_prefix(
+                                            reanchor_to_execute = safechunk.intervention._truncate_chunk_to_safe_prefix(
                                                 reanchor_action,
                                                 reanchor_acceptance,
                                             )
@@ -9641,9 +6302,373 @@ def main():
                                     safe_env_action = reanchor_to_execute
                                     safe_first_action = extract_first_action(safe_env_action)
                                     phase_reanchor_steps_left -= 1
+                                    phase_reanchor_live_release_ready = None
+                                    phase_reanchor_live_release_reason = None
+                                    phase_reanchor_live_release_target_error = None
+                                    phase_reanchor_live_release_handle_dist = None
+                                    phase_reanchor_live_extension_started = False
+                                    phase_reanchor_live_extension_budget_exhausted = False
+                                    phase_reanchor_early_release_triggered = False
+                                    phase_reanchor_early_release_reason = None
+                                    phase_reanchor_early_release_arm_q_error = None
+                                    phase_reanchor_bridge_contact_ready = None
+                                    phase_reanchor_bridge_contact_reason = None
+                                    phase_reanchor_bridge_contact_handle_dist = None
+                                    phase_reanchor_bridge_contact_handle_limit = None
+                                    phase_reanchor_bridge_preload_validated = None
+                                    phase_reanchor_bridge_preload_reason = None
+                                    phase_reanchor_bridge_preload_steps = None
+                                    phase_reanchor_bridge_preload_progress_delta = None
+                                    phase_reanchor_bridge_preload_handle_dist = None
+                                    phase_reanchor_bridge_preload_handle_limit = None
+                                    phase_reanchor_bridge_preload_progress_ok = None
+                                    phase_reanchor_bridge_preload_handle_ok = None
+                                    phase_reanchor_bridge_preload_validation_source = None
+                                    phase_reanchor_bridge_preload_progress_abs = None
+                                    if bool(getattr(args, "phase_reanchor_early_release_on_resumable_window", False)):
+                                        try:
+                                            phase_reanchor_early_release_arm_q_error = reanchor_info.get(
+                                                "arm_servo_target_window_score"
+                                            )
+                                            if phase_reanchor_early_release_arm_q_error is None:
+                                                phase_reanchor_early_release_arm_q_error = reanchor_info.get(
+                                                    "arm_servo_error_norm"
+                                                )
+                                            if phase_reanchor_early_release_arm_q_error is not None:
+                                                phase_reanchor_early_release_arm_q_error = float(
+                                                    phase_reanchor_early_release_arm_q_error
+                                                )
+                                                if not np.isfinite(phase_reanchor_early_release_arm_q_error):
+                                                    phase_reanchor_early_release_arm_q_error = None
+                                        except (TypeError, ValueError):
+                                            phase_reanchor_early_release_arm_q_error = None
+                                        early_release_arm_limit = float(
+                                            getattr(args, "phase_reanchor_early_release_arm_q_error", 0.12)
+                                        )
+                                        early_release_min_steps = int(
+                                            getattr(args, "phase_reanchor_early_release_min_steps", 8)
+                                        )
+                                        early_release_elapsed = int(live_taskspace_elapsed_steps)
+                                        (
+                                            early_release_live_ready,
+                                            early_release_live_reason,
+                                            _early_release_target_error,
+                                            _early_release_handle_dist,
+                                        ) = _phase_reanchor_live_release_status(
+                                            phase_reanchor_action_state,
+                                            args,
+                                        )
+                                        early_release_resume_ready = bool(
+                                            _safe_info_get(safety_info, "resume_affordance_ok")
+                                        )
+                                        if (
+                                            phase_reanchor_early_release_arm_q_error is None
+                                            and isinstance(phase_reanchor_action_state, dict)
+                                        ):
+                                            try:
+                                                q_window = phase_reanchor_action_state.get("nominal_reentry_q_window")
+                                                q_rows = np.asarray(q_window, dtype=np.float64)
+                                                if q_rows.ndim == 1:
+                                                    q_rows = q_rows.reshape(1, -1)
+                                                elif q_rows.ndim > 2:
+                                                    q_rows = q_rows.reshape((-1, q_rows.shape[-1]))
+                                                live_q = np.asarray(q_full, dtype=np.float64).reshape(-1)
+                                                dim = min(live_q.size, q_rows.shape[-1])
+                                                if dim > 0 and np.isfinite(q_rows[:, :dim]).all() and np.isfinite(live_q[:dim]).all():
+                                                    compare_idx = np.arange(dim, dtype=np.int64)
+                                                    if not bool(getattr(args, "phase_reanchor_nominal_window_track_base", True)):
+                                                        arm_state_idx = np.asarray(
+                                                            getattr(oscbf, "bigym_state_arm_indices", []),
+                                                            dtype=np.int64,
+                                                        )
+                                                        arm_state_idx = arm_state_idx[
+                                                            (arm_state_idx >= 0) & (arm_state_idx < dim)
+                                                        ]
+                                                        if arm_state_idx.size > 0:
+                                                            compare_idx = arm_state_idx
+                                                    adapted_q_dists = np.linalg.norm(
+                                                        q_rows[:, compare_idx] - live_q[compare_idx][None, :],
+                                                        axis=1,
+                                                    )
+                                                    phase_reanchor_early_release_arm_q_error = float(adapted_q_dists[-1])
+                                            except Exception as exc:  # noqa: BLE001
+                                                logger.debug("Could not compute early-release nominal-q distance: %s", exc)
+                                        early_release_arm_ready = bool(
+                                            phase_reanchor_early_release_arm_q_error is not None
+                                            and phase_reanchor_early_release_arm_q_error <= early_release_arm_limit
+                                        )
+                                        (
+                                            phase_reanchor_bridge_contact_ready,
+                                            phase_reanchor_bridge_contact_reason,
+                                            phase_reanchor_bridge_contact_handle_dist,
+                                            phase_reanchor_bridge_contact_handle_limit,
+                                        ) = _phase_reanchor_bridge_contact_status(
+                                            phase_reanchor_action_state,
+                                            args,
+                                        )
+                                        preload_enabled = bool(
+                                            getattr(args, "phase_reanchor_bridge_preload_validation", False)
+                                        )
+                                        phase_reanchor_bridge_preload_validated = not preload_enabled
+                                        phase_reanchor_bridge_preload_reason = (
+                                            "disabled" if not preload_enabled else "waiting_for_readiness"
+                                        )
+                                        phase_reanchor_bridge_preload_steps = int(
+                                            phase_reanchor_bridge_preload_count
+                                        )
+                                        phase_reanchor_bridge_preload_progress_delta = (
+                                            phase_reanchor_bridge_preload_progress_delta_last
+                                        )
+                                        phase_reanchor_bridge_preload_handle_dist = (
+                                            phase_reanchor_bridge_contact_handle_dist
+                                        )
+                                        phase_reanchor_bridge_preload_handle_limit = float(
+                                            getattr(args, "phase_reanchor_bridge_preload_handle_dist", 0.245)
+                                        )
+                                        preload_base_ready = bool(phase_reanchor_bridge_contact_ready)
+                                        if preload_enabled and preload_base_ready:
+                                            current_progress = None
+                                            try:
+                                                current_progress = float(task_state_before.get("drawer_open_distance"))
+                                                if not np.isfinite(current_progress):
+                                                    current_progress = None
+                                            except (TypeError, ValueError):
+                                                current_progress = None
+                                            if current_progress is None and progress_before is not None:
+                                                try:
+                                                    current_progress = float(progress_before)
+                                                except (TypeError, ValueError):
+                                                    current_progress = None
+                                            if (
+                                                phase_reanchor_bridge_preload_start_progress is None
+                                                and current_progress is not None
+                                                and np.isfinite(current_progress)
+                                            ):
+                                                phase_reanchor_bridge_preload_start_progress = float(current_progress)
+                                                phase_reanchor_bridge_preload_count = 0
+                                            phase_reanchor_bridge_preload_count += 1
+                                            phase_reanchor_bridge_preload_steps = int(
+                                                phase_reanchor_bridge_preload_count
+                                            )
+                                            if (
+                                                current_progress is not None
+                                                and phase_reanchor_bridge_preload_start_progress is not None
+                                            ):
+                                                phase_reanchor_bridge_preload_progress_delta = float(
+                                                    current_progress - phase_reanchor_bridge_preload_start_progress
+                                                )
+                                                phase_reanchor_bridge_preload_progress_delta_last = (
+                                                    phase_reanchor_bridge_preload_progress_delta
+                                                )
+                                            phase_reanchor_bridge_preload_handle_dist_last = (
+                                                phase_reanchor_bridge_preload_handle_dist
+                                            )
+                                            preload_min_steps = int(
+                                                getattr(args, "phase_reanchor_bridge_preload_steps", 8)
+                                            )
+                                            preload_warmed = bool(phase_reanchor_bridge_preload_steps >= preload_min_steps)
+                                            phase_reanchor_bridge_preload_progress_abs = current_progress
+                                            preload_progress_abs_ok = bool(
+                                                current_progress is not None
+                                                and current_progress >= float(
+                                                    getattr(
+                                                        args,
+                                                        "phase_reanchor_bridge_preload_progress_min_abs",
+                                                        0.0,
+                                                    )
+                                                )
+                                            )
+                                            preload_progress_ok = bool(
+                                                preload_warmed
+                                                and preload_progress_abs_ok
+                                                and phase_reanchor_bridge_preload_progress_delta is not None
+                                                and phase_reanchor_bridge_preload_progress_delta
+                                                >= float(
+                                                    getattr(
+                                                        args,
+                                                        "phase_reanchor_bridge_preload_progress_delta",
+                                                        0.0002,
+                                                    )
+                                                )
+                                            )
+                                            preload_handle_ok = bool(
+                                                phase_reanchor_bridge_preload_handle_dist is not None
+                                                and phase_reanchor_bridge_preload_handle_dist
+                                                <= phase_reanchor_bridge_preload_handle_limit
+                                            )
+                                            phase_reanchor_bridge_preload_progress_ok = bool(preload_progress_ok)
+                                            phase_reanchor_bridge_preload_handle_ok = bool(preload_handle_ok)
+                                            allow_handle_only = bool(
+                                                getattr(args, "phase_reanchor_bridge_preload_allow_handle_only", False)
+                                            )
+                                            phase_reanchor_bridge_preload_validated = bool(
+                                                phase_reanchor_bridge_preload_validated_latched
+                                                or preload_progress_ok
+                                                or (allow_handle_only and preload_handle_ok)
+                                            )
+                                            if phase_reanchor_bridge_preload_validated:
+                                                phase_reanchor_bridge_preload_validated_latched = True
+                                                phase_reanchor_bridge_preload_validation_source = (
+                                                    "drawer_progress"
+                                                    if preload_progress_ok
+                                                    else "strict_handle"
+                                                )
+                                                phase_reanchor_bridge_preload_reason = (
+                                                    "validated:drawer_progress"
+                                                    if preload_progress_ok
+                                                    else "validated:strict_handle"
+                                                )
+                                            elif phase_reanchor_bridge_preload_steps < preload_min_steps:
+                                                phase_reanchor_bridge_preload_reason = (
+                                                    f"warming:{phase_reanchor_bridge_preload_steps}/{preload_min_steps}"
+                                                )
+                                            elif preload_handle_ok and not bool(
+                                                getattr(args, "phase_reanchor_bridge_preload_allow_handle_only", False)
+                                            ):
+                                                phase_reanchor_bridge_preload_reason = (
+                                                    "waiting:strict_handle_without_progress"
+                                                )
+                                            else:
+                                                phase_reanchor_bridge_preload_reason = (
+                                                    "waiting:contact_preload_not_validated"
+                                                )
+                                            phase_reanchor_bridge_preload_reason_last = (
+                                                phase_reanchor_bridge_preload_reason
+                                            )
+                                        elif preload_enabled:
+                                            phase_reanchor_bridge_preload_start_progress = None
+                                            phase_reanchor_bridge_preload_count = 0
+                                            phase_reanchor_bridge_preload_validated_latched = False
+                                            phase_reanchor_bridge_preload_progress_delta_last = None
+                                            phase_reanchor_bridge_preload_handle_dist_last = (
+                                                phase_reanchor_bridge_preload_handle_dist
+                                            )
+                                            phase_reanchor_bridge_preload_steps = 0
+                                            phase_reanchor_bridge_preload_progress_delta = None
+                                            phase_reanchor_bridge_preload_progress_abs = None
+                                            phase_reanchor_bridge_preload_progress_ok = False
+                                            phase_reanchor_bridge_preload_handle_ok = False
+                                            phase_reanchor_bridge_preload_validation_source = None
+                                            phase_reanchor_bridge_preload_reason_last = (
+                                                phase_reanchor_bridge_preload_reason
+                                            )
+                                        if (
+                                            phase_reanchor_steps_left > 0
+                                            and early_release_elapsed >= early_release_min_steps
+                                            and bool(early_release_live_ready)
+                                            and bool(phase_reanchor_bridge_contact_ready)
+                                            and bool(phase_reanchor_bridge_preload_validated)
+                                            and early_release_resume_ready
+                                            and early_release_arm_ready
+                                        ):
+                                            phase_reanchor_steps_left = 0
+                                            phase_reanchor_early_release_triggered = True
+                                            phase_reanchor_early_release_reason = (
+                                                "live_resume_arm_window_bridge_contact_ready"
+                                            )
+                                            phase_reanchor_early_release_grace_left = max(
+                                                phase_reanchor_early_release_grace_left,
+                                                int(
+                                                    getattr(
+                                                        args,
+                                                        "phase_reanchor_early_release_act_grace_steps",
+                                                        16,
+                                                    )
+                                                ),
+                                            )
+                                            phase_bridge_monitor_steps = max(
+                                                int(
+                                                    getattr(
+                                                        args,
+                                                        "post_recovery_act_bridge_no_progress_monitor_steps",
+                                                        0,
+                                                    )
+                                                ),
+                                                int(
+                                                    getattr(
+                                                        args,
+                                                        "phase_reanchor_early_release_act_grace_steps",
+                                                        16,
+                                                    )
+                                                ),
+                                            )
+                                            if phase_bridge_monitor_steps > 0:
+                                                post_recovery_act_bridge_steps_left = max(
+                                                    post_recovery_act_bridge_steps_left,
+                                                    phase_bridge_monitor_steps,
+                                                )
+                                                post_recovery_act_bridge_total_steps = max(
+                                                    post_recovery_act_bridge_total_steps,
+                                                    phase_bridge_monitor_steps,
+                                                )
+                                                post_recovery_act_bridge_progress_best = None
+                                                post_recovery_act_bridge_no_progress_count = 0
+                                            post_recovery_task_guard_steps_left = 0
+                                            post_recovery_no_progress_count = 0
+                                        elif phase_reanchor_early_release_arm_q_error is not None:
+                                            phase_reanchor_early_release_reason = (
+                                                f"waiting:live={bool(early_release_live_ready)};"
+                                                f"bridge_contact={bool(phase_reanchor_bridge_contact_ready)};"
+                                                f"bridge_contact_reason={phase_reanchor_bridge_contact_reason};"
+                                                f"preload={bool(phase_reanchor_bridge_preload_validated)};"
+                                                f"preload_reason={phase_reanchor_bridge_preload_reason};"
+                                                f"resume={early_release_resume_ready};"
+                                                f"arm={early_release_arm_ready};"
+                                                f"elapsed={early_release_elapsed}"
+                                            )
+                                        else:
+                                            phase_reanchor_early_release_reason = (
+                                                f"waiting:live={bool(early_release_live_ready)};"
+                                                f"bridge_contact={bool(phase_reanchor_bridge_contact_ready)};"
+                                                f"bridge_contact_reason={phase_reanchor_bridge_contact_reason};"
+                                                f"resume={early_release_resume_ready};"
+                                                f"arm_unavailable;elapsed={early_release_elapsed}"
+                                            )
+                                    if live_taskspace_stop_requested:
+                                        post_recovery_task_guard_steps_left = 0
+                                        phase_reanchor_steps_left = 0
                                     if phase_reanchor_steps_left <= 0:
-                                        phase_reanchor_cooldown_left = int(args.phase_reanchor_cooldown_steps)
-                                        phase_reanchor_reset_after_step = True
+                                        (
+                                            phase_reanchor_live_release_ready,
+                                            phase_reanchor_live_release_reason,
+                                            phase_reanchor_live_release_target_error,
+                                            phase_reanchor_live_release_handle_dist,
+                                        ) = _phase_reanchor_live_release_status(
+                                            phase_reanchor_action_state,
+                                            args,
+                                        )
+                                        can_extend_live = (
+                                            bool(getattr(args, "phase_reanchor_live_extend_on_not_ready", True))
+                                            and not bool(phase_reanchor_live_release_ready)
+                                            and phase_reanchor_live_extension_count
+                                            < int(getattr(args, "phase_reanchor_live_max_extensions", 3))
+                                        )
+                                        if can_extend_live:
+                                            extend_steps = max(
+                                                1,
+                                                int(getattr(args, "phase_reanchor_live_extend_steps", 16)),
+                                            )
+                                            phase_reanchor_live_extension_count += 1
+                                            phase_reanchor_steps_left = extend_steps
+                                            phase_reanchor_cooldown_left = 0
+                                            phase_reanchor_reset_after_step = False
+                                            phase_reanchor_suppress_q_servo_steps_left = max(
+                                                phase_reanchor_suppress_q_servo_steps_left,
+                                                extend_steps,
+                                            )
+                                            phase_reanchor_taskspace_worsen_count = 0
+                                            post_recovery_task_guard_steps_left = max(
+                                                post_recovery_task_guard_steps_left,
+                                                extend_steps,
+                                            )
+                                            phase_reanchor_live_extension_started = True
+                                            live_taskspace_suppress_q_servo = True
+                                        else:
+                                            phase_reanchor_live_extension_budget_exhausted = (
+                                                not bool(phase_reanchor_live_release_ready)
+                                            )
+                                            phase_reanchor_cooldown_left = int(args.phase_reanchor_cooldown_steps)
+                                            phase_reanchor_reset_after_step = True
                                     safety_info = dict(safety_info)
                                     safety_info.update(
                                         {
@@ -9655,10 +6680,109 @@ def main():
                                             ),
                                             "deformation_source": "phase_reanchor",
                                             "phase_reanchor_steps_left": int(phase_reanchor_steps_left),
+                                            "phase_reanchor_phase": reanchor_info.get("phase"),
                                             "phase_reanchor_base_cmd_xy": reanchor_info.get("base_cmd_xy"),
+                                            "phase_reanchor_base_cmd_normalized_xy": reanchor_info.get("base_cmd_normalized_xy"),
+                                            "phase_reanchor_base_cmd_effective_raw_xy": reanchor_info.get("base_cmd_effective_raw_xy"),
+                                            "phase_reanchor_base_cmd_clip_delta_norm": reanchor_info.get("base_cmd_clip_delta_norm"),
                                             "phase_reanchor_ee_error_xy": reanchor_info.get("ee_error_xy"),
                                             "phase_reanchor_drawer_fraction": reanchor_info.get("drawer_open_fraction"),
                                             "phase_reanchor_ee_to_handle_dist": reanchor_info.get("ee_to_handle_dist"),
+                                            "phase_reanchor_ee_to_target_dist": reanchor_info.get("ee_to_target_dist"),
+                                            "phase_reanchor_task_point_source": reanchor_info.get("task_point_source"),
+                                            "phase_reanchor_task_point_requested_source": reanchor_info.get("task_point_requested_source"),
+                                            "phase_reanchor_task_point_fallback_reason": reanchor_info.get("task_point_fallback_reason"),
+                                            "phase_reanchor_control_task_point_source": reanchor_info.get("control_task_point_source"),
+                                            "phase_reanchor_control_task_point_requested_source": reanchor_info.get("control_task_point_requested_source"),
+                                            "phase_reanchor_control_task_point_fallback_reason": reanchor_info.get("control_task_point_fallback_reason"),
+                                            "phase_reanchor_control_ee_to_handle_dist": reanchor_info.get("control_ee_to_handle_dist"),
+                                            "phase_reanchor_control_ee_to_target_dist": reanchor_info.get("control_ee_to_target_dist"),
+                                            "phase_reanchor_control_error_source": reanchor_info.get("control_error_source"),
+                                            "phase_reanchor_site_ee_to_handle_dist": reanchor_info.get("site_ee_to_handle_dist"),
+                                            "phase_reanchor_site_ee_to_target_dist": reanchor_info.get("site_ee_to_target_dist"),
+                                            "phase_reanchor_gripper_to_handle_dist": reanchor_info.get("gripper_to_handle_dist"),
+                                            "phase_reanchor_gripper_to_target_dist": reanchor_info.get("gripper_to_target_dist"),
+                                            "phase_reanchor_gripper_site_xy_error": reanchor_info.get("gripper_site_xy_error"),
+                                            "phase_reanchor_task_point_geometry_untrusted": reanchor_info.get("task_point_geometry_untrusted"),
+                                            "phase_reanchor_handle_assist_enabled": reanchor_info.get("handle_assist_enabled"),
+                                            "phase_reanchor_handle_assist_reason": reanchor_info.get("handle_assist_reason"),
+                                            "phase_reanchor_handle_assist_error_norm": reanchor_info.get("handle_assist_error_norm"),
+                                            "phase_reanchor_handle_assist_base_cmd_xy": reanchor_info.get("handle_assist_base_cmd_xy"),
+                                            "phase_reanchor_preload_gripper_forced": reanchor_info.get("preload_gripper_forced"),
+                                            "phase_reanchor_preload_gripper_limit": reanchor_info.get("preload_gripper_limit"),
+                                            "phase_reanchor_preload_target_grasp": reanchor_info.get("preload_target_grasp"),
+                                            "phase_reanchor_preload_grasp_limit": reanchor_info.get("preload_grasp_limit"),
+                                            "phase_reanchor_arm_hold_enabled": reanchor_info.get("arm_hold_enabled"),
+                                            "phase_reanchor_arm_hold_reason": reanchor_info.get("arm_hold_reason"),
+                                            "phase_reanchor_arm_servo_enabled": reanchor_info.get("arm_servo_enabled"),
+                                            "phase_reanchor_arm_servo_reason": reanchor_info.get("arm_servo_reason"),
+                                            "phase_reanchor_arm_servo_rank": reanchor_info.get("arm_servo_rank"),
+                                            "phase_reanchor_arm_servo_error_norm": reanchor_info.get("arm_servo_error_norm"),
+                                            "phase_reanchor_arm_servo_delta_norm": reanchor_info.get("arm_servo_delta_norm"),
+                                            "phase_reanchor_arm_servo_command_norm": reanchor_info.get("arm_servo_command_norm"),
+                                            "phase_reanchor_arm_servo_action_delta_norm": reanchor_info.get("arm_servo_action_delta_norm"),
+                                            "phase_reanchor_arm_servo_target_source": reanchor_info.get("arm_servo_target_source"),
+                                            "phase_reanchor_arm_servo_target_episode": reanchor_info.get("arm_servo_target_episode"),
+                                            "phase_reanchor_arm_servo_target_start_step": reanchor_info.get("arm_servo_target_start_step"),
+                                            "phase_reanchor_arm_servo_target_step": reanchor_info.get("arm_servo_target_step"),
+                                            "phase_reanchor_arm_servo_target_window_index": reanchor_info.get("arm_servo_target_window_index"),
+                                            "phase_reanchor_arm_servo_target_window_score": reanchor_info.get("arm_servo_target_window_score"),
+                                            "phase_reanchor_nominal_reentry_selection_reason": phase_reanchor_action_state.get("nominal_reentry_selection_reason") if isinstance(phase_reanchor_action_state, dict) else None,
+                                            "phase_reanchor_nominal_reentry_live_target_distance": phase_reanchor_action_state.get("nominal_reentry_live_target_distance") if isinstance(phase_reanchor_action_state, dict) else None,
+                                            "phase_reanchor_live_taskspace_guard_active": live_taskspace_guard_active,
+                                            "phase_reanchor_live_taskspace_suppress_q_servo": live_taskspace_suppress_q_servo,
+                                            "phase_reanchor_live_taskspace_suppress_q_servo_reason": live_taskspace_suppress_q_servo_reason,
+                                            "phase_reanchor_live_taskspace_distance": live_taskspace_distance,
+                                            "phase_reanchor_live_taskspace_distance_source": live_taskspace_distance_source,
+                                            "phase_reanchor_live_taskspace_best_distance": phase_reanchor_best_target_distance,
+                                            "phase_reanchor_live_taskspace_worsen_count": int(phase_reanchor_taskspace_worsen_count),
+                                            "phase_reanchor_live_taskspace_stop_requested": live_taskspace_stop_requested,
+                                            "phase_reanchor_live_taskspace_stop_reason": live_taskspace_stop_reason,
+                                            "phase_reanchor_live_taskspace_elapsed_steps": int(live_taskspace_elapsed_steps),
+                                            "phase_reanchor_live_release_ready": phase_reanchor_live_release_ready,
+                                            "phase_reanchor_live_release_reason": phase_reanchor_live_release_reason,
+                                            "phase_reanchor_live_release_target_error": phase_reanchor_live_release_target_error,
+                                            "phase_reanchor_live_release_handle_dist": phase_reanchor_live_release_handle_dist,
+                                            "phase_reanchor_live_extension_started": phase_reanchor_live_extension_started,
+                                            "phase_reanchor_live_extension_count": int(phase_reanchor_live_extension_count),
+                                            "phase_reanchor_live_extension_budget_exhausted": phase_reanchor_live_extension_budget_exhausted,
+                                            "phase_reanchor_early_release_triggered": phase_reanchor_early_release_triggered,
+                                            "phase_reanchor_early_release_reason": phase_reanchor_early_release_reason,
+                                            "phase_reanchor_early_release_arm_q_error": phase_reanchor_early_release_arm_q_error,
+                                            "phase_reanchor_bridge_contact_ready": phase_reanchor_bridge_contact_ready,
+                                            "phase_reanchor_bridge_contact_reason": phase_reanchor_bridge_contact_reason,
+                                            "phase_reanchor_bridge_contact_handle_dist": phase_reanchor_bridge_contact_handle_dist,
+                                            "phase_reanchor_bridge_contact_handle_limit": phase_reanchor_bridge_contact_handle_limit,
+                                            "phase_reanchor_bridge_preload_validated": phase_reanchor_bridge_preload_validated,
+                                            "phase_reanchor_bridge_preload_reason": phase_reanchor_bridge_preload_reason,
+                                            "phase_reanchor_bridge_preload_steps": phase_reanchor_bridge_preload_steps,
+                                            "phase_reanchor_bridge_preload_progress_delta": phase_reanchor_bridge_preload_progress_delta,
+                                            "phase_reanchor_bridge_preload_progress_abs": phase_reanchor_bridge_preload_progress_abs,
+                                            "phase_reanchor_bridge_preload_handle_dist": phase_reanchor_bridge_preload_handle_dist,
+                                            "phase_reanchor_bridge_preload_handle_limit": phase_reanchor_bridge_preload_handle_limit,
+                                            "phase_reanchor_bridge_preload_progress_ok": phase_reanchor_bridge_preload_progress_ok,
+                                            "phase_reanchor_bridge_preload_handle_ok": phase_reanchor_bridge_preload_handle_ok,
+                                            "phase_reanchor_bridge_preload_validation_source": phase_reanchor_bridge_preload_validation_source,
+                                            "phase_reanchor_preload_pull_probe_enabled": reanchor_info.get("preload_pull_probe_enabled"),
+                                            "phase_reanchor_preload_pull_probe_reason": reanchor_info.get("preload_pull_probe_reason"),
+                                            "phase_reanchor_preload_pull_probe_axis_xy": reanchor_info.get("preload_pull_probe_axis_xy"),
+                                            "phase_reanchor_preload_pull_probe_step": reanchor_info.get("preload_pull_probe_step"),
+                                            "phase_reanchor_preload_pull_probe_delta_norm": reanchor_info.get("preload_pull_probe_delta_norm"),
+                                            "phase_reanchor_early_release_act_grace": bool(phase_reanchor_early_release_grace_left > 0),
+                                            "phase_reanchor_early_release_act_grace_steps": int(phase_reanchor_early_release_grace_left),
+                                            "phase_reanchor_live_ee_servo_enabled": reanchor_info.get("live_ee_servo_enabled"),
+                                            "phase_reanchor_live_ee_servo_reason": reanchor_info.get("live_ee_servo_reason"),
+                                            "phase_reanchor_live_ee_servo_error_norm": reanchor_info.get("live_ee_servo_error_norm"),
+                                            "phase_reanchor_live_ee_servo_delta_norm": reanchor_info.get("live_ee_servo_delta_norm"),
+                                            "phase_reanchor_live_ee_servo_command_norm": reanchor_info.get("live_ee_servo_command_norm"),
+                                            "phase_reanchor_live_ee_servo_jacobian_rank": reanchor_info.get("live_ee_servo_jacobian_rank"),
+                                            "phase_reanchor_live_ee_servo_nominal_reg": reanchor_info.get("live_ee_servo_nominal_reg"),
+                                            "phase_reanchor_live_ee_servo_fk_site_xy_error": reanchor_info.get("live_ee_servo_fk_site_xy_error"),
+                                            "phase_reanchor_live_ee_servo_fk_gripper_xy_error": reanchor_info.get("live_ee_servo_fk_gripper_xy_error"),
+                                            "phase_reanchor_live_ee_servo_predicted_error_before": reanchor_info.get("live_ee_servo_predicted_error_before"),
+                                            "phase_reanchor_live_ee_servo_predicted_error_after": reanchor_info.get("live_ee_servo_predicted_error_after"),
+                                            "phase_reanchor_live_ee_servo_geometry_untrusted": reanchor_info.get("live_ee_servo_geometry_untrusted"),
+                                            "phase_reanchor_suppressed_q_servo_arm_hold": reanchor_info.get("suppressed_q_servo_arm_hold"),
                                             "phase_reanchor_rejected": False,
                                             "phase_reanchor_acceptance_type": (
                                                 reanchor_acceptance or {}
@@ -9739,6 +6863,7 @@ def main():
                         post_recovery_task_guard_steps_left > 0
                         or post_recovery_reanchor_started
                         or post_recovery_progress_regression is not None
+                        or post_recovery_no_progress_triggered
                         or (
                             post_recovery_task_guard_reason is not None
                             and phase_reanchor_steps_left > 0
@@ -9746,6 +6871,155 @@ def main():
                     )
                 )
                 safety_info = dict(safety_info)
+                for _resume_key, _resume_value in resume_affordance_context.items():
+                    safety_info.setdefault(_resume_key, _resume_value)
+                act_reentry_diag = {}
+                act_reentry_diag_active = bool(
+                    post_recovery_task_guard_active
+                    or _safe_info_get(safety_info, "deformation_source") == "phase_reanchor"
+                    or _safe_info_get(safety_info, "safety_mode") == "phase_reanchor"
+                )
+                if act_reentry_diag_active:
+                    act_reentry_diag["act_reentry_diag_active"] = True
+                    try:
+                        act_first_arr = np.asarray(first_action, dtype=np.float32).reshape(-1)
+                        safe_first_arr = np.asarray(safe_first_action, dtype=np.float32).reshape(-1)
+                        dim = min(act_first_arr.size, safe_first_arr.size)
+                        if dim > 0:
+                            a = act_first_arr[:dim]
+                            b = safe_first_arr[:dim]
+                            delta = b - a
+                            denom = float(np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+                            act_reentry_diag.update(
+                                {
+                                    "act_reentry_diag_act_first_vs_safe_l2": float(np.linalg.norm(delta)),
+                                    "act_reentry_diag_act_first_vs_safe_max_abs": float(np.max(np.abs(delta))),
+                                    "act_reentry_diag_act_first_vs_safe_cosine": float(np.dot(a, b) / denom),
+                                    "act_reentry_diag_act_first_vs_safe_dim": int(dim),
+                                    "act_resume_diag_active": True,
+                                    "act_resume_diag_query_step": int(step),
+                                    "act_resume_diag_predicted_first_action_norm": float(np.linalg.norm(a)),
+                                    "act_resume_diag_target_first_action_norm": float(np.linalg.norm(b)),
+                                    "act_resume_diag_executed_vs_act_first_l2": float(np.linalg.norm(delta)),
+                                    "act_resume_diag_executed_vs_act_first_max_abs": float(np.max(np.abs(delta))),
+                                    "act_resume_diag_executed_vs_act_first_cosine": float(np.dot(a, b) / denom),
+                                    "act_resume_diag_executed_vs_act_first_dim": int(dim),
+                                }
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        act_reentry_diag["act_reentry_diag_error"] = repr(exc)
+                    if isinstance(policy_obs, dict):
+                        low_dim = policy_obs.get("low_dim_state")
+                        if low_dim is not None:
+                            try:
+                                low_arr = np.asarray(low_dim, dtype=np.float32).reshape(-1)
+                                low_arr = low_arr[np.isfinite(low_arr)]
+                                if low_arr.size:
+                                    act_reentry_diag.update(
+                                        {
+                                            "act_reentry_diag_policy_low_dim_dim": int(low_arr.size),
+                                            "act_reentry_diag_policy_low_dim_norm": float(np.linalg.norm(low_arr)),
+                                            "act_reentry_diag_policy_low_dim_mean": float(np.mean(low_arr)),
+                                            "act_reentry_diag_policy_low_dim_std": float(np.std(low_arr)),
+                                            "act_reentry_diag_policy_low_dim_max_abs": float(np.max(np.abs(low_arr))),
+                                        }
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                act_reentry_diag["act_reentry_diag_low_dim_error"] = repr(exc)
+                        image_means = []
+                        image_stds = []
+                        image_max_abs = []
+                        for obs_key, obs_value in policy_obs.items():
+                            obs_key_str = str(obs_key)
+                            if not (
+                                obs_key_str.startswith("rgb_")
+                                or "camera" in obs_key_str
+                                or "image" in obs_key_str
+                            ):
+                                continue
+                            try:
+                                image_arr = np.asarray(obs_value, dtype=np.float32)
+                                if image_arr.size == 0:
+                                    continue
+                                if np.nanmax(np.abs(image_arr)) > 2.0:
+                                    image_arr = image_arr / 255.0
+                                finite = image_arr[np.isfinite(image_arr)]
+                                if finite.size == 0:
+                                    continue
+                                image_means.append(float(np.mean(finite)))
+                                image_stds.append(float(np.std(finite)))
+                                image_max_abs.append(float(np.max(np.abs(finite))))
+                            except Exception:  # noqa: BLE001
+                                continue
+                        if image_means:
+                            act_reentry_diag.update(
+                                {
+                                    "act_reentry_diag_image_key_count": int(len(image_means)),
+                                    "act_reentry_diag_image_mean_mean": float(np.mean(image_means)),
+                                    "act_reentry_diag_image_std_mean": float(np.mean(image_stds)),
+                                    "act_reentry_diag_image_max_abs_mean": float(np.mean(image_max_abs)),
+                                }
+                            )
+
+                action_agreement_info = {
+                    "act_action_agreement_logged": False,
+                    "act_action_agreement_pair_count": 0,
+                    "act_action_agreement_post_recovery_or_reentry": bool(act_reentry_diag_active),
+                }
+                action_agreement_context = (
+                    _safe_info_get(safety_info, "safety_mode")
+                    or _safe_info_get(safety_info, "mode")
+                    or _safe_info_get(safety_info, "deformation_source")
+                    or "pass_through"
+                )
+                if post_recovery_act_bridge_active:
+                    action_agreement_context = "act_bridge"
+                elif act_reentry_diag_active:
+                    action_agreement_context = "post_recovery_or_reentry"
+                action_agreement_info["act_action_agreement_context"] = str(action_agreement_context)
+                act_first_for_agreement = _first_action_or_none(env_action)
+                safe_first_for_agreement = _first_action_or_none(safe_env_action)
+                nominal_first_for_agreement = _first_action_or_none(env_action)
+                target_first_for_agreement = act_resume_diag_target_first_action
+                last_recovery_first_for_agreement = _first_action_or_none(
+                    last_recovery_first_action_for_bridge
+                )
+                handoff_release_first_for_agreement = _first_action_or_none(
+                    handoff_release_first_action_for_bridge
+                )
+                handoff_release_executed_for_agreement = _first_action_or_none(
+                    handoff_release_executed_action_for_bridge
+                )
+                action_agreement_pairs = (
+                    (act_first_for_agreement, safe_first_for_agreement, "act_action_agreement_act_vs_safe"),
+                    (act_first_for_agreement, nominal_first_for_agreement, "act_action_agreement_act_vs_nominal"),
+                    (safe_first_for_agreement, nominal_first_for_agreement, "act_action_agreement_safe_vs_nominal"),
+                    (act_first_for_agreement, target_first_for_agreement, "act_action_agreement_act_vs_target"),
+                    (safe_first_for_agreement, target_first_for_agreement, "act_action_agreement_safe_vs_target"),
+                    (act_first_for_agreement, last_recovery_first_for_agreement, "act_action_agreement_act_vs_last_recovery"),
+                    (safe_first_for_agreement, last_recovery_first_for_agreement, "act_action_agreement_safe_vs_last_recovery"),
+                    (act_first_for_agreement, handoff_release_first_for_agreement, "act_action_agreement_act_vs_handoff_release"),
+                    (safe_first_for_agreement, handoff_release_first_for_agreement, "act_action_agreement_safe_vs_handoff_release"),
+                    (act_first_for_agreement, handoff_release_executed_for_agreement, "act_action_agreement_act_vs_executed_handoff_release"),
+                    (safe_first_for_agreement, handoff_release_executed_for_agreement, "act_action_agreement_safe_vs_executed_handoff_release"),
+                )
+                action_agreement_pair_count = 0
+                for _lhs_action, _rhs_action, _agreement_prefix in action_agreement_pairs:
+                    _agreement_metrics = _action_agreement_metrics(
+                        _lhs_action,
+                        _rhs_action,
+                        _agreement_prefix,
+                        arm_indices=arm_idx,
+                        gripper_index=latch_dim,
+                    )
+                    if _agreement_metrics:
+                        action_agreement_info.update(_agreement_metrics)
+                        action_agreement_pair_count += 1
+                action_agreement_info["act_action_agreement_pair_count"] = int(action_agreement_pair_count)
+                action_agreement_info["act_action_agreement_logged"] = bool(
+                    action_agreement_pair_count > 0
+                )
+
                 safety_info.update(
                     {
                         "gripper_latched": bool(gripper_latched),
@@ -9758,8 +7032,39 @@ def main():
                         "post_recovery_task_guard_best_progress": post_recovery_task_guard_best_progress,
                         "post_recovery_progress_regression": post_recovery_progress_regression,
                         "post_recovery_reanchor_started": bool(post_recovery_reanchor_started),
+                        "post_recovery_no_progress_count": int(post_recovery_no_progress_count),
+                        "post_recovery_mid_progress_no_progress_count": int(
+                            post_recovery_mid_progress_no_progress_count
+                        ),
+                        "post_recovery_mid_progress_best_progress": post_recovery_mid_progress_best_progress,
+                        "post_recovery_mid_progress_best_distance": post_recovery_mid_progress_best_distance,
+                        "post_recovery_mid_progress_distance_regression": post_recovery_mid_progress_distance_regression,
+                        "post_recovery_mid_progress_reseed_triggered": bool(
+                            post_recovery_mid_progress_reseed_triggered
+                        ),
+                        "post_recovery_mid_progress_reseed_reset_count": int(
+                            post_recovery_mid_progress_reseed_reset_count
+                        ),
+                        "post_recovery_mid_progress_reseed_reason": post_recovery_mid_progress_reseed_reason,
+                        "post_recovery_mid_progress_prior_action_seed_count": int(
+                            post_recovery_mid_progress_prior_action_seed_count
+                        ),
+                        "post_recovery_mid_progress_prior_action_seed_step": post_recovery_mid_progress_prior_action_seed_step,
+                        "post_recovery_mid_progress_prior_action_seed_age": post_recovery_mid_progress_prior_action_seed_age,
+                        "post_recovery_no_progress_triggered": bool(post_recovery_no_progress_triggered),
+                        "post_recovery_no_progress_target_distance": post_recovery_no_progress_target_distance,
+                        "post_recovery_no_progress_distance_source": post_recovery_no_progress_distance_source,
+                        "post_recovery_act_bridge_active": bool(post_recovery_act_bridge_active),
+                        "post_recovery_act_bridge_steps_left": int(post_recovery_act_bridge_steps_left),
+                        "post_recovery_act_bridge_total_steps": int(post_recovery_act_bridge_total_steps),
+                        "post_recovery_act_bridge_step_index": post_recovery_act_bridge_step_index,
+                        "post_recovery_act_bridge_last_recovery_step": last_recovery_action_step_for_bridge,
+                        **act_reentry_diag,
+                        **action_agreement_info,
                     }
                 )
+                if post_recovery_act_bridge_active:
+                    safety_info.update(action_bridge_info)
 
                 if (
                     trajectory_logging_enabled
@@ -9796,6 +7101,25 @@ def main():
                         episode_chunk_trajectory_records.append(trace_record)
                         all_chunk_trajectory_records.append(trace_record)
 
+                if nominal_rollout_diagnostic_context is not None and chunk_trace_context is not None:
+                    try:
+                        safe_diag_chunk, _ = _as_chunk(safe_env_action)
+                        safe_q_seq_diag = np.asarray(
+                            safechunk.deform.rollout_nominal_chunk(
+                                chunk_trace_context["obs"],
+                                safe_diag_chunk,
+                            ),
+                            dtype=np.float32,
+                        )
+                        nominal_rollout_diagnostic_context["safe_rollout_shape"] = list(safe_q_seq_diag.shape)
+                        nominal_rollout_diagnostic_context["safe_pred_q_next"] = _first_rollout_state(safe_q_seq_diag)
+                        nominal_rollout_diagnostic_context["safe_first_action"] = np.asarray(
+                            safe_diag_chunk[0],
+                            dtype=np.float32,
+                        ).reshape(-1).copy()
+                    except Exception as exc:  # noqa: BLE001
+                        nominal_rollout_diagnostic_context["safe_rollout_error"] = repr(exc)
+
                 saved_episode_actions.append(
                     np.asarray(safe_env_action, dtype=np.float32).copy()
                 )
@@ -9808,34 +7132,587 @@ def main():
                     and not last_safety_intervention_active
                 )
 
-                env_step_t0 = time.perf_counter()
-                obs, reward, terminated, truncated, info = env.step(safe_env_action)
-                env_step_time_ms = 1000.0 * (time.perf_counter() - env_step_t0)
-                policy_obs_update_time_ms = 0.0
-                if policy_env is None:
-                    policy_obs_update_t0 = time.perf_counter()
-                    if args.hide_human_arm_policy_obs:
-                        policy_obs = _policy_obs_with_hidden_human_arm(
-                            env,
-                            obs,
-                            prev_policy_obs=policy_obs,
-                        )
-                    else:
-                        policy_obs = obs
-                    policy_obs_update_time_ms = 1000.0 * (time.perf_counter() - policy_obs_update_t0)
-                else:
-                    policy_env_step_t0 = time.perf_counter()
-                    policy_obs, _policy_reward, policy_terminated, policy_truncated, _policy_info = policy_env.step(
-                        safe_env_action
+                brake_execution_active = (
+                    replay_actions is None
+                    and _is_brake_or_fallback_execution(safety_info)
+                )
+                brake_action_history_reset_count = 0
+                brake_low_level_hold_sync_count = 0
+                brake_robot_freeze_count = 0
+                brake_temporal_ensemble_records = []
+                phase_reanchor_temporal_ensemble_bypass = False
+                phase_reanchor_temporal_ensemble_bypass_count = 0
+                if brake_execution_active:
+                    brake_action_history_reset_count = _reset_action_sequence_history(env)
+                    brake_low_level_hold_sync_count = _sync_robot_low_level_hold_state(env)
+                    brake_robot_freeze_count = _set_robot_freeze_next_step(env)
+                    brake_temporal_ensemble_records.extend(
+                        _set_action_sequence_temporal_ensemble(env, False)
                     )
-                    env_step_time_ms += 1000.0 * (time.perf_counter() - policy_env_step_t0)
-                    if (policy_terminated or policy_truncated) and not (
-                        terminated or truncated or extract_success(info, float(reward), bool(terminated))
-                    ):
-                        print(
-                            "Warning: clean policy env ended before eval env; "
-                            "policy/eval states may have diverged."
+                    if policy_env is not None:
+                        brake_action_history_reset_count += _reset_action_sequence_history(policy_env)
+                        brake_low_level_hold_sync_count += _sync_robot_low_level_hold_state(policy_env)
+                        brake_robot_freeze_count += _set_robot_freeze_next_step(policy_env)
+                        brake_temporal_ensemble_records.extend(
+                            _set_action_sequence_temporal_ensemble(policy_env, False)
                         )
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "brake_temporal_ensemble_bypass": True,
+                            "brake_action_history_reset_count": int(brake_action_history_reset_count),
+                            "brake_low_level_hold_sync_count": int(brake_low_level_hold_sync_count),
+                            "brake_robot_freeze_count": int(brake_robot_freeze_count),
+                        }
+                    )
+
+                phase_reanchor_execution_active = (
+                    replay_actions is None
+                    and bool(getattr(args, "phase_reanchor_bypass_temporal_ensemble", False))
+                    and (
+                        _safe_info_get(safety_info, "deformation_source") == "phase_reanchor"
+                        or _safe_info_get(safety_info, "safety_mode") == "phase_reanchor"
+                        or _safe_info_get(safety_info, "mode") == "phase_reanchor"
+                    )
+                )
+                if phase_reanchor_execution_active:
+                    phase_records = _set_action_sequence_temporal_ensemble(env, False)
+                    phase_reanchor_temporal_ensemble_bypass_count += len(phase_records)
+                    brake_temporal_ensemble_records.extend(phase_records)
+                    if policy_env is not None:
+                        phase_records = _set_action_sequence_temporal_ensemble(policy_env, False)
+                        phase_reanchor_temporal_ensemble_bypass_count += len(phase_records)
+                        brake_temporal_ensemble_records.extend(phase_records)
+                    phase_reanchor_temporal_ensemble_bypass = bool(
+                        phase_reanchor_temporal_ensemble_bypass_count > 0
+                    )
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "phase_reanchor_temporal_ensemble_bypass": phase_reanchor_temporal_ensemble_bypass,
+                            "phase_reanchor_temporal_ensemble_bypass_count": int(
+                                phase_reanchor_temporal_ensemble_bypass_count
+                            ),
+                        }
+                    )
+
+                ablation_force_sequence_applied_this_step = False
+                ablation_force_sequence_this_step_q = None
+                ablation_force_sequence_this_step_qvel = None
+                ablation_force_sequence_this_step_indices = None
+                if (
+                    pending_ablation_force_q_sequence is not None
+                    and replay_actions is None
+                    and chunk_filter_mode
+                ):
+                    try:
+                        q_seq_arr = np.asarray(pending_ablation_force_q_sequence, dtype=np.float64)
+                    except Exception:
+                        q_seq_arr = np.empty((0, 0), dtype=np.float64)
+                    qvel_seq_arr = (
+                        np.asarray(pending_ablation_force_q_sequence_qvel, dtype=np.float64)
+                        if pending_ablation_force_q_sequence_qvel is not None
+                        else None
+                    )
+                    seq_idx = int(pending_ablation_force_q_sequence_index)
+                    if q_seq_arr.ndim == 2 and 0 <= seq_idx < q_seq_arr.shape[0]:
+                        indices_arr = np.asarray(pending_ablation_force_q_sequence_indices, dtype=np.int64)
+                        frame_qvel = (
+                            qvel_seq_arr[seq_idx]
+                            if qvel_seq_arr is not None and seq_idx < qvel_seq_arr.shape[0]
+                            else None
+                        )
+                        forced_env_count = 0
+                        seen_envs = set()
+                        for candidate in (env, policy_env, safety_runtime_env):
+                            if candidate is None or id(candidate) in seen_envs:
+                                continue
+                            seen_envs.add(id(candidate))
+                            if _set_h1_q_for_ablation(
+                                candidate,
+                                q_seq_arr[seq_idx],
+                                indices_arr,
+                                zero_velocity=bool(
+                                    getattr(args, "ablation_force_planned_recovery_q_zero_velocity", True)
+                                ),
+                                target_qvel=frame_qvel,
+                            ):
+                                forced_env_count += 1
+                        sequence_action_source = None
+                        sequence_action_index = None
+                        sequence_nominal_action_used = False
+                        nominal_env_action = _ablation_nominal_env_action_for_sequence_step(
+                            pending_ablation_force_q_sequence_target_action,
+                            seq_idx,
+                            safe_env_action,
+                        )
+                        if nominal_env_action is not None:
+                            safe_env_action = nominal_env_action
+                            hold_indices = None
+                            hold_delta = None
+                            sequence_action_source = (
+                                pending_ablation_force_q_sequence_target_action_source
+                                or "recover_resume_window_target_action"
+                            )
+                            sequence_action_index = int(seq_idx)
+                            sequence_nominal_action_used = True
+                        else:
+                            try:
+                                safe_env_action, hold_indices, hold_delta = _hard_hold_action_from_live_robot(
+                                    env, safe_env_action
+                                )
+                                sequence_action_source = "live_hold"
+                            except Exception as exc:  # noqa: BLE001
+                                hold_indices = None
+                                hold_delta = None
+                                logger.debug("Could not hold during planned recovery q sequence ablation: %s", exc)
+                        safety_info = dict(safety_info)
+                        safety_info.update(
+                            {
+                                "safety_mode": "ablation_force_recovery_q_sequence",
+                                "mode": "ablation_force_recovery_q_sequence",
+                                "deformation_source": "ablation_force_recovery_q_sequence",
+                                "suppress_outer_pause": True,
+                                "ablation_force_planned_recovery_q_sequence_active": True,
+                                "ablation_force_planned_recovery_q_sequence_index": int(seq_idx),
+                                "ablation_force_planned_recovery_q_sequence_len": int(q_seq_arr.shape[0]),
+                                "ablation_force_planned_recovery_q_sequence_forced_env_count": int(forced_env_count),
+                                "ablation_force_planned_recovery_q_sequence_hold_delta": (
+                                    float(hold_delta) if hold_delta is not None else None
+                                ),
+                                "ablation_force_planned_recovery_q_sequence_hold_indices": hold_indices,
+                                "ablation_force_planned_recovery_q_sequence_qvel_seeded": bool(
+                                    frame_qvel is not None
+                                ),
+                                "ablation_force_planned_recovery_q_sequence_nominal_action_used": bool(
+                                    sequence_nominal_action_used
+                                ),
+                                "ablation_force_planned_recovery_q_sequence_action_source": sequence_action_source,
+                                "ablation_force_planned_recovery_q_sequence_action_index": sequence_action_index,
+                            }
+                        )
+                        pending_ablation_force_q_sequence_index = seq_idx + 1
+                        ablation_force_sequence_applied_this_step = True
+                        ablation_force_sequence_this_step_q = q_seq_arr[seq_idx].copy()
+                        ablation_force_sequence_this_step_qvel = (
+                            frame_qvel.copy() if frame_qvel is not None else None
+                        )
+                        ablation_force_sequence_this_step_indices = indices_arr.copy()
+                        safe_first_action = extract_first_action(safe_env_action)
+                        policy_hold_active = True
+                    else:
+                        pending_ablation_force_q_sequence = None
+
+                if (
+                    bool(getattr(args, "ablation_force_planned_recovery_q", False))
+                    and replay_actions is None
+                    and chunk_filter_mode
+                    and pending_ablation_force_q_sequence is None
+                    and not (
+                        bool(getattr(args, "ablation_force_planned_recovery_q_once_per_episode", True))
+                        and ablation_force_planned_recovery_q_done
+                    )
+                ):
+                    (
+                        safety_info,
+                        safe_env_action,
+                        ablation_force_applied,
+                        pending_ablation_policy_obs_history,
+                    ) = _maybe_force_planned_recovery_q_ablation(
+                        args=args,
+                        env=env,
+                        policy_env=policy_env,
+                        safety_runtime_env=safety_runtime_env,
+                        safechunk=safechunk,
+                        safety_info=safety_info,
+                        safe_env_action=safe_env_action,
+                    )
+                    if ablation_force_applied:
+                        ablation_force_planned_recovery_q_done = True
+                        q_sequence_payload = _safe_info_get(
+                            safety_info,
+                            "ablation_force_planned_recovery_q_replay_sequence_q",
+                        )
+                        sequence_enabled = bool(
+                            _safe_info_get(
+                                safety_info,
+                                "ablation_force_planned_recovery_q_replay_sequence_enabled",
+                            )
+                            and q_sequence_payload is not None
+                        )
+                        if sequence_enabled:
+                            pending_ablation_force_q_sequence = np.asarray(
+                                q_sequence_payload, dtype=np.float64
+                            )
+                            qvel_sequence_payload = _safe_info_get(
+                                safety_info,
+                                "ablation_force_planned_recovery_q_replay_sequence_qvel",
+                            )
+                            pending_ablation_force_q_sequence_qvel = (
+                                np.asarray(qvel_sequence_payload, dtype=np.float64)
+                                if qvel_sequence_payload is not None
+                                else None
+                            )
+                            pending_ablation_force_q_sequence_index = min(
+                                1, int(pending_ablation_force_q_sequence.shape[0])
+                            )
+                            pending_ablation_force_q_sequence_history = []
+                            pending_ablation_force_q_sequence_indices = _safe_info_get(
+                                safety_info,
+                                "ablation_force_planned_recovery_q_indices",
+                            )
+                            pending_ablation_force_q_sequence_target_action = _safe_info_get(
+                                safety_info,
+                                "recover_resume_window_target_action",
+                            )
+                            pending_ablation_force_q_sequence_target_action_source = (
+                                "recover_resume_window_target_action"
+                                if pending_ablation_force_q_sequence_target_action is not None
+                                else None
+                            )
+                            safety_info = dict(safety_info)
+                            safety_info.update(
+                                {
+                                    "ablation_force_planned_recovery_q_sequence_active": True,
+                                    "ablation_force_planned_recovery_q_sequence_index": 0,
+                                    "ablation_force_planned_recovery_q_sequence_len": int(
+                                        pending_ablation_force_q_sequence.shape[0]
+                                    ),
+                                }
+                            )
+                            ablation_force_sequence_applied_this_step = True
+                            ablation_force_sequence_this_step_q = pending_ablation_force_q_sequence[0].copy()
+                            ablation_force_sequence_this_step_qvel = (
+                                pending_ablation_force_q_sequence_qvel[0].copy()
+                                if pending_ablation_force_q_sequence_qvel is not None
+                                else None
+                            )
+                            ablation_force_sequence_this_step_indices = (
+                                np.asarray(pending_ablation_force_q_sequence_indices, dtype=np.int64)
+                                if pending_ablation_force_q_sequence_indices is not None
+                                else None
+                            )
+                        elif ablation_pure_act_resume_total_steps > 0:
+                            ablation_pure_act_resume_steps_left = max(
+                                int(ablation_pure_act_resume_steps_left),
+                                int(ablation_pure_act_resume_total_steps),
+                            )
+                            safety_info = dict(safety_info)
+                            safety_info.update(
+                                {
+                                    "ablation_pure_act_resume_enabled": True,
+                                    "ablation_pure_act_resume_scheduled_steps": int(
+                                        ablation_pure_act_resume_steps_left
+                                    ),
+                                    "ablation_pure_act_resume_total_steps": int(
+                                        ablation_pure_act_resume_total_steps
+                                    ),
+                                }
+                            )
+                        safe_first_action = extract_first_action(safe_env_action)
+                        policy_hold_active = True
+
+                if act_resume_diag_info:
+                    executed_first_action = _first_action_or_none(safe_env_action)
+                    act_first_action = _first_action_or_none(env_action)
+                    if executed_first_action is not None and act_first_action is not None:
+                        act_resume_diag_info.update(
+                            _vector_compare_metrics(
+                                executed_first_action,
+                                act_first_action,
+                                "act_resume_diag_executed_vs_act_first",
+                            )
+                        )
+                    if executed_first_action is not None and act_resume_diag_target_first_action is not None:
+                        act_resume_diag_info.update(
+                            _vector_compare_metrics(
+                                executed_first_action,
+                                act_resume_diag_target_first_action,
+                                "act_resume_diag_executed_vs_target",
+                            )
+                        )
+                    safety_info = dict(safety_info)
+                    safety_info.update(act_resume_diag_info)
+
+                mpc_replay_pre_mujoco_snapshot = None
+                if (
+                    mpc_replay_diagnostic_logging_enabled
+                    and len(all_mpc_replay_diagnostic_records) < max(0, int(args.mpc_replay_diagnostics_max_events))
+                    and _should_log_mpc_replay_diagnostic(safety_info)
+                ):
+                    mpc_replay_pre_mujoco_snapshot = _mujoco_state_snapshot(env)
+
+                try:
+                    env_step_t0 = time.perf_counter()
+                    obs, reward, terminated, truncated, info = env.step(safe_env_action)
+                    env_step_time_ms = 1000.0 * (time.perf_counter() - env_step_t0)
+                    rhc_executed_action = info.get("rhc_executed_action") if isinstance(info, dict) else None
+                    rhc_requested_action = info.get("rhc_requested_action") if isinstance(info, dict) else None
+                    rhc_execution_index = info.get("rhc_execution_index") if isinstance(info, dict) else None
+                    if rhc_executed_action is None:
+                        for candidate in (env, policy_env):
+                            wrapper = _find_wrapped_env_with_attr(candidate, "_last_executed_action")
+                            if wrapper is None:
+                                continue
+                            rhc_executed_action = getattr(wrapper, "_last_executed_action", None)
+                            rhc_requested_action = getattr(wrapper, "_last_requested_action", None)
+                            rhc_execution_index = getattr(wrapper, "_last_execution_index", None)
+                            if rhc_executed_action is not None:
+                                break
+                    if rhc_executed_action is not None:
+                        safety_info = dict(safety_info)
+                        safety_info["rhc_executed_action_available"] = True
+                        safety_info["rhc_execution_index"] = rhc_execution_index
+                        safety_info.update(
+                            _vector_compare_metrics(
+                                rhc_requested_action,
+                                rhc_executed_action,
+                                "rhc_requested_vs_executed",
+                            )
+                        )
+                        if bool(_safe_info_get(safety_info, "mpc_handoff_accepted")):
+                            handoff_release_executed_action_for_bridge = np.asarray(
+                                rhc_executed_action, dtype=np.float32
+                            ).reshape(-1).copy()
+                            safety_info["mpc_handoff_executed_release_provenance_source"] = "rhc_post_ensemble_smoothing"
+                            safety_info["mpc_handoff_executed_release_age_steps"] = 0
+                    policy_obs_update_time_ms = 0.0
+                    if policy_env is None:
+                        policy_obs_update_t0 = time.perf_counter()
+                        if args.hide_human_arm_policy_obs:
+                            policy_obs = _policy_obs_with_hidden_human_arm(
+                                env,
+                                obs,
+                                prev_policy_obs=policy_obs,
+                            )
+                        else:
+                            policy_obs = obs
+                        policy_obs_update_time_ms = 1000.0 * (time.perf_counter() - policy_obs_update_t0)
+                    else:
+                        policy_env_step_t0 = time.perf_counter()
+                        policy_obs, _policy_reward, policy_terminated, policy_truncated, _policy_info = policy_env.step(
+                            safe_env_action
+                        )
+                        env_step_time_ms += 1000.0 * (time.perf_counter() - policy_env_step_t0)
+                        if (policy_terminated or policy_truncated) and not (
+                            terminated or truncated or extract_success(info, float(reward), bool(terminated))
+                        ):
+                            print(
+                                "Warning: clean policy env ended before eval env; "
+                                "policy/eval states may have diverged."
+                            )
+                finally:
+                    _restore_action_sequence_temporal_ensemble(brake_temporal_ensemble_records)
+
+                if (
+                    ablation_force_sequence_applied_this_step
+                    and ablation_force_sequence_this_step_q is not None
+                    and ablation_force_sequence_this_step_indices is not None
+                ):
+                    # The hold-action env.step above already integrated one real
+                    # physics step from the qpos/qvel we injected before stepping, and
+                    # its resulting policy_obs went through the normal wrapper stack
+                    # (FrameStack/ConcatDim), so it is correctly shaped. We only
+                    # re-affirm the live MuJoCo q/qvel here for downstream consumers
+                    # that read sim state directly (e.g. the next forced frame's
+                    # `live_q`) — deliberately NOT re-deriving policy_obs from a raw
+                    # env snapshot, since bypassing the wrapper stack drops the
+                    # FrameStack dimension and corrupts obs shapes fed to ACT.
+                    reaffirm_seen = set()
+                    for candidate in (env, policy_env, safety_runtime_env):
+                        if candidate is None or id(candidate) in reaffirm_seen:
+                            continue
+                        reaffirm_seen.add(id(candidate))
+                        _set_h1_q_for_ablation(
+                            candidate,
+                            ablation_force_sequence_this_step_q,
+                            ablation_force_sequence_this_step_indices,
+                            zero_velocity=bool(
+                                getattr(args, "ablation_force_planned_recovery_q_zero_velocity", True)
+                            ),
+                            target_qvel=ablation_force_sequence_this_step_qvel,
+                        )
+
+                if (
+                    ablation_force_sequence_applied_this_step
+                    and pending_ablation_force_q_sequence_history is not None
+                    and isinstance(policy_obs, dict)
+                ):
+                    pending_ablation_force_q_sequence_history.append(copy.deepcopy(policy_obs))
+                    try:
+                        q_seq_len = int(np.asarray(pending_ablation_force_q_sequence).shape[0])
+                    except Exception:
+                        q_seq_len = 0
+                    if int(pending_ablation_force_q_sequence_index) >= q_seq_len:
+                        pending_ablation_policy_obs_history = list(
+                            pending_ablation_force_q_sequence_history
+                        )
+                        safety_info = dict(safety_info)
+                        if pending_ablation_force_q_sequence_target_action is not None:
+                            safety_info["recover_resume_window_target_action"] = (
+                                pending_ablation_force_q_sequence_target_action
+                            )
+                        safety_info.update(
+                            {
+                                "ablation_force_planned_recovery_q_sequence_completed": True,
+                                "ablation_force_planned_recovery_q_sequence_obs_count": int(
+                                    len(pending_ablation_policy_obs_history)
+                                ),
+                            }
+                        )
+                        pending_ablation_force_q_sequence = None
+                        pending_ablation_force_q_sequence_history = None
+                        pending_ablation_force_q_sequence_indices = None
+
+                if pending_ablation_policy_obs_history:
+                    (
+                        policy_obs,
+                        ablation_window_seed_count,
+                        ablation_frame_stack_seed_count,
+                    ) = _seed_policy_visual_history_after_recovery(
+                        policy_obs,
+                        pending_ablation_policy_obs_history,
+                        env=env,
+                        policy_env=policy_env,
+                    )
+                    target_action = _safe_info_get(safety_info, "recover_resume_window_target_action")
+                    target_action_source = "recover_resume_window_target_action" if target_action is not None else None
+                    if target_action is None and pending_ablation_force_q_sequence_target_action is not None:
+                        target_action = pending_ablation_force_q_sequence_target_action
+                        target_action_source = pending_ablation_force_q_sequence_target_action_source
+                    action_history_seed_count = 0
+                    action_history_seed_source = None
+                    if target_action is not None:
+                        seed_seen: set[int] = set()
+                        for candidate in (env, policy_env):
+                            if candidate is None or id(candidate) in seed_seen:
+                                continue
+                            seed_seen.add(id(candidate))
+                            try:
+                                action_history_seed_count += _seed_action_sequence_history_with_nominal_actions(
+                                    candidate,
+                                    target_action,
+                                    history_window_len=len(pending_ablation_policy_obs_history),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Could not seed action-sequence history for ablation: %s", exc)
+                        if action_history_seed_count > 0:
+                            action_history_seed_source = target_action_source
+                    seeded_policy_obs_for_action = None
+                    try:
+                        seeded_policy_obs_for_action = copy.deepcopy(
+                            _adapt_policy_obs_to_space(policy_obs, policy_observation_space)
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Could not snapshot seeded policy obs for ablation diagnostics: %s", exc)
+                    pending_ablation_resume_diag = {
+                        "seed_step": int(step),
+                        "seeded_low_dim_state": (
+                            np.asarray(policy_obs.get("low_dim_state"), dtype=np.float32).copy()
+                            if isinstance(policy_obs, dict) and policy_obs.get("low_dim_state") is not None
+                            else None
+                        ),
+                        "seeded_policy_obs_for_action": seeded_policy_obs_for_action,
+                        "seeded_visual_pose_snapshot": _mujoco_visual_pose_snapshot(env),
+                        "target_action": (
+                            np.asarray(target_action, dtype=np.float32).copy()
+                            if target_action is not None
+                            else None
+                        ),
+                        "target_action_source": target_action_source,
+                    }
+                    safety_info = dict(safety_info)
+                    safety_info.update(
+                        {
+                            "ablation_force_planned_recovery_q_window_seed_count": int(ablation_window_seed_count),
+                            "ablation_force_planned_recovery_q_frame_stack_seed_count": int(
+                                ablation_frame_stack_seed_count
+                            ),
+                            "ablation_force_planned_recovery_q_window_seed_source_count": int(
+                                len(pending_ablation_policy_obs_history)
+                            ),
+                            "ablation_force_planned_recovery_q_action_history_seed_count": int(
+                                action_history_seed_count
+                            ),
+                            "ablation_force_planned_recovery_q_action_history_seed_source": action_history_seed_source,
+                        }
+                    )
+                    if (
+                        bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_completed"))
+                        and ablation_pure_act_resume_total_steps > 0
+                    ):
+                        ablation_pure_act_resume_steps_left = max(
+                            int(ablation_pure_act_resume_steps_left),
+                            int(ablation_pure_act_resume_total_steps),
+                        )
+                        safety_info.update(
+                            {
+                                "ablation_pure_act_resume_enabled": True,
+                                "ablation_pure_act_resume_scheduled_steps": int(
+                                    ablation_pure_act_resume_steps_left
+                                ),
+                                "ablation_pure_act_resume_total_steps": int(
+                                    ablation_pure_act_resume_total_steps
+                                ),
+                            }
+                        )
+                        pending_ablation_force_q_sequence_target_action = None
+                        pending_ablation_force_q_sequence_target_action_source = None
+                    pending_ablation_policy_obs_history = None
+
+                if (
+                    mpc_replay_diagnostic_logging_enabled
+                    and len(all_mpc_replay_diagnostic_records) < max(0, int(args.mpc_replay_diagnostics_max_events))
+                    and _should_log_mpc_replay_diagnostic(safety_info)
+                ):
+                    diagnostic_record = _collect_mpc_replay_diagnostic(
+                        episode=episode,
+                        step=step,
+                        safety_info=safety_info,
+                        safe_env_action=safe_env_action,
+                        pre_mujoco_snapshot=mpc_replay_pre_mujoco_snapshot,
+                        post_mujoco_snapshot=_mujoco_state_snapshot(env),
+                        reward=reward,
+                        terminated=terminated,
+                        truncated=truncated,
+                    )
+                    if diagnostic_record is not None:
+                        episode_mpc_replay_diagnostic_records.append(diagnostic_record)
+                        all_mpc_replay_diagnostic_records.append(diagnostic_record)
+
+                if (
+                    nominal_rollout_diagnostic_context is not None
+                    or (chunk_filter_mode and nominal_pred_q_next_for_feedback is not None)
+                ):
+                    try:
+                        post_h1state = extract_h1_state(env)
+                        post_q_full = np.asarray(post_h1state.q_full, dtype=np.float32).reshape(-1)
+                        post_qd_full = np.asarray(post_h1state.qd_full, dtype=np.float32).reshape(-1)
+                        (
+                            post_min_h,
+                            _post_h_values,
+                            post_h_violation,
+                            post_h_pair_label,
+                            post_live_info,
+                        ) = compute_oscbf_full_arm_h_monitor(
+                            filt=oscbf,
+                            env=safety_runtime_env,
+                            obs=obs,
+                            q_full=post_q_full,
+                            qd_full=post_qd_full,
+                            clearance_threshold=0.0,
+                            return_details=True,
+                        )
+                        nominal_rollout_post_step_state = {
+                            "q_after": post_q_full,
+                            "qd_after": post_qd_full,
+                            "post_live_min_h": post_min_h,
+                            "post_live_h_violation": bool(post_h_violation),
+                            "post_live_h_pair_label": post_h_pair_label,
+                            "post_live_min_clearance": _safe_info_get(post_live_info, "live_min_clearance"),
+                        }
+                    except Exception as exc:  # noqa: BLE001
+                        nominal_rollout_post_step_state = {"post_step_state_error": repr(exc)}
 
                 task_state_after = (
                     _diagnostic_task_state(env)
@@ -9862,6 +7739,113 @@ def main():
                     task_state_before,
                     task_state_after,
                 )
+                progress_cache_epsilon = float(
+                    getattr(args, "post_recovery_mid_progress_epsilon", 0.001)
+                )
+                current_mode_for_progress_cache = (
+                    _safe_info_get(safety_info, "safety_mode")
+                    or _safe_info_get(safety_info, "mode")
+                )
+                if (
+                    replay_actions is None
+                    and chunk_filter_mode
+                    and task_progress_delta is not None
+                    and float(task_progress_delta) > progress_cache_epsilon
+                    and current_mode_for_progress_cache == "pass_through"
+                ):
+                    last_progressing_act_chunk = np.asarray(
+                        env_action,
+                        dtype=np.float32,
+                    ).copy()
+                    last_progressing_act_chunk_step = int(step)
+
+                if chunk_filter_mode:
+                    actual_q_after_for_feedback = None
+                    if isinstance(nominal_rollout_post_step_state, dict):
+                        actual_q_after_for_feedback = nominal_rollout_post_step_state.get("q_after")
+                    rollout_feedback = _rollout_residual_feedback(
+                        nominal_pred_q_next_for_feedback,
+                        actual_q_after_for_feedback,
+                        state_idx,
+                    )
+                    if rollout_feedback is not None:
+                        last_rollout_residual_state = rollout_feedback.get("rollout_residual_state")
+                        last_rollout_residual_l2 = rollout_feedback.get("rollout_residual_l2")
+                        last_rollout_residual_max_abs = rollout_feedback.get("rollout_residual_max_abs")
+                        last_rollout_residual_base_l2 = rollout_feedback.get("rollout_residual_base_l2")
+                        last_rollout_residual_arm_l2 = rollout_feedback.get("rollout_residual_arm_l2")
+                        last_rollout_prediction_untrusted = bool(
+                            rollout_feedback.get("rollout_prediction_untrusted", False)
+                        )
+                    else:
+                        last_rollout_residual_state = None
+                        last_rollout_residual_l2 = None
+                        last_rollout_residual_max_abs = None
+                        last_rollout_residual_base_l2 = None
+                        last_rollout_residual_arm_l2 = None
+                        last_rollout_prediction_untrusted = False
+
+                if replay_actions is None and chunk_filter_mode:
+                    recovery_history_mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
+                    recovery_history_source = _safe_info_get(safety_info, "deformation_source")
+                    recovery_history_phase = _safe_info_get(safety_info, "recovery_phase")
+                    recovery_history_committed_mode = _safe_info_get(safety_info, "committed_chunk_mode")
+                    explicit_recovery_history_reset_request = bool(
+                        _safe_info_get(safety_info, "request_action_history_reset_after_recovery")
+                    )
+                    implicit_recovery_handoff_reset_request = bool(
+                        getattr(
+                            args,
+                            "reset_action_history_after_intervention_boundary",
+                            False,
+                        )
+                        and args.reset_action_history_after_recovery
+                        and last_safety_intervention_active
+                        and not safety_intervention_active
+                        and len(recovery_policy_obs_history) > 0
+                    )
+                    recovery_handoff_reset_request = bool(
+                        explicit_recovery_history_reset_request
+                        or implicit_recovery_handoff_reset_request
+                    )
+                    record_recovery_history = bool(
+                        _is_safety_intervention_mode(safety_info)
+                        or explicit_recovery_history_reset_request
+                        or recovery_history_mode in {
+                            "recover",
+                            "committed_explicit_recovery",
+                            "horizon_deform",
+                            "horizon_brake",
+                            "phase_reanchor",
+                        }
+                        or recovery_history_source in {
+                            "committed_explicit_recovery",
+                            "explicit_recover_deform",
+                            "chunk_deform",
+                            "horizon_deform",
+                            "horizon_brake",
+                            "phase_reanchor",
+                        }
+                        or recovery_history_phase in {
+                            "recover",
+                            "horizon_deform",
+                            "resume_act",
+                        }
+                        or recovery_history_committed_mode in {
+                            "recover",
+                            "horizon_deform",
+                        }
+                    )
+                    if record_recovery_history:
+                        recovery_policy_obs_history.append(copy.deepcopy(policy_obs))
+                        if len(recovery_policy_obs_history) > 8:
+                            recovery_policy_obs_history = recovery_policy_obs_history[-8:]
+                    elif not recovery_handoff_reset_request:
+                        recovery_policy_obs_history.clear()
+                else:
+                    explicit_recovery_history_reset_request = False
+                    implicit_recovery_handoff_reset_request = False
+                    recovery_handoff_reset_request = False
 
                 if replay_actions is None:
                     if reset_policy_after_intervention:
@@ -9875,22 +7859,188 @@ def main():
                                 f"step={step} mode={mode} reset_wrappers={reset_count}"
                             )
                     if (
-                        args.reset_action_history_after_recovery
-                        and chunk_filter_mode
-                        and bool(_safe_info_get(safety_info, "request_action_history_reset_after_recovery"))
+                        chunk_filter_mode
+                        and recovery_handoff_reset_request
                     ):
-                        reset_count = _reset_action_sequence_history(env)
-                        if policy_env is not None:
-                            reset_count += _reset_action_sequence_history(policy_env)
-                        policy_step = 0
-                        policy_hold_active = True
+                        reset_count = 0
+                        low_level_sync_count = 0
+                        visual_reset_count = 0
+                        visual_seed_count = 0
+                        visual_seed_source_count = len(recovery_policy_obs_history)
+                        handoff_fresh_act_seed_enabled = bool(
+                            getattr(args, "handoff_seed_action_history_from_fresh_act", True)
+                        )
+                        effective_action_history_reset = bool(
+                            args.reset_action_history_after_recovery
+                            or handoff_fresh_act_seed_enabled
+                        )
+                        if effective_action_history_reset:
+                            reset_count = _reset_action_sequence_history(env)
+                            if policy_env is not None:
+                                reset_count += _reset_action_sequence_history(policy_env)
+                            policy_step = 0
+                            policy_hold_active = True
+                        if bool(getattr(args, "handoff_sanitize_controller_state", True)):
+                            sync_seen: set[int] = set()
+                            for candidate in (env, policy_env, safety_runtime_env):
+                                if candidate is None or id(candidate) in sync_seen:
+                                    continue
+                                sync_seen.add(id(candidate))
+                                try:
+                                    low_level_sync_count += int(
+                                        _sync_robot_low_level_hold_state(candidate)
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug(
+                                        "Could not sanitize low-level controller state "
+                                        "after recovery handoff: %s",
+                                        exc,
+                                    )
+                        if args.reset_visual_history_after_recovery:
+                            policy_obs, visual_reset_count = _reset_policy_visual_history_after_recovery(
+                                env,
+                                policy_env,
+                                policy_obs,
+                            )
+                        else:
+                            (
+                                policy_obs,
+                                visual_seed_count,
+                                visual_frame_stack_seed_count,
+                            ) = _seed_policy_visual_history_after_recovery(
+                                policy_obs,
+                                recovery_policy_obs_history,
+                                env=env,
+                                policy_env=policy_env,
+                            )
+                        recovery_policy_obs_history.clear()
                         safety_info = dict(safety_info)
                         safety_info.update(
                             {
-                                "recovery_action_history_reset": True,
+                                "recovery_action_history_reset": bool(effective_action_history_reset),
                                 "recovery_action_history_reset_count": int(reset_count),
+                                "recovery_action_history_reset_config": bool(
+                                    args.reset_action_history_after_recovery
+                                ),
+                                "recovery_action_history_reset_reason": (
+                                    "config"
+                                    if explicit_recovery_history_reset_request
+                                    and bool(args.reset_action_history_after_recovery)
+                                    else (
+                                        "intervention_boundary"
+                                        if implicit_recovery_handoff_reset_request
+                                        and bool(args.reset_action_history_after_recovery)
+                                        else (
+                                            "fresh_act_seed"
+                                            if handoff_fresh_act_seed_enabled
+                                            else None
+                                        )
+                                    )
+                                ),
+                                "request_action_history_reset_after_recovery": bool(
+                                    explicit_recovery_history_reset_request
+                                ),
+                                "implicit_action_history_reset_after_intervention": bool(
+                                    implicit_recovery_handoff_reset_request
+                                ),
+                                "recovery_action_history_reset_request_reason": (
+                                    "explicit_filter_request"
+                                    if explicit_recovery_history_reset_request
+                                    else (
+                                        "intervention_boundary"
+                                        if implicit_recovery_handoff_reset_request
+                                        else None
+                                    )
+                                ),
+                                "recovery_low_level_hold_sync": bool(
+                                    getattr(args, "handoff_sanitize_controller_state", True)
+                                ),
+                                "recovery_low_level_hold_sync_count": int(low_level_sync_count),
+                                "recovery_visual_history_reset": bool(args.reset_visual_history_after_recovery),
+                                "recovery_visual_frame_stack_seed_count": int(
+                                    locals().get("visual_frame_stack_seed_count", 0)
+                                ),
+                                "recovery_visual_history_reset_count": int(visual_reset_count),
+                                "recovery_visual_history_seed": bool(
+                                    (not args.reset_visual_history_after_recovery)
+                                    and visual_seed_count > 0
+                                ),
+                                "recovery_visual_history_seed_count": int(visual_seed_count),
+                                "recovery_visual_history_seed_source_count": int(visual_seed_source_count),
+                                "recovery_policy_obs_history_seed": bool(
+                                    (not args.reset_visual_history_after_recovery)
+                                    and visual_seed_count > 0
+                                ),
+                                "recovery_policy_obs_history_seed_count": int(visual_seed_count),
+                                "recovery_policy_obs_history_seed_source_count": int(visual_seed_source_count),
+                                "post_recovery_act_bridge_started": bool(
+                                    post_recovery_act_bridge_total_steps > 0
+                                ),
                             }
                         )
+                        if post_recovery_act_bridge_total_steps > 0:
+                            post_recovery_act_bridge_steps_left = max(
+                                int(post_recovery_act_bridge_steps_left),
+                                int(post_recovery_act_bridge_total_steps),
+                            )
+                            post_recovery_seed_fresh_act_history_pending = bool(
+                                handoff_fresh_act_seed_enabled
+                            )
+                            safety_info.update(
+                                {
+                                    "post_recovery_act_bridge_steps_left": int(
+                                        post_recovery_act_bridge_steps_left
+                                    ),
+                                    "post_recovery_act_bridge_total_steps": int(
+                                        post_recovery_act_bridge_total_steps
+                                    ),
+                                    "post_recovery_act_bridge_fresh_action_seed_pending": bool(
+                                        post_recovery_seed_fresh_act_history_pending
+                                    ),
+                                }
+                            )
+                        phase_reanchor_early_release_grace = bool(
+                            _safe_info_get(safety_info, "phase_reanchor_early_release_triggered")
+                            and (
+                                (_safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode"))
+                                == "phase_reanchor"
+                            )
+                        )
+                        phase_reanchor_early_release_grace_steps = 0
+                        if phase_reanchor_early_release_grace:
+                            phase_reanchor_early_release_grace_steps = max(
+                                1,
+                                int(getattr(args, "phase_reanchor_early_release_act_grace_steps", 16)),
+                            )
+                            phase_bridge_monitor_steps = max(
+                                phase_reanchor_early_release_grace_steps,
+                                int(getattr(args, "post_recovery_act_bridge_no_progress_monitor_steps", 0)),
+                            )
+                            post_recovery_act_bridge_steps_left = max(
+                                post_recovery_act_bridge_steps_left,
+                                phase_bridge_monitor_steps,
+                            )
+                            post_recovery_act_bridge_total_steps = max(
+                                post_recovery_act_bridge_total_steps,
+                                phase_bridge_monitor_steps,
+                            )
+                            post_recovery_act_bridge_progress_best = None
+                            post_recovery_act_bridge_no_progress_count = 0
+                            post_recovery_task_guard_steps_left = 0
+                            phase_reanchor_cooldown_left = max(
+                                phase_reanchor_cooldown_left,
+                                phase_reanchor_early_release_grace_steps,
+                            )
+                            policy_hold_active = False
+                            safety_info = dict(safety_info)
+                            safety_info.update(
+                                {
+                                    "phase_reanchor_early_release_act_grace": True,
+                                    "phase_reanchor_early_release_act_grace_steps": int(
+                                        phase_reanchor_early_release_grace_steps
+                                    ),
+                                }
+                            )
                         if args.post_recovery_task_guard:
                             progress_after_recovery = _finite_task_progress(task_state_after)
                             if progress_after_recovery is not None:
@@ -9904,6 +8054,11 @@ def main():
                                 phase_reanchor_state,
                                 args,
                             )
+                            if phase_reanchor_early_release_grace:
+                                guard_ready = False
+                                guard_phase_reason = (
+                                    f"phase_reanchor_early_release_act_grace:{phase_reanchor_early_release_grace_steps}"
+                                )
                             if guard_ready:
                                 post_recovery_task_guard_steps_left = max(
                                     post_recovery_task_guard_steps_left,
@@ -9924,6 +8079,12 @@ def main():
                                         int(args.post_recovery_task_guard_steps),
                                     )
                                     phase_reanchor_cooldown_left = 0
+                                    phase_reanchor_bridge_preload_start_progress = None
+                                    phase_reanchor_bridge_preload_count = 0
+                                    phase_reanchor_bridge_preload_validated_latched = False
+                                    phase_reanchor_bridge_preload_reason_last = None
+                                    phase_reanchor_bridge_preload_progress_delta_last = None
+                                    phase_reanchor_bridge_preload_handle_dist_last = None
                                 post_recovery_guard_active_after_reset = True
                                 post_recovery_guard_reanchor_after_reset = bool(reanchor_allowed)
                             else:
@@ -9941,31 +8102,756 @@ def main():
                                     "post_recovery_task_guard_best_progress": post_recovery_task_guard_best_progress,
                                     "post_recovery_progress_regression": post_recovery_progress_regression,
                                     "post_recovery_reanchor_started": bool(post_recovery_guard_reanchor_after_reset),
+                                    "post_recovery_no_progress_count": int(post_recovery_no_progress_count),
+                                    "post_recovery_mid_progress_no_progress_count": int(
+                                        post_recovery_mid_progress_no_progress_count
+                                    ),
+                                    "post_recovery_mid_progress_best_progress": post_recovery_mid_progress_best_progress,
+                                    "post_recovery_mid_progress_best_distance": post_recovery_mid_progress_best_distance,
+                                    "post_recovery_mid_progress_distance_regression": post_recovery_mid_progress_distance_regression,
+                                    "post_recovery_mid_progress_reseed_triggered": bool(
+                                        post_recovery_mid_progress_reseed_triggered
+                                    ),
+                                    "post_recovery_mid_progress_reseed_reset_count": int(
+                                        post_recovery_mid_progress_reseed_reset_count
+                                    ),
+                                    "post_recovery_mid_progress_reseed_reason": post_recovery_mid_progress_reseed_reason,
+                                    "post_recovery_mid_progress_prior_action_seed_count": int(
+                                        post_recovery_mid_progress_prior_action_seed_count
+                                    ),
+                                    "post_recovery_mid_progress_prior_action_seed_step": post_recovery_mid_progress_prior_action_seed_step,
+                                    "post_recovery_mid_progress_prior_action_seed_age": post_recovery_mid_progress_prior_action_seed_age,
+                                    "post_recovery_no_progress_triggered": bool(post_recovery_no_progress_triggered),
+                                    "post_recovery_no_progress_target_distance": post_recovery_no_progress_target_distance,
+                                    "post_recovery_no_progress_distance_source": post_recovery_no_progress_distance_source,
                                 }
                             )
                         if episode == 0 or args.debug:
                             mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
                             print(
-                                "recovery_requery: reset_action_history "
-                                f"step={step} mode={mode} reset_wrappers={reset_count}"
+                                "recovery_requery: reset_histories "
+                                f"step={step} mode={mode} "
+                                f"action_reset_wrappers={reset_count} "
+                                f"visual_reset_entries={visual_reset_count} "
+                                f"visual_seed_entries={visual_seed_count} "
+                                f"visual_seed_source_obs={visual_seed_source_count}"
                             )
 
                     if phase_reanchor_reset_after_step:
-                        reset_count = _reset_action_sequence_history(env)
-                        if policy_env is not None:
-                            reset_count += _reset_action_sequence_history(policy_env)
+                        phase_reanchor_best_target_distance = None
+                        phase_reanchor_best_target_signature = None
+                        phase_reanchor_best_control_distance = None
+                        phase_reanchor_best_control_signature = None
+                        phase_reanchor_taskspace_worsen_count = 0
+                        phase_reanchor_suppress_q_servo_steps_left = 0
+                        phase_bridge_resume_ok = bool(_safe_info_get(safety_info, "resume_affordance_ok"))
+                        phase_bridge_live_ready = _safe_info_get(safety_info, "phase_reanchor_live_release_ready")
+                        phase_bridge_live_reason = _safe_info_get(safety_info, "phase_reanchor_live_release_reason")
+                        if phase_bridge_live_ready is None:
+                            (
+                                phase_bridge_live_ready,
+                                phase_bridge_live_reason,
+                                _phase_bridge_live_target_error,
+                                _phase_bridge_live_handle_dist,
+                            ) = _phase_reanchor_live_release_status(
+                                phase_reanchor_action_state,
+                                args,
+                            )
+                        (
+                            phase_bridge_contact_ready,
+                            phase_bridge_contact_reason,
+                            phase_bridge_contact_handle_dist,
+                            phase_bridge_contact_handle_limit,
+                        ) = _phase_reanchor_bridge_contact_status(
+                            phase_reanchor_action_state,
+                            args,
+                        )
+                        phase_bridge_preload_enabled = bool(
+                            getattr(args, "phase_reanchor_bridge_preload_validation", False)
+                        )
+                        phase_bridge_preload_validated = bool(
+                            (not phase_bridge_preload_enabled)
+                            or phase_reanchor_bridge_preload_validated_latched
+                        )
+                        phase_bridge_preload_reason = (
+                            "disabled"
+                            if not phase_bridge_preload_enabled
+                            else (
+                                phase_reanchor_bridge_preload_reason_last
+                                or "not_validated_before_bridge_seed"
+                            )
+                        )
+                        phase_bridge_preload_steps = int(phase_reanchor_bridge_preload_count)
+                        phase_bridge_preload_progress_delta = (
+                            phase_reanchor_bridge_preload_progress_delta_last
+                        )
+                        phase_bridge_preload_handle_dist = (
+                            phase_reanchor_bridge_preload_handle_dist_last
+                            if phase_reanchor_bridge_preload_handle_dist_last is not None
+                            else phase_bridge_contact_handle_dist
+                        )
+                        phase_bridge_preload_handle_limit = float(
+                            getattr(args, "phase_reanchor_bridge_preload_handle_dist", 0.245)
+                        )
+                        phase_bridge_seed_ok = bool(
+                            phase_bridge_resume_ok
+                            and phase_bridge_live_ready
+                            and phase_bridge_contact_ready
+                            and phase_bridge_preload_validated
+                        )
+                        phase_bridge_nominal_q_l2 = None
+                        phase_bridge_nominal_q_window_l2_mean = None
+                        phase_bridge_nominal_q_window_l2_max = None
+                        phase_bridge_nominal_q_window_len = None
+                        phase_bridge_nominal_q_ok = None
+                        phase_bridge_nominal_q_adapted_l2 = None
+                        phase_bridge_nominal_q_adapted_window_l2_mean = None
+                        phase_bridge_nominal_q_adapted_window_l2_max = None
+                        phase_bridge_nominal_q_adapted_dims = None
+                        phase_bridge_nominal_q_base_l2 = None
+                        phase_bridge_nominal_q_arm_l2 = None
+                        phase_bridge_nominal_q_track_base = bool(
+                            getattr(args, "phase_reanchor_nominal_window_track_base", True)
+                        )
+                        phase_bridge_nominal_q_rows = None
+                        phase_bridge_nominal_q_live_dim = None
+                        phase_bridge_nominal_q_base_state_idx = np.asarray([], dtype=np.int64)
+                        if isinstance(phase_reanchor_action_state, dict):
+                            try:
+                                q_window = phase_reanchor_action_state.get("nominal_reentry_q_window")
+                                if q_window is not None:
+                                    q_rows = np.asarray(q_window, dtype=np.float64)
+                                    if q_rows.ndim == 1:
+                                        q_rows = q_rows.reshape(1, -1)
+                                    elif q_rows.ndim > 2:
+                                        q_rows = q_rows.reshape((-1, q_rows.shape[-1]))
+                                    live_q = np.asarray(q_full, dtype=np.float64).reshape(-1)
+                                    dim = min(live_q.size, q_rows.shape[-1])
+                                    if dim > 0 and np.isfinite(q_rows[:, :dim]).all() and np.isfinite(live_q[:dim]).all():
+                                        phase_bridge_nominal_q_rows = np.asarray(q_rows, dtype=np.float64).copy()
+                                        phase_bridge_nominal_q_live_dim = int(dim)
+                                        q_dists = np.linalg.norm(q_rows[:, :dim] - live_q[:dim][None, :], axis=1)
+                                        phase_bridge_nominal_q_l2 = float(q_dists[-1])
+                                        phase_bridge_nominal_q_window_l2_mean = float(np.mean(q_dists))
+                                        phase_bridge_nominal_q_window_l2_max = float(np.max(q_dists))
+                                        phase_bridge_nominal_q_window_len = int(q_rows.shape[0])
+                                        compare_idx = np.arange(dim, dtype=np.int64)
+                                        base_state_idx = np.asarray(
+                                            getattr(oscbf, "bigym_state_base_indices", []),
+                                            dtype=np.int64,
+                                        )
+                                        phase_bridge_nominal_q_base_state_idx = base_state_idx.copy()
+                                        arm_state_idx = np.asarray(
+                                            getattr(oscbf, "bigym_state_arm_indices", []),
+                                            dtype=np.int64,
+                                        )
+                                        base_state_idx = base_state_idx[
+                                            (base_state_idx >= 0) & (base_state_idx < dim)
+                                        ]
+                                        arm_state_idx = arm_state_idx[
+                                            (arm_state_idx >= 0) & (arm_state_idx < dim)
+                                        ]
+                                        if base_state_idx.size > 0:
+                                            base_dists = np.linalg.norm(
+                                                q_rows[:, base_state_idx] - live_q[base_state_idx][None, :],
+                                                axis=1,
+                                            )
+                                            phase_bridge_nominal_q_base_l2 = float(base_dists[-1])
+                                        if arm_state_idx.size > 0:
+                                            arm_dists = np.linalg.norm(
+                                                q_rows[:, arm_state_idx] - live_q[arm_state_idx][None, :],
+                                                axis=1,
+                                            )
+                                            phase_bridge_nominal_q_arm_l2 = float(arm_dists[-1])
+                                        if not phase_bridge_nominal_q_track_base and arm_state_idx.size > 0:
+                                            compare_idx = arm_state_idx
+                                            phase_bridge_nominal_q_adapted_dims = "arm_only_base_live_taskspace"
+                                        else:
+                                            phase_bridge_nominal_q_adapted_dims = "full_controlled"
+                                        adapted_q_dists = np.linalg.norm(
+                                            q_rows[:, compare_idx] - live_q[compare_idx][None, :],
+                                            axis=1,
+                                        )
+                                        phase_bridge_nominal_q_adapted_l2 = float(adapted_q_dists[-1])
+                                        phase_bridge_nominal_q_adapted_window_l2_mean = float(
+                                            np.mean(adapted_q_dists)
+                                        )
+                                        phase_bridge_nominal_q_adapted_window_l2_max = float(
+                                            np.max(adapted_q_dists)
+                                        )
+                                        phase_bridge_nominal_q_ok = bool(
+                                            phase_bridge_nominal_q_adapted_l2 <= 0.35
+                                        )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Could not compute phase-reanchor nominal-q bridge readiness: %s", exc)
+                        phase_bridge_seed_source_count = int(len(recovery_policy_obs_history))
+                        phase_bridge_obs_seed_source = "recovery_policy_obs_history"
+                        phase_bridge_obs_seed_restore_count = 0
+                        phase_bridge_obs_seed_window_count = 0
+                        phase_bridge_visual_seed_count = 0
+                        phase_bridge_frame_stack_seed_count = 0
+                        phase_bridge_action_seed_count = 0
+                        phase_bridge_action_seed_source = None
+                        phase_bridge_action_window_len = None
+                        phase_bridge_act_vs_nominal_l2 = None
+                        phase_bridge_act_vs_nominal_cosine = None
+                        phase_bridge_target_action = None
+                        phase_bridge_action_base_adapted = False
+                        phase_bridge_action_base_adapted_dims = 0
+                        if isinstance(phase_reanchor_action_state, dict):
+                            phase_bridge_target_action = phase_reanchor_action_state.get(
+                                "nominal_reentry_action_window"
+                            )
+                        if phase_bridge_target_action is not None:
+                            phase_bridge_action_seed_source = "nominal_reentry_action_window"
+                        else:
+                            phase_bridge_target_action = safe_env_action
+                            phase_bridge_action_seed_source = "phase_reanchor_safe_action"
+                        if (
+                            phase_bridge_target_action is not None
+                            and not phase_bridge_nominal_q_track_base
+                        ):
+                            try:
+                                target_rows = _ablation_action_rows(phase_bridge_target_action)
+                                safe_rows = _ablation_action_rows(safe_env_action)
+                                base_action_idx = np.asarray(
+                                    getattr(oscbf, "bigym_action_base_indices", []),
+                                    dtype=np.int64,
+                                )
+                                if (
+                                    target_rows is not None
+                                    and safe_rows is not None
+                                    and safe_rows.shape[0] > 0
+                                    and base_action_idx.size > 0
+                                ):
+                                    adapted_rows = np.asarray(target_rows, dtype=np.float32).copy()
+                                    base_action_idx = base_action_idx[
+                                        (base_action_idx >= 0) & (base_action_idx < adapted_rows.shape[1])
+                                    ]
+                                    safe_first = np.asarray(safe_rows[0], dtype=np.float32).reshape(-1)
+                                    base_action_idx = base_action_idx[base_action_idx < safe_first.size]
+                                    if base_action_idx.size > 0:
+                                        adapted_rows[:, base_action_idx] = safe_first[base_action_idx]
+                                        phase_bridge_target_action = adapted_rows
+                                        phase_bridge_action_base_adapted = True
+                                        phase_bridge_action_base_adapted_dims = int(base_action_idx.size)
+                                        phase_bridge_action_seed_source = (
+                                            f"{phase_bridge_action_seed_source}_base_live_adapted"
+                                        )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Could not adapt phase-reanchor bridge base action history: %s", exc)
+                        phase_bridge_target_rows = _ablation_action_rows(phase_bridge_target_action)
+                        phase_bridge_action_agreement_ok = None
+                        if phase_bridge_target_rows is not None:
+                            phase_bridge_action_window_len = int(phase_bridge_target_rows.shape[0])
+                            try:
+                                act_first_arr = np.asarray(first_action, dtype=np.float32).reshape(-1)
+                                nominal_first_arr = np.asarray(phase_bridge_target_rows[0], dtype=np.float32).reshape(-1)
+                                dim = min(act_first_arr.size, nominal_first_arr.size)
+                                if dim > 0:
+                                    a = act_first_arr[:dim]
+                                    b = nominal_first_arr[:dim]
+                                    phase_bridge_act_vs_nominal_l2 = float(np.linalg.norm(a - b))
+                                    denom = float(np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+                                    phase_bridge_act_vs_nominal_cosine = float(np.dot(a, b) / denom)
+                                    action_l2_limit = float(
+                                        getattr(args, "phase_reanchor_bridge_action_agreement_l2", 1.0)
+                                    )
+                                    action_cosine_limit = float(
+                                        getattr(args, "phase_reanchor_bridge_action_agreement_cosine", 0.8)
+                                    )
+                                    action_agreement_mode = str(
+                                        getattr(args, "phase_reanchor_bridge_action_agreement_mode", "and")
+                                    )
+                                    if action_agreement_mode == "or":
+                                        phase_bridge_action_agreement_ok = bool(
+                                            phase_bridge_act_vs_nominal_l2 <= action_l2_limit
+                                            or phase_bridge_act_vs_nominal_cosine >= action_cosine_limit
+                                        )
+                                    else:
+                                        phase_bridge_action_agreement_ok = bool(
+                                            phase_bridge_act_vs_nominal_l2 <= action_l2_limit
+                                            and phase_bridge_act_vs_nominal_cosine >= action_cosine_limit
+                                        )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Could not compute phase-reanchor ACT-vs-nominal action diagnostic: %s", exc)
+                        phase_bridge_live_taskspace_ok = bool(
+                            phase_bridge_live_ready
+                            and phase_bridge_contact_ready
+                            and phase_bridge_preload_validated
+                        )
+                        phase_bridge_nominal_action_window_ok = bool(
+                            isinstance(phase_bridge_action_seed_source, str)
+                            and phase_bridge_action_seed_source.startswith(
+                                "nominal_reentry_action_window"
+                            )
+                            and phase_bridge_action_window_len is not None
+                            and phase_bridge_action_window_len >= int(
+                                getattr(args, "phase_reanchor_nominal_window_len", 4)
+                            )
+                        )
+                        phase_bridge_requires_resume_affordance = bool(
+                            getattr(args, "phase_reanchor_bridge_requires_resume_affordance", True)
+                        )
+                        phase_bridge_nominal_history_ok = bool(
+                            (phase_bridge_resume_ok or not phase_bridge_requires_resume_affordance)
+                            and phase_bridge_nominal_q_ok is True
+                            and phase_bridge_action_agreement_ok is True
+                            and phase_bridge_nominal_action_window_ok
+                        )
+                        phase_bridge_seed_mode = str(
+                            getattr(args, "phase_reanchor_bridge_seed_mode", "live_taskspace")
+                        )
+                        phase_bridge_live_veto = bool(
+                            phase_bridge_live_reason == "live_taskspace_geometry_untrusted"
+                            or phase_bridge_contact_reason == "bridge_contact_geometry_untrusted"
+                        )
+                        if phase_bridge_seed_mode == "nominal_history":
+                            phase_bridge_readiness_ok = bool(phase_bridge_nominal_history_ok)
+                        elif phase_bridge_seed_mode == "nominal_history_with_live_veto":
+                            phase_bridge_readiness_ok = bool(
+                                phase_bridge_nominal_history_ok and not phase_bridge_live_veto
+                            )
+                        else:
+                            phase_bridge_seed_mode = "live_taskspace"
+                            phase_bridge_readiness_ok = bool(
+                                phase_bridge_nominal_history_ok and phase_bridge_live_taskspace_ok
+                            )
+                        phase_bridge_seed_blockers: list[str] = []
+                        if phase_bridge_requires_resume_affordance and not phase_bridge_resume_ok:
+                            phase_bridge_seed_blockers.append("resume_affordance")
+                        if phase_bridge_nominal_q_ok is not True:
+                            phase_bridge_seed_blockers.append("nominal_q")
+                        if phase_bridge_action_agreement_ok is not True:
+                            phase_bridge_seed_blockers.append("action_agreement")
+                        if not phase_bridge_nominal_action_window_ok:
+                            phase_bridge_seed_blockers.append("nominal_action_window")
+                        if phase_bridge_seed_mode == "live_taskspace" and not phase_bridge_live_ready:
+                            phase_bridge_seed_blockers.append(f"live_release:{phase_bridge_live_reason}")
+                        if phase_bridge_seed_mode == "live_taskspace" and not phase_bridge_contact_ready:
+                            phase_bridge_seed_blockers.append(f"contact:{phase_bridge_contact_reason}")
+                        if phase_bridge_seed_mode == "live_taskspace" and not phase_bridge_preload_validated:
+                            phase_bridge_seed_blockers.append(f"preload:{phase_bridge_preload_reason}")
+                        if phase_bridge_seed_mode == "nominal_history_with_live_veto" and phase_bridge_live_veto:
+                            phase_bridge_seed_blockers.append("live_geometry_untrusted")
+                        phase_bridge_seed_ok = bool(phase_bridge_readiness_ok)
+                        reset_count = 0
+                        reset_phase_action_history = not (
+                            phase_bridge_seed_ok
+                            and phase_bridge_action_seed_source == "nominal_reentry_action_window"
+                            and phase_bridge_target_rows is not None
+                        )
+                        if reset_phase_action_history:
+                            reset_count = _reset_action_sequence_history(env)
+                            if policy_env is not None:
+                                reset_count += _reset_action_sequence_history(policy_env)
+                        phase_bridge_policy_obs_history = recovery_policy_obs_history
+                        if (
+                            phase_bridge_seed_ok
+                            and str(getattr(args, "phase_reanchor_bridge_seed_obs_source", "recovery"))
+                            == "nominal_q_window"
+                            and phase_bridge_nominal_q_rows is not None
+                            and phase_bridge_nominal_q_live_dim is not None
+                        ):
+                            try:
+                                obs_q_rows = np.asarray(phase_bridge_nominal_q_rows, dtype=np.float64).copy()
+                                live_q_for_obs = np.asarray(q_full, dtype=np.float64).reshape(-1)
+                                obs_dim = min(
+                                    int(phase_bridge_nominal_q_live_dim),
+                                    obs_q_rows.shape[-1],
+                                    live_q_for_obs.size,
+                                )
+                                if (
+                                    not phase_bridge_nominal_q_track_base
+                                    and phase_bridge_nominal_q_base_state_idx.size > 0
+                                ):
+                                    base_idx = phase_bridge_nominal_q_base_state_idx[
+                                        (phase_bridge_nominal_q_base_state_idx >= 0)
+                                        & (phase_bridge_nominal_q_base_state_idx < obs_dim)
+                                    ]
+                                    if base_idx.size > 0:
+                                        obs_q_rows[:, base_idx] = live_q_for_obs[base_idx][None, :]
+                                obs_indices = np.arange(obs_dim, dtype=np.int64)
+                                obs_qvel_window = _ablation_window_qvel(
+                                    obs_q_rows[:, :obs_dim],
+                                    _ablation_env_dt(env),
+                                )
+                                (
+                                    nominal_obs_history,
+                                    phase_bridge_obs_seed_restore_count,
+                                ) = _collect_policy_obs_window_preserving_state(
+                                    env=env,
+                                    policy_env=policy_env,
+                                    safety_runtime_env=safety_env,
+                                    q_window=obs_q_rows[:, :obs_dim],
+                                    indices=obs_indices,
+                                    zero_velocity=False,
+                                    qvel_window=obs_qvel_window,
+                                )
+                                if nominal_obs_history:
+                                    phase_bridge_policy_obs_history = nominal_obs_history
+                                    phase_bridge_obs_seed_source = "nominal_q_window"
+                                    phase_bridge_obs_seed_window_count = int(len(nominal_obs_history))
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not collect nominal-q policy obs bridge window: %s",
+                                    exc,
+                                )
+                        phase_bridge_seed_source_count = int(len(phase_bridge_policy_obs_history))
+                        if phase_bridge_seed_ok and phase_bridge_policy_obs_history:
+                            (
+                                policy_obs,
+                                phase_bridge_visual_seed_count,
+                                phase_bridge_frame_stack_seed_count,
+                            ) = _seed_policy_visual_history_after_recovery(
+                                policy_obs,
+                                phase_bridge_policy_obs_history,
+                                env=env,
+                                policy_env=policy_env,
+                            )
+                            seed_seen: set[int] = set()
+                            for candidate in (env, policy_env):
+                                if candidate is None or id(candidate) in seed_seen:
+                                    continue
+                                seed_seen.add(id(candidate))
+                                try:
+                                    phase_bridge_action_seed_count += _seed_action_sequence_history_with_nominal_actions(
+                                        candidate,
+                                        phase_bridge_target_action,
+                                        history_window_len=(
+                                            phase_bridge_action_window_len
+                                            if phase_bridge_action_window_len is not None
+                                            else phase_bridge_seed_source_count
+                                        ),
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("Could not seed phase-reanchor action history: %s", exc)
+                            if phase_bridge_action_seed_count <= 0 and not reset_phase_action_history:
+                                reset_count = _reset_action_sequence_history(env)
+                                if policy_env is not None:
+                                    reset_count += _reset_action_sequence_history(policy_env)
+                                phase_bridge_action_seed_source = "nominal_reentry_action_window_seed_failed"
+                        phase_bridge_temporal_stats = {
+                            "action_bridge_temporal_history_slot_count": None,
+                            "action_bridge_temporal_history_vs_resume_l2": None,
+                        }
+                        if phase_bridge_target_rows is not None and phase_bridge_target_rows.shape[0] > 0:
+                            try:
+                                phase_bridge_temporal_stats = _temporal_action_history_stats(
+                                    env,
+                                    np.asarray(phase_bridge_target_rows[0], dtype=np.float32).reshape(-1),
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not compute phase-reanchor bridge temporal action stats: %s",
+                                    exc,
+                                )
+                        phase_bridge_policy_step_before = int(policy_step)
+                        phase_bridge_policy_step_after = 0
+                        phase_bridge_policy_step_source = "reset_zero"
+                        if (
+                            phase_bridge_seed_ok
+                            and str(getattr(args, "phase_reanchor_bridge_policy_step_source", "reset_zero"))
+                            == "nominal_window"
+                            and isinstance(phase_reanchor_action_state, dict)
+                        ):
+                            candidate_policy_step = None
+                            target_steps = phase_reanchor_action_state.get(
+                                "nominal_reentry_window_steps"
+                            )
+                            try:
+                                if target_steps is not None:
+                                    target_steps_list = list(target_steps)
+                                    target_index = _safe_info_get(
+                                        safety_info,
+                                        "phase_reanchor_arm_servo_target_window_index",
+                                    )
+                                    if target_index is not None:
+                                        target_index = int(target_index)
+                                        if 0 <= target_index < len(target_steps_list):
+                                            candidate_policy_step = int(target_steps_list[target_index])
+                                    if candidate_policy_step is None and target_steps_list:
+                                        candidate_policy_step = int(target_steps_list[0])
+                            except Exception:  # noqa: BLE001
+                                candidate_policy_step = None
+                            if candidate_policy_step is None:
+                                try:
+                                    candidate_policy_step = int(
+                                        phase_reanchor_action_state.get(
+                                            "nominal_reentry_start_step"
+                                        )
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    candidate_policy_step = None
+                            if candidate_policy_step is not None and candidate_policy_step >= 0:
+                                phase_bridge_policy_step_after = int(candidate_policy_step)
+                                phase_bridge_policy_step_source = "nominal_window"
                         if hasattr(safechunk, "reset"):
                             safechunk.reset()
-                        policy_step = 0
-                        policy_hold_active = True
+                        if phase_bridge_seed_ok:
+                            recovery_policy_obs_history.clear()
+                        policy_step = int(phase_bridge_policy_step_after)
+                        phase_bridge_post_seed_act_vs_nominal_l2 = None
+                        phase_bridge_post_seed_act_vs_nominal_cosine = None
+                        phase_bridge_post_seed_action_agreement_ok = None
+                        phase_bridge_post_seed_action_seed_count = 0
+                        phase_bridge_temporal_stats_source = phase_bridge_action_seed_source
+                        phase_bridge_requires_post_seed_action_agreement = bool(
+                            getattr(args, "phase_reanchor_bridge_requires_post_seed_action_agreement", False)
+                        )
+                        post_seed_rows = None
+                        if phase_bridge_seed_ok:
+                            try:
+                                post_seed_env_action = policy_action(ws, policy_obs, step=policy_step)
+                                post_seed_rows = _ablation_action_rows(post_seed_env_action)
+                                if (
+                                    post_seed_rows is not None
+                                    and post_seed_rows.shape[0] > 0
+                                    and phase_bridge_target_rows is not None
+                                    and phase_bridge_target_rows.shape[0] > 0
+                                ):
+                                    a = np.asarray(post_seed_rows[0], dtype=np.float32).reshape(-1)
+                                    b = np.asarray(phase_bridge_target_rows[0], dtype=np.float32).reshape(-1)
+                                    dim = min(a.size, b.size)
+                                    if dim > 0:
+                                        phase_bridge_post_seed_act_vs_nominal_l2 = float(
+                                            np.linalg.norm(a[:dim] - b[:dim])
+                                        )
+                                        denom = float(np.linalg.norm(a[:dim]) * np.linalg.norm(b[:dim]) + 1e-8)
+                                        phase_bridge_post_seed_act_vs_nominal_cosine = float(
+                                            np.dot(a[:dim], b[:dim]) / denom
+                                        )
+                                        action_l2_limit = float(
+                                            getattr(args, "phase_reanchor_bridge_action_agreement_l2", 1.0)
+                                        )
+                                        action_cosine_limit = float(
+                                            getattr(args, "phase_reanchor_bridge_action_agreement_cosine", 0.8)
+                                        )
+                                        action_agreement_mode = str(
+                                            getattr(args, "phase_reanchor_bridge_action_agreement_mode", "and")
+                                        )
+                                        if action_agreement_mode == "or":
+                                            phase_bridge_post_seed_action_agreement_ok = bool(
+                                                phase_bridge_post_seed_act_vs_nominal_l2 <= action_l2_limit
+                                                or phase_bridge_post_seed_act_vs_nominal_cosine >= action_cosine_limit
+                                            )
+                                        else:
+                                            phase_bridge_post_seed_action_agreement_ok = bool(
+                                                phase_bridge_post_seed_act_vs_nominal_l2 <= action_l2_limit
+                                                and phase_bridge_post_seed_act_vs_nominal_cosine >= action_cosine_limit
+                                            )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not compute phase-reanchor post-seed ACT action diagnostic: %s",
+                                    exc,
+                                )
+                        if (
+                            phase_bridge_seed_ok
+                            and phase_bridge_requires_post_seed_action_agreement
+                            and phase_bridge_post_seed_action_agreement_ok is not True
+                        ):
+                            phase_bridge_seed_blockers.append("post_seed_action_agreement")
+                            phase_bridge_seed_ok = False
+                            phase_bridge_readiness_ok = False
+                            try:
+                                reset_count += _reset_action_sequence_history(env)
+                                if policy_env is not None:
+                                    reset_count += _reset_action_sequence_history(policy_env)
+                                policy_obs, reset_visual_count = _reset_policy_visual_history_after_recovery(
+                                    env,
+                                    policy_env,
+                                    policy_obs,
+                                )
+                                reset_count += int(reset_visual_count)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not reset bridge history after post-seed ACT mismatch: %s",
+                                    exc,
+                                )
+                        if (
+                            phase_bridge_seed_ok
+                            and bool(
+                                getattr(
+                                    args,
+                                    "phase_reanchor_bridge_reseed_action_history_with_post_seed_act",
+                                    False,
+                                )
+                            )
+                            and post_seed_rows is not None
+                            and post_seed_rows.shape[0] > 0
+                        ):
+                            try:
+                                seed_seen: set[int] = set()
+                                for candidate in (env, policy_env):
+                                    if candidate is None or id(candidate) in seed_seen:
+                                        continue
+                                    seed_seen.add(id(candidate))
+                                    phase_bridge_post_seed_action_seed_count += (
+                                        _seed_action_sequence_history_with_nominal_actions(
+                                            candidate,
+                                            post_seed_rows,
+                                            history_window_len=(
+                                                phase_bridge_action_window_len
+                                                if phase_bridge_action_window_len is not None
+                                                else post_seed_rows.shape[0]
+                                            ),
+                                        )
+                                    )
+                                if phase_bridge_post_seed_action_seed_count > 0:
+                                    phase_bridge_action_seed_count = int(phase_bridge_post_seed_action_seed_count)
+                                    phase_bridge_action_seed_source = "post_seed_act_policy_action"
+                                    phase_bridge_temporal_stats_source = phase_bridge_action_seed_source
+                                    phase_bridge_temporal_stats = _temporal_action_history_stats(
+                                        env,
+                                        np.asarray(post_seed_rows[0], dtype=np.float32).reshape(-1),
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug(
+                                    "Could not reseed phase-reanchor bridge action history with post-seed ACT: %s",
+                                    exc,
+                                )
+                        policy_hold_active = bool(phase_bridge_seed_ok)
+                        safety_info = dict(safety_info)
+                        safety_info.update(
+                            {
+                                "phase_reanchor_bridge_history_seed": bool(
+                                    phase_bridge_seed_ok
+                                    and (phase_bridge_visual_seed_count > 0 or phase_bridge_action_seed_count > 0)
+                                ),
+                                "phase_reanchor_bridge_seed_mode": phase_bridge_seed_mode,
+                                "phase_reanchor_bridge_seed_reason": (
+                                    f"{phase_bridge_seed_mode}_ok"
+                                    if phase_bridge_seed_ok
+                                    else "blocked:" + ",".join(phase_bridge_seed_blockers)
+                                ),
+                                "phase_reanchor_bridge_seed_blockers": phase_bridge_seed_blockers,
+                                "phase_reanchor_bridge_nominal_history_ok": phase_bridge_nominal_history_ok,
+                                "phase_reanchor_bridge_nominal_action_window_ok": phase_bridge_nominal_action_window_ok,
+                                "phase_reanchor_bridge_live_taskspace_ok": phase_bridge_live_taskspace_ok,
+                                "phase_reanchor_bridge_policy_step_before": phase_bridge_policy_step_before,
+                                "phase_reanchor_bridge_policy_step_after": phase_bridge_policy_step_after,
+                                "phase_reanchor_bridge_policy_step_source": phase_bridge_policy_step_source,
+                                "phase_reanchor_bridge_post_seed_act_vs_nominal_l2": phase_bridge_post_seed_act_vs_nominal_l2,
+                                "phase_reanchor_bridge_post_seed_act_vs_nominal_cosine": phase_bridge_post_seed_act_vs_nominal_cosine,
+                                "phase_reanchor_bridge_post_seed_action_seed_count": int(phase_bridge_post_seed_action_seed_count),
+                                "phase_reanchor_bridge_post_seed_action_agreement_ok": phase_bridge_post_seed_action_agreement_ok,
+                                "phase_reanchor_bridge_requires_post_seed_action_agreement": phase_bridge_requires_post_seed_action_agreement,
+                                "phase_reanchor_bridge_temporal_stats_source": phase_bridge_temporal_stats_source,
+                                "action_bridge_temporal_history_slot_count": phase_bridge_temporal_stats.get(
+                                    "action_bridge_temporal_history_slot_count"
+                                ),
+                                "action_bridge_temporal_history_vs_resume_l2": phase_bridge_temporal_stats.get(
+                                    "action_bridge_temporal_history_vs_resume_l2"
+                                ),
+                                "phase_reanchor_bridge_visual_seed_count": int(phase_bridge_visual_seed_count),
+                                "phase_reanchor_bridge_visual_seed_source_count": int(phase_bridge_seed_source_count),
+                                "phase_reanchor_bridge_frame_stack_seed_count": int(phase_bridge_frame_stack_seed_count),
+                                "phase_reanchor_bridge_obs_seed_source": phase_bridge_obs_seed_source,
+                                "phase_reanchor_bridge_obs_seed_window_count": int(phase_bridge_obs_seed_window_count),
+                                "phase_reanchor_bridge_obs_seed_restore_count": int(phase_bridge_obs_seed_restore_count),
+                                "phase_reanchor_bridge_action_seed_count": int(phase_bridge_action_seed_count),
+                                "phase_reanchor_bridge_action_seed_source": phase_bridge_action_seed_source,
+                                "phase_reanchor_bridge_action_window_len": phase_bridge_action_window_len,
+                                "phase_reanchor_bridge_act_vs_nominal_l2": phase_bridge_act_vs_nominal_l2,
+                                "phase_reanchor_bridge_act_vs_nominal_cosine": phase_bridge_act_vs_nominal_cosine,
+                                "phase_reanchor_bridge_action_agreement_ok": phase_bridge_action_agreement_ok,
+                                "phase_reanchor_bridge_action_base_adapted": phase_bridge_action_base_adapted,
+                                "phase_reanchor_bridge_action_base_adapted_dims": phase_bridge_action_base_adapted_dims,
+                                "phase_reanchor_bridge_contact_ready": phase_bridge_contact_ready,
+                                "phase_reanchor_bridge_contact_reason": phase_bridge_contact_reason,
+                                "phase_reanchor_bridge_contact_handle_dist": phase_bridge_contact_handle_dist,
+                                "phase_reanchor_bridge_contact_handle_limit": phase_bridge_contact_handle_limit,
+                                "phase_reanchor_bridge_preload_validated": phase_bridge_preload_validated,
+                                "phase_reanchor_bridge_preload_reason": phase_bridge_preload_reason,
+                                "phase_reanchor_bridge_preload_steps": phase_bridge_preload_steps,
+                                "phase_reanchor_bridge_preload_progress_delta": phase_bridge_preload_progress_delta,
+                                "phase_reanchor_bridge_preload_handle_dist": phase_bridge_preload_handle_dist,
+                                "phase_reanchor_bridge_preload_handle_limit": phase_bridge_preload_handle_limit,
+                                "phase_reanchor_bridge_nominal_q_l2": phase_bridge_nominal_q_l2,
+                                "phase_reanchor_bridge_nominal_q_window_l2_mean": phase_bridge_nominal_q_window_l2_mean,
+                                "phase_reanchor_bridge_nominal_q_window_l2_max": phase_bridge_nominal_q_window_l2_max,
+                                "phase_reanchor_bridge_nominal_q_window_len": phase_bridge_nominal_q_window_len,
+                                "phase_reanchor_bridge_nominal_q_adapted_l2": phase_bridge_nominal_q_adapted_l2,
+                                "phase_reanchor_bridge_nominal_q_adapted_window_l2_mean": phase_bridge_nominal_q_adapted_window_l2_mean,
+                                "phase_reanchor_bridge_nominal_q_adapted_window_l2_max": phase_bridge_nominal_q_adapted_window_l2_max,
+                                "phase_reanchor_bridge_nominal_q_adapted_dims": phase_bridge_nominal_q_adapted_dims,
+                                "phase_reanchor_bridge_nominal_q_base_l2": phase_bridge_nominal_q_base_l2,
+                                "phase_reanchor_bridge_nominal_q_arm_l2": phase_bridge_nominal_q_arm_l2,
+                                "phase_reanchor_bridge_nominal_q_track_base": phase_bridge_nominal_q_track_base,
+                                "phase_reanchor_bridge_nominal_q_ok": phase_bridge_nominal_q_ok,
+                                "phase_reanchor_bridge_readiness_ok": phase_bridge_readiness_ok,
+                                "recovery_visual_history_seed": bool(phase_bridge_visual_seed_count > 0),
+                                "recovery_visual_history_seed_count": int(phase_bridge_visual_seed_count),
+                                "recovery_visual_history_seed_source_count": int(phase_bridge_seed_source_count),
+                                "recovery_policy_obs_history_seed": bool(phase_bridge_visual_seed_count > 0),
+                                "recovery_policy_obs_history_seed_count": int(phase_bridge_visual_seed_count),
+                                "recovery_policy_obs_history_seed_source_count": int(phase_bridge_seed_source_count),
+                            }
+                        )
                         if episode == 0 or args.debug:
                             print(
                                 "phase_reanchor: finish "
                                 f"episode={episode} step={step} reset_wrappers={reset_count} "
+                                f"bridge_seed={phase_bridge_seed_ok} "
+                                f"visual_seed={phase_bridge_visual_seed_count} "
+                                f"action_seed={phase_bridge_action_seed_count} "
+                                f"action_source={phase_bridge_action_seed_source} "
                                 f"cooldown={phase_reanchor_cooldown_left}"
                             )
                     if not policy_hold_active:
                         policy_step += 1
+
+                bridge_history_mode = _safe_info_get(safety_info, "safety_mode") or _safe_info_get(safety_info, "mode")
+                bridge_history_source = _safe_info_get(safety_info, "deformation_source")
+                bridge_history_phase = _safe_info_get(safety_info, "recovery_phase")
+                bridge_history_committed_mode = _safe_info_get(safety_info, "committed_chunk_mode")
+                bridge_record_last_action = bool(
+                    post_recovery_act_bridge_active
+                    or _is_safety_intervention_mode(safety_info)
+                    or _is_brake_or_fallback_execution(safety_info)
+                    or bool(_safe_info_get(safety_info, "request_action_history_reset_after_recovery"))
+                    or bridge_history_mode in {
+                        "recover",
+                        "committed_explicit_recovery",
+                        "horizon_deform",
+                        "horizon_brake",
+                        "phase_reanchor",
+                    }
+                    or bridge_history_source in {
+                        "committed_explicit_recovery",
+                        "explicit_recover_deform",
+                        "chunk_deform",
+                        "horizon_deform",
+                        "horizon_brake",
+                        "phase_reanchor",
+                    }
+                    or bridge_history_phase in {
+                        "recover",
+                        "horizon_deform",
+                        "resume_act",
+                    }
+                    or bridge_history_committed_mode in {
+                        "recover",
+                        "horizon_deform",
+                    }
+                )
+                if bridge_record_last_action:
+                    last_recovery_first_action_for_bridge = np.asarray(
+                        safe_first_action,
+                        dtype=np.float32,
+                    ).reshape(-1).copy()
+                    last_recovery_action_step_for_bridge = int(step)
+                if bool(_safe_info_get(safety_info, "mpc_handoff_accepted")):
+                    handoff_release_first_action_for_bridge = np.asarray(
+                        safe_first_action,
+                        dtype=np.float32,
+                    ).reshape(-1).copy()
+                    handoff_release_action_step_for_bridge = int(step)
+                if post_recovery_act_bridge_active:
+                    post_recovery_act_bridge_steps_left = max(
+                        0,
+                        int(post_recovery_act_bridge_steps_left) - 1,
+                    )
 
                 last_safety_intervention_active = bool(safety_intervention_active)
 
@@ -10002,11 +8888,23 @@ def main():
                         reset_count = _reset_action_sequence_history(env)
                         if policy_env is not None:
                             reset_count += _reset_action_sequence_history(policy_env)
+                        visual_reset_count = 0
+                        if bool(getattr(args, "reset_visual_history_after_human_exit", False)):
+                            policy_obs, visual_reset_count = _reset_policy_visual_history_after_recovery(
+                                env,
+                                policy_env,
+                                policy_obs,
+                            )
                         if hasattr(safechunk, "reset"):
                             safechunk.reset()
                         policy_step = 0
+                        human_exit_resume_started = True
+                        human_exit_resume_start_step = int(step)
+                        human_exit_resume_action_reset_count = int(reset_count)
+                        human_exit_resume_visual_reset_count = int(visual_reset_count)
                         if should_reset_after_human_exit:
                             action_history_reset_after_exit = True
+                            visual_history_reset_after_exit = bool(visual_reset_count > 0)
                         if should_restart_after_blocker_pause:
                             pause_restart_reset_after_exit = True
                         if episode == 0 or args.debug:
@@ -10022,15 +8920,23 @@ def main():
                 elif phase_for_resume != "done":
                     human_done_clear_steps = 0
 
-                video_recorder.record(safety_runtime_env)
-                if args.save_frame_images and step % args.frame_image_every == 0:
-                    frame = _render_single_env_if_vector(safety_runtime_env)
-                    if frame is not None:
-                        frame_path = frame_image_dir / (
-                            f"{args.condition}_episode_{episode:03d}_step_{step:06d}.png"
-                        )
-                        imageio.imwrite(str(frame_path), np.asarray(frame))
-                        saved_frame_image_paths.append(str(frame_path))
+                robot_violation_color_overrides = _apply_robot_part_color_overrides(
+                    safety_runtime_env,
+                    red_parts=current_h_violation_parts,
+                    blue_parts=(horizon_violation_parts - current_h_violation_parts),
+                )
+                try:
+                    video_recorder.record(safety_runtime_env)
+                    if args.save_frame_images and step % args.frame_image_every == 0:
+                        frame = _render_single_env_if_vector(safety_runtime_env)
+                        if frame is not None:
+                            frame_path = frame_image_dir / (
+                                f"{args.condition}_episode_{episode:03d}_step_{step:06d}.png"
+                            )
+                            imageio.imwrite(str(frame_path), np.asarray(frame))
+                            saved_frame_image_paths.append(str(frame_path))
+                finally:
+                    _restore_robot_part_color_overrides(safety_runtime_env, robot_violation_color_overrides)
                 step_wall_t = time.perf_counter()
                 elapsed_wall_time_s = step_wall_t - episode_wall_t0
                 step_wall_time_s = step_wall_t - last_step_wall_t
@@ -10177,6 +9083,80 @@ def main():
                 contact_pairs = robot_human_contact_pairs(safety_runtime_env)
                 contact_count = None if contact_pairs is None else len(contact_pairs)
                 contact_now = bool(contact_count is not None and contact_count > 0)
+                if nominal_rollout_diagnostic_context is not None:
+                    record = dict(nominal_rollout_diagnostic_context)
+                    record.update(
+                        {
+                            "condition": args.condition,
+                            "safety_mode": _safe_info_get(safety_info, "safety_mode"),
+                            "mode": _safe_info_get(safety_info, "mode"),
+                            "deform_mode": _safe_info_get(safety_info, "deform_mode"),
+                            "deformation_source": _safe_info_get(safety_info, "deformation_source"),
+                            "fallback_reason": _safe_info_get(safety_info, "fallback_reason"),
+                            "optimized_fallback": _safe_info_get(safety_info, "optimized_fallback"),
+                            "act_step": diagnostic_flags.get("act_step"),
+                            "deform_step": diagnostic_flags.get("deform_step"),
+                            "recover_step": diagnostic_flags.get("recover_step"),
+                            "brake_step": diagnostic_flags.get("brake_step"),
+                            "fallback_step": diagnostic_flags.get("fallback_step"),
+                            "task_progress_before": task_state_before.get("task_progress"),
+                            "task_progress_after": task_state_after.get("task_progress"),
+                            "drawer_open_distance_after": task_state_after.get("drawer_open_distance"),
+                            "nominal_horizon_min_clearance": _safe_info_get(safety_info, "min_clearance"),
+                            "nominal_horizon_first_violation": _safe_info_get(safety_info, "first_violation"),
+                            "nominal_horizon_unsafe_count": _safe_info_get(safety_info, "unsafe_count"),
+                            "rollout_residual_correction_applied": _safe_info_get(safety_info, "rollout_residual_correction_applied"),
+                            "rollout_mismatch_prediction_untrusted": _safe_info_get(safety_info, "rollout_mismatch_prediction_untrusted"),
+                            "rollout_mismatch_live_clear_to_continue": _safe_info_get(safety_info, "rollout_mismatch_live_clear_to_continue"),
+                            "rollout_mismatch_pass_through": _safe_info_get(safety_info, "rollout_mismatch_pass_through"),
+                            "rollout_mismatch_escape_reason": _safe_info_get(safety_info, "rollout_mismatch_escape_reason"),
+                            "horizon_unsafe_ignored_due_to_rollout_mismatch": _safe_info_get(safety_info, "horizon_unsafe_ignored_due_to_rollout_mismatch"),
+                            "hard_executable_prefix_safe": _safe_info_get(safety_info, "hard_executable_prefix_safe"),
+                            "full_horizon_soft_pass_through": _safe_info_get(safety_info, "full_horizon_soft_pass_through"),
+                            "horizon_unsafe_ignored_due_to_executable_prefix_safe": _safe_info_get(safety_info, "horizon_unsafe_ignored_due_to_executable_prefix_safe"),
+                            "committed_soft_handoff_release_to_main_filter": _safe_info_get(safety_info, "committed_soft_handoff_release_to_main_filter"),
+                            "committed_soft_handoff_release_reason": _safe_info_get(safety_info, "committed_soft_handoff_release_reason"),
+                            "live_min_clearance_before": live_min_clearance,
+                            "live_h_violation_before": h_violation,
+                            "contact_count_after": contact_count,
+                            "contact_pairs_after": contact_pairs,
+                            "reward": float(reward),
+                            "terminated": bool(terminated),
+                            "truncated": bool(truncated),
+                        }
+                    )
+                    if nominal_rollout_post_step_state is not None:
+                        record.update(nominal_rollout_post_step_state)
+                    actual_q_after = record.get("q_after")
+                    record.update(
+                        _rollout_error_payload(
+                            "nominal",
+                            record.get("nominal_pred_q_next"),
+                            actual_q_after,
+                            state_idx,
+                        )
+                    )
+                    record.update(
+                        _rollout_error_payload(
+                            "safe",
+                            record.get("safe_pred_q_next"),
+                            actual_q_after,
+                            state_idx,
+                        )
+                    )
+                    if rollout_feedback is not None:
+                        record.update(rollout_feedback)
+                    nominal_first = record.get("nominal_first_action")
+                    safe_first = record.get("safe_first_action")
+                    if nominal_first is not None and safe_first is not None:
+                        try:
+                            action_delta = np.asarray(safe_first, dtype=np.float32) - np.asarray(nominal_first, dtype=np.float32)
+                            record["safe_vs_nominal_first_action_l2"] = float(np.linalg.norm(action_delta))
+                            record["safe_vs_nominal_first_action_max_abs"] = float(np.max(np.abs(action_delta)))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    episode_nominal_rollout_diagnostic_records.append(record)
+                    all_nominal_rollout_diagnostic_records.append(record)
                 safety_info["contact_during_hold"] = bool(
                     contact_now
                     and diagnostic_flags.get("brake_step")
@@ -10191,6 +9171,24 @@ def main():
                 safety_info["contact_during_recover"] = bool(
                     contact_now and diagnostic_flags.get("recover_step")
                 )
+                safety_info.update(_act_resumable_score_terms(safety_info, args))
+                safety_info.update(
+                    {
+                        "human_done_clear_steps": int(human_done_clear_steps),
+                        "action_history_reset_after_exit": bool(action_history_reset_after_exit),
+                        "visual_history_reset_after_exit": bool(visual_history_reset_after_exit),
+                        "human_exit_resume_started": bool(human_exit_resume_started),
+                        "human_exit_resume_start_step": human_exit_resume_start_step,
+                        "human_exit_resume_action_reset_count": int(human_exit_resume_action_reset_count),
+                        "human_exit_resume_visual_reset_count": int(human_exit_resume_visual_reset_count),
+                        "human_exit_resume_act_resumable_ok": (
+                            _safe_info_get(safety_info, "act_resumable_ok")
+                            if human_exit_resume_started
+                            else None
+                        ),
+                    }
+                )
+
                 unmodelled_contact_reason = _unmodelled_robot_contact_reason(contact_pairs)
                 info_dict = info if isinstance(info, dict) else {}
                 if blocker_info:
@@ -10222,15 +9220,346 @@ def main():
                     ),
                     drawer_open_fraction=_optional_float(task_state_after.get("drawer_open_fraction")),
                     drawer_joint_position=_optional_float(task_state_after.get("drawer_joint_position")),
-                    task_progress=_optional_float(task_state_after.get("task_progress")),
                     task_progress_before=_optional_float(task_state_before.get("task_progress")),
                     task_progress_after=_optional_float(task_state_after.get("task_progress")),
                     task_progress_delta=_optional_float(task_progress_delta),
                     ee_object_distance=_optional_float(task_state_after.get("ee_object_distance")),
                     object_state=task_state_after.get("object_state"),
-
+                    interaction_context=_optional_str(_safe_info_get(safety_info, "interaction_context")),
+                    resume_adapter=_optional_str(_safe_info_get(safety_info, "resume_adapter")),
+                    resume_context_source=_optional_str(_safe_info_get(safety_info, "resume_context_source")),
+                    resume_target_label=_optional_str(_safe_info_get(safety_info, "resume_target_label")),
+                    resume_affordance_enabled=_optional_bool(_safe_info_get(safety_info, "resume_affordance_enabled")),
+                    resume_affordance_available=_optional_bool(_safe_info_get(safety_info, "resume_affordance_available")),
+                    resume_affordance_task_relevant=_optional_bool(_safe_info_get(safety_info, "resume_affordance_task_relevant")),
+                    resume_affordance_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_score")),
+                    resume_affordance_ok=_optional_bool(_safe_info_get(safety_info, "resume_affordance_ok")),
+                    resume_affordance_min_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_min_score")),
+                    resume_affordance_component_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_component_score")),
+                    resume_affordance_min_component_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_min_component_score")),
+                    resume_affordance_target_distance=_optional_float(_safe_info_get(safety_info, "resume_affordance_target_distance", _safe_info_get(safety_info, "resume_target_distance"))),
+                    resume_affordance_target_distance_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_target_distance_score")),
+                    resume_affordance_target_distance_good=_optional_float(_safe_info_get(safety_info, "resume_affordance_target_distance_good")),
+                    resume_affordance_target_distance_scale=_optional_float(_safe_info_get(safety_info, "resume_affordance_target_distance_scale")),
+                    resume_affordance_contact_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_contact_score")),
+                    resume_affordance_contact_available=_optional_bool(_safe_info_get(safety_info, "resume_affordance_contact_available")),
+                    resume_affordance_progress=_optional_float(_safe_info_get(safety_info, "resume_affordance_progress", _safe_info_get(safety_info, "resume_task_progress"))),
+                    resume_affordance_progress_delta=_optional_float(_safe_info_get(safety_info, "resume_affordance_progress_delta", _safe_info_get(safety_info, "resume_task_progress_delta"))),
+                    resume_affordance_progress_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_progress_score")),
+                    resume_affordance_alignment_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_alignment_score")),
+                    resume_affordance_continuity_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_continuity_score")),
+                    resume_affordance_safety_score=_optional_float(_safe_info_get(safety_info, "resume_affordance_safety_score")),
+                    resume_affordance_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "resume_affordance_prefix_min_clearance")),
+                    resume_affordance_required_clearance=_optional_float(_safe_info_get(safety_info, "resume_affordance_required_clearance")),
+                    act_resumable_score=_optional_float(_safe_info_get(safety_info, "act_resumable_score")),
+                    act_resumable_nominal_score=_optional_float(_safe_info_get(safety_info, "act_resumable_nominal_score")),
+                    act_resumable_live_score=_optional_float(_safe_info_get(safety_info, "act_resumable_live_score")),
+                    act_resumable_nominal_ok=_optional_bool(_safe_info_get(safety_info, "act_resumable_nominal_ok")),
+                    act_resumable_live_ok=_optional_bool(_safe_info_get(safety_info, "act_resumable_live_ok")),
+                    act_resumable_ok=_optional_bool(_safe_info_get(safety_info, "act_resumable_ok")),
+                    act_resumable_live_target_distance=_optional_float(_safe_info_get(safety_info, "act_resumable_live_target_distance")),
+                    act_resumable_live_handle_distance=_optional_float(_safe_info_get(safety_info, "act_resumable_live_handle_distance")),
+                    act_resumable_live_requires_handle_proximity=_optional_bool(_safe_info_get(safety_info, "act_resumable_live_requires_handle_proximity")),
+                    act_resumable_live_handle_limit=_optional_float(_safe_info_get(safety_info, "act_resumable_live_handle_limit")),
+                    act_resumable_geometry_untrusted=_optional_bool(_safe_info_get(safety_info, "act_resumable_geometry_untrusted")),
+                    human_done_clear_steps=_optional_int(_safe_info_get(safety_info, "human_done_clear_steps")),
+                    action_history_reset_after_exit=_optional_bool(_safe_info_get(safety_info, "action_history_reset_after_exit")),
+                    visual_history_reset_after_exit=_optional_bool(_safe_info_get(safety_info, "visual_history_reset_after_exit")),
+                    human_exit_resume_started=_optional_bool(_safe_info_get(safety_info, "human_exit_resume_started")),
+                    human_exit_resume_start_step=_optional_int(_safe_info_get(safety_info, "human_exit_resume_start_step")),
+                    human_exit_resume_action_reset_count=_optional_int(_safe_info_get(safety_info, "human_exit_resume_action_reset_count")),
+                    human_exit_resume_visual_reset_count=_optional_int(_safe_info_get(safety_info, "human_exit_resume_visual_reset_count")),
+                    human_exit_resume_act_resumable_ok=_optional_bool(_safe_info_get(safety_info, "human_exit_resume_act_resumable_ok")),
+                    ablation_force_planned_recovery_q_enabled=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_enabled")),
+                    ablation_force_planned_recovery_q_applied=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_applied")),
+                    ablation_force_planned_recovery_q_skip_reason=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_skip_reason")),
+                    ablation_force_planned_recovery_q_trigger=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_trigger")),
+                    ablation_force_planned_recovery_q_source=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_source")),
+                    ablation_force_planned_recovery_q_source_mode=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_source_mode")),
+                    ablation_force_planned_recovery_q_window_mode=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_mode")),
+                    ablation_force_planned_recovery_q_mode=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_mode")),
+                    ablation_force_planned_recovery_q_indices=_safe_info_get(safety_info, "ablation_force_planned_recovery_q_indices"),
+                    ablation_force_planned_recovery_q_dim=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_dim")),
+                    ablation_force_planned_recovery_q_l2_from_pre=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_l2_from_pre")),
+                    ablation_force_planned_recovery_q_max_abs_from_pre=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_max_abs_from_pre")),
+                    ablation_force_planned_recovery_q_arm_l2_from_pre=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_arm_l2_from_pre")),
+                    ablation_force_planned_recovery_q_base_l2_from_pre=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_base_l2_from_pre")),
+                    ablation_force_planned_recovery_q_forced_env_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_forced_env_count")),
+                    ablation_force_planned_recovery_q_reset_history_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_reset_history_count")),
+                    ablation_force_planned_recovery_q_reset_filter=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_reset_filter")),
+                    ablation_force_planned_recovery_q_sync_low_level_state_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sync_low_level_state_count")),
+                    ablation_force_planned_recovery_q_zero_velocity=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_zero_velocity")),
+                    ablation_force_planned_recovery_q_hold_current_step=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_hold_current_step")),
+                    ablation_force_planned_recovery_q_hold_delta=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_hold_delta")),
+                    ablation_force_planned_recovery_q_hold_indices=_safe_info_get(safety_info, "ablation_force_planned_recovery_q_hold_indices"),
+                    ablation_force_planned_recovery_q_seed_window_enabled=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_seed_window_enabled")),
+                    ablation_force_planned_recovery_q_window_source=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_source")),
+                    ablation_force_planned_recovery_q_window_interpolated=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_interpolated")),
+                    ablation_force_planned_recovery_q_window_len=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_len")),
+                    ablation_force_planned_recovery_q_window_obs_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_obs_count")),
+                    ablation_force_planned_recovery_q_window_seed_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_seed_count")),
+                    ablation_force_planned_recovery_q_frame_stack_seed_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_frame_stack_seed_count")),
+                    ablation_force_planned_recovery_q_window_seed_source_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_seed_source_count")),
+                    ablation_force_planned_recovery_q_window_step_l2_mean=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_step_l2_mean")),
+                    ablation_force_planned_recovery_q_window_step_l2_max=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_step_l2_max")),
+                    ablation_force_planned_recovery_q_window_qvel_enabled=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_qvel_enabled")),
+                    ablation_force_planned_recovery_q_window_qvel_dt=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_qvel_dt")),
+                    ablation_force_planned_recovery_q_window_qvel_l2_mean=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_qvel_l2_mean")),
+                    ablation_force_planned_recovery_q_window_qvel_l2_max=_optional_float(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_window_qvel_l2_max")),
+                    ablation_force_planned_recovery_q_action_history_seed_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_action_history_seed_count")),
+                    ablation_force_planned_recovery_q_action_history_seed_source=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_action_history_seed_source")),
+                    ablation_force_planned_recovery_q_replay_sequence_enabled=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_replay_sequence_enabled")),
+                    ablation_force_planned_recovery_q_replay_sequence_source=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_replay_sequence_source")),
+                    ablation_force_planned_recovery_q_replay_sequence_len=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_replay_sequence_len")),
+                    ablation_force_planned_recovery_q_sequence_active=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_active")),
+                    ablation_force_planned_recovery_q_sequence_index=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_index")),
+                    ablation_force_planned_recovery_q_sequence_len=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_len")),
+                    ablation_force_planned_recovery_q_sequence_nominal_action_used=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_nominal_action_used")),
+                    ablation_force_planned_recovery_q_sequence_action_source=_optional_str(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_action_source")),
+                    ablation_force_planned_recovery_q_sequence_action_index=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_action_index")),
+                    ablation_force_planned_recovery_q_sequence_forced_env_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_forced_env_count")),
+                    ablation_force_planned_recovery_q_sequence_completed=_optional_bool(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_completed")),
+                    ablation_force_planned_recovery_q_sequence_obs_count=_optional_int(_safe_info_get(safety_info, "ablation_force_planned_recovery_q_sequence_obs_count")),
+                    ablation_pure_act_resume_enabled=_optional_bool(_safe_info_get(safety_info, "ablation_pure_act_resume_enabled")),
+                    ablation_pure_act_resume_active=_optional_bool(_safe_info_get(safety_info, "ablation_pure_act_resume_active")),
+                    ablation_pure_act_resume_step_index=_optional_int(_safe_info_get(safety_info, "ablation_pure_act_resume_step_index")),
+                    ablation_pure_act_resume_steps_left=_optional_int(_safe_info_get(safety_info, "ablation_pure_act_resume_steps_left")),
+                    ablation_pure_act_resume_scheduled_steps=_optional_int(_safe_info_get(safety_info, "ablation_pure_act_resume_scheduled_steps")),
+                    ablation_pure_act_resume_total_steps=_optional_int(_safe_info_get(safety_info, "ablation_pure_act_resume_total_steps")),
+                    act_resume_diag_active=_optional_bool(_safe_info_get(safety_info, "act_resume_diag_active")),
+                    act_resume_diag_seed_step=_optional_int(_safe_info_get(safety_info, "act_resume_diag_seed_step")),
+                    act_resume_diag_query_step=_optional_int(_safe_info_get(safety_info, "act_resume_diag_query_step")),
+                    act_resume_diag_target_age_steps=_optional_int(_safe_info_get(safety_info, "act_resume_diag_target_age_steps")),
+                    act_resume_diag_target_action_source=_optional_str(_safe_info_get(safety_info, "act_resume_diag_target_action_source")),
+                    act_resume_diag_target_action_rows=_optional_int(_safe_info_get(safety_info, "act_resume_diag_target_action_rows")),
+                    act_resume_diag_target_action_dim=_optional_int(_safe_info_get(safety_info, "act_resume_diag_target_action_dim")),
+                    act_resume_diag_predicted_first_action_norm=_optional_float(_safe_info_get(safety_info, "act_resume_diag_predicted_first_action_norm")),
+                    act_resume_diag_target_first_action_norm=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_first_action_norm")),
+                    act_resume_diag_target_window_best_index=_optional_int(_safe_info_get(safety_info, "act_resume_diag_target_window_best_index")),
+                    act_resume_diag_target_window_best_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_window_best_l2")),
+                    act_resume_diag_target_window_l2_0=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_window_l2_0")),
+                    act_resume_diag_target_window_l2_1=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_window_l2_1")),
+                    act_resume_diag_target_window_l2_2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_window_l2_2")),
+                    act_resume_diag_target_window_l2_3=_optional_float(_safe_info_get(safety_info, "act_resume_diag_target_window_l2_3")),
+                    act_resume_diag_policy_obs_vs_seed_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_common_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_common_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_missing_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_missing_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_shape_mismatch_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_shape_mismatch_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_mismatch_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_mismatch_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_l2")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_mean_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_mean_abs")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_max_abs")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_worst_key=_optional_str(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_worst_key")),
+                    act_resume_diag_policy_obs_vs_seed_numeric_worst_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_numeric_worst_l2")),
+                    act_resume_diag_policy_obs_vs_seed_image_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_image_mismatch_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_mismatch_key_count")),
+                    act_resume_diag_policy_obs_vs_seed_image_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_l2")),
+                    act_resume_diag_policy_obs_vs_seed_image_mean_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_mean_abs")),
+                    act_resume_diag_policy_obs_vs_seed_image_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_max_abs")),
+                    act_resume_diag_policy_obs_vs_seed_image_worst_key=_optional_str(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_worst_key")),
+                    act_resume_diag_policy_obs_vs_seed_image_worst_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_obs_vs_seed_image_worst_l2")),
+                    act_resume_diag_visual_pose_vs_seed_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_key_count")),
+                    act_resume_diag_visual_pose_vs_seed_common_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_common_key_count")),
+                    act_resume_diag_visual_pose_vs_seed_missing_key_count=_optional_int(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_missing_key_count")),
+                    act_resume_diag_visual_pose_vs_seed_pos_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_pos_l2")),
+                    act_resume_diag_visual_pose_vs_seed_pos_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_pos_max_abs")),
+                    act_resume_diag_visual_pose_vs_seed_pos_worst_key=_optional_str(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_pos_worst_key")),
+                    act_resume_diag_visual_pose_vs_seed_pos_worst_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_pos_worst_l2")),
+                    act_resume_diag_visual_pose_vs_seed_wrist_pos_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_wrist_pos_l2")),
+                    act_resume_diag_visual_pose_vs_seed_head_pos_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_head_pos_l2")),
+                    act_resume_diag_visual_pose_vs_seed_camera_pos_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_camera_pos_l2")),
+                    act_resume_diag_visual_pose_vs_seed_xmat_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_xmat_l2")),
+                    act_resume_diag_visual_pose_vs_seed_xmat_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_xmat_max_abs")),
+                    act_resume_diag_visual_pose_vs_seed_xmat_worst_key=_optional_str(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_xmat_worst_key")),
+                    act_resume_diag_visual_pose_vs_seed_xmat_worst_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_visual_pose_vs_seed_xmat_worst_l2")),
+                    act_resume_diag_policy_low_dim_vs_seed_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_low_dim_vs_seed_l2")),
+                    act_resume_diag_policy_low_dim_vs_seed_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_low_dim_vs_seed_max_abs")),
+                    act_resume_diag_policy_low_dim_vs_seed_cosine=_optional_float(_safe_info_get(safety_info, "act_resume_diag_policy_low_dim_vs_seed_cosine")),
+                    act_resume_diag_policy_low_dim_vs_seed_dim=_optional_int(_safe_info_get(safety_info, "act_resume_diag_policy_low_dim_vs_seed_dim")),
+                    act_resume_diag_first_action_vs_target_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_first_action_vs_target_l2")),
+                    act_resume_diag_first_action_vs_target_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_first_action_vs_target_max_abs")),
+                    act_resume_diag_first_action_vs_target_cosine=_optional_float(_safe_info_get(safety_info, "act_resume_diag_first_action_vs_target_cosine")),
+                    act_resume_diag_first_action_vs_target_dim=_optional_int(_safe_info_get(safety_info, "act_resume_diag_first_action_vs_target_dim")),
+                    act_resume_diag_executed_vs_act_first_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_act_first_l2")),
+                    act_resume_diag_executed_vs_act_first_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_act_first_max_abs")),
+                    act_resume_diag_executed_vs_act_first_cosine=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_act_first_cosine")),
+                    act_resume_diag_executed_vs_act_first_dim=_optional_int(_safe_info_get(safety_info, "act_resume_diag_executed_vs_act_first_dim")),
+                    act_resume_diag_executed_vs_target_l2=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_target_l2")),
+                    act_resume_diag_executed_vs_target_max_abs=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_target_max_abs")),
+                    act_resume_diag_executed_vs_target_cosine=_optional_float(_safe_info_get(safety_info, "act_resume_diag_executed_vs_target_cosine")),
+                    act_resume_diag_executed_vs_target_dim=_optional_int(_safe_info_get(safety_info, "act_resume_diag_executed_vs_target_dim")),
+                    act_reentry_diag_active=_optional_bool(_safe_info_get(safety_info, "act_reentry_diag_active")),
+                    act_reentry_diag_policy_low_dim_dim=_optional_int(_safe_info_get(safety_info, "act_reentry_diag_policy_low_dim_dim")),
+                    act_reentry_diag_policy_low_dim_norm=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_policy_low_dim_norm")),
+                    act_reentry_diag_policy_low_dim_mean=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_policy_low_dim_mean")),
+                    act_reentry_diag_policy_low_dim_std=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_policy_low_dim_std")),
+                    act_reentry_diag_policy_low_dim_max_abs=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_policy_low_dim_max_abs")),
+                    act_reentry_diag_image_key_count=_optional_int(_safe_info_get(safety_info, "act_reentry_diag_image_key_count")),
+                    act_reentry_diag_image_mean_mean=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_image_mean_mean")),
+                    act_reentry_diag_image_std_mean=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_image_std_mean")),
+                    act_reentry_diag_image_max_abs_mean=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_image_max_abs_mean")),
+                    rhc_executed_action_available=_safe_info_get(safety_info, "rhc_executed_action_available"),
+                    rhc_execution_index=_optional_int(_safe_info_get(safety_info, "rhc_execution_index")),
+                    rhc_requested_vs_executed_l2=_optional_float(_safe_info_get(safety_info, "rhc_requested_vs_executed_l2")),
+                    rhc_requested_vs_executed_max_abs=_optional_float(_safe_info_get(safety_info, "rhc_requested_vs_executed_max_abs")),
+                    rhc_requested_vs_executed_cosine=_optional_float(_safe_info_get(safety_info, "rhc_requested_vs_executed_cosine")),
+                    act_reentry_diag_act_first_vs_safe_l2=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_act_first_vs_safe_l2")),
+                    act_reentry_diag_act_first_vs_safe_max_abs=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_act_first_vs_safe_max_abs")),
+                    act_reentry_diag_act_first_vs_safe_cosine=_optional_float(_safe_info_get(safety_info, "act_reentry_diag_act_first_vs_safe_cosine")),
+                    act_reentry_diag_act_first_vs_safe_dim=_optional_int(_safe_info_get(safety_info, "act_reentry_diag_act_first_vs_safe_dim")),
+                    act_action_agreement_logged=_optional_bool(_safe_info_get(safety_info, "act_action_agreement_logged")),
+                    act_action_agreement_context=_optional_str(_safe_info_get(safety_info, "act_action_agreement_context")),
+                    act_action_agreement_pair_count=_optional_int(_safe_info_get(safety_info, "act_action_agreement_pair_count")),
+                    act_action_agreement_post_recovery_or_reentry=_optional_bool(_safe_info_get(safety_info, "act_action_agreement_post_recovery_or_reentry")),
+                    act_action_agreement_act_vs_safe_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_l2")),
+                    act_action_agreement_act_vs_safe_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_max_abs")),
+                    act_action_agreement_act_vs_safe_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_cosine")),
+                    act_action_agreement_act_vs_safe_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_dim")),
+                    act_action_agreement_act_vs_safe_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_arm_l2")),
+                    act_action_agreement_act_vs_safe_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_arm_max_abs")),
+                    act_action_agreement_act_vs_safe_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_arm_dim")),
+                    act_action_agreement_act_vs_safe_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_gripper_delta")),
+                    act_action_agreement_act_vs_safe_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_safe_gripper_abs_delta")),
+                    act_action_agreement_act_vs_nominal_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_l2")),
+                    act_action_agreement_act_vs_nominal_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_max_abs")),
+                    act_action_agreement_act_vs_nominal_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_cosine")),
+                    act_action_agreement_act_vs_nominal_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_dim")),
+                    act_action_agreement_act_vs_nominal_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_arm_l2")),
+                    act_action_agreement_act_vs_nominal_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_arm_max_abs")),
+                    act_action_agreement_act_vs_nominal_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_arm_dim")),
+                    act_action_agreement_act_vs_nominal_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_gripper_delta")),
+                    act_action_agreement_act_vs_nominal_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_nominal_gripper_abs_delta")),
+                    act_action_agreement_safe_vs_nominal_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_l2")),
+                    act_action_agreement_safe_vs_nominal_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_max_abs")),
+                    act_action_agreement_safe_vs_nominal_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_cosine")),
+                    act_action_agreement_safe_vs_nominal_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_dim")),
+                    act_action_agreement_safe_vs_nominal_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_arm_l2")),
+                    act_action_agreement_safe_vs_nominal_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_arm_max_abs")),
+                    act_action_agreement_safe_vs_nominal_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_arm_dim")),
+                    act_action_agreement_safe_vs_nominal_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_gripper_delta")),
+                    act_action_agreement_safe_vs_nominal_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_nominal_gripper_abs_delta")),
+                    act_action_agreement_act_vs_target_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_l2")),
+                    act_action_agreement_act_vs_target_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_max_abs")),
+                    act_action_agreement_act_vs_target_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_cosine")),
+                    act_action_agreement_act_vs_target_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_dim")),
+                    act_action_agreement_act_vs_target_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_arm_l2")),
+                    act_action_agreement_act_vs_target_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_arm_max_abs")),
+                    act_action_agreement_act_vs_target_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_arm_dim")),
+                    act_action_agreement_act_vs_target_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_gripper_delta")),
+                    act_action_agreement_act_vs_target_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_target_gripper_abs_delta")),
+                    act_action_agreement_safe_vs_target_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_l2")),
+                    act_action_agreement_safe_vs_target_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_max_abs")),
+                    act_action_agreement_safe_vs_target_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_cosine")),
+                    act_action_agreement_safe_vs_target_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_dim")),
+                    act_action_agreement_safe_vs_target_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_arm_l2")),
+                    act_action_agreement_safe_vs_target_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_arm_max_abs")),
+                    act_action_agreement_safe_vs_target_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_arm_dim")),
+                    act_action_agreement_safe_vs_target_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_gripper_delta")),
+                    act_action_agreement_safe_vs_target_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_target_gripper_abs_delta")),
+                    act_action_agreement_act_vs_last_recovery_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_l2")),
+                    act_action_agreement_act_vs_last_recovery_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_max_abs")),
+                    act_action_agreement_act_vs_last_recovery_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_cosine")),
+                    act_action_agreement_act_vs_last_recovery_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_dim")),
+                    act_action_agreement_act_vs_last_recovery_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_arm_l2")),
+                    act_action_agreement_act_vs_last_recovery_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_arm_max_abs")),
+                    act_action_agreement_act_vs_last_recovery_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_arm_dim")),
+                    act_action_agreement_act_vs_last_recovery_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_gripper_delta")),
+                    act_action_agreement_act_vs_last_recovery_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_last_recovery_gripper_abs_delta")),
+                    act_action_agreement_safe_vs_last_recovery_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_l2")),
+                    act_action_agreement_safe_vs_last_recovery_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_max_abs")),
+                    act_action_agreement_safe_vs_last_recovery_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_cosine")),
+                    act_action_agreement_safe_vs_last_recovery_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_dim")),
+                    act_action_agreement_safe_vs_last_recovery_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_arm_l2")),
+                    act_action_agreement_safe_vs_last_recovery_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_arm_max_abs")),
+                    act_action_agreement_safe_vs_last_recovery_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_arm_dim")),
+                    act_action_agreement_safe_vs_last_recovery_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_gripper_delta")),
+                    act_action_agreement_safe_vs_last_recovery_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_last_recovery_gripper_abs_delta")),
+                    act_action_agreement_act_vs_handoff_release_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_l2")),
+                    act_action_agreement_act_vs_handoff_release_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_max_abs")),
+                    act_action_agreement_act_vs_handoff_release_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_cosine")),
+                    act_action_agreement_act_vs_handoff_release_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_dim")),
+                    act_action_agreement_act_vs_handoff_release_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_arm_l2")),
+                    act_action_agreement_act_vs_handoff_release_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_arm_max_abs")),
+                    act_action_agreement_act_vs_handoff_release_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_arm_dim")),
+                    act_action_agreement_act_vs_handoff_release_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_gripper_delta")),
+                    act_action_agreement_act_vs_handoff_release_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_handoff_release_gripper_abs_delta")),
+                    act_action_agreement_safe_vs_handoff_release_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_l2")),
+                    act_action_agreement_safe_vs_handoff_release_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_max_abs")),
+                    act_action_agreement_safe_vs_handoff_release_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_cosine")),
+                    act_action_agreement_safe_vs_handoff_release_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_dim")),
+                    act_action_agreement_safe_vs_handoff_release_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_arm_l2")),
+                    act_action_agreement_safe_vs_handoff_release_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_arm_max_abs")),
+                    act_action_agreement_safe_vs_handoff_release_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_arm_dim")),
+                    act_action_agreement_safe_vs_handoff_release_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_gripper_delta")),
+                    act_action_agreement_safe_vs_handoff_release_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_handoff_release_gripper_abs_delta")),
+                    act_action_agreement_act_vs_executed_handoff_release_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_l2")),
+                    act_action_agreement_act_vs_executed_handoff_release_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_max_abs")),
+                    act_action_agreement_act_vs_executed_handoff_release_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_cosine")),
+                    act_action_agreement_act_vs_executed_handoff_release_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_dim")),
+                    act_action_agreement_act_vs_executed_handoff_release_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_arm_l2")),
+                    act_action_agreement_act_vs_executed_handoff_release_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_arm_max_abs")),
+                    act_action_agreement_act_vs_executed_handoff_release_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_arm_dim")),
+                    act_action_agreement_act_vs_executed_handoff_release_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_gripper_delta")),
+                    act_action_agreement_act_vs_executed_handoff_release_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_act_vs_executed_handoff_release_gripper_abs_delta")),
+                    act_action_agreement_safe_vs_executed_handoff_release_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_l2")),
+                    act_action_agreement_safe_vs_executed_handoff_release_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_max_abs")),
+                    act_action_agreement_safe_vs_executed_handoff_release_cosine=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_cosine")),
+                    act_action_agreement_safe_vs_executed_handoff_release_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_dim")),
+                    act_action_agreement_safe_vs_executed_handoff_release_arm_l2=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_arm_l2")),
+                    act_action_agreement_safe_vs_executed_handoff_release_arm_max_abs=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_arm_max_abs")),
+                    act_action_agreement_safe_vs_executed_handoff_release_arm_dim=_optional_int(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_arm_dim")),
+                    act_action_agreement_safe_vs_executed_handoff_release_gripper_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_gripper_delta")),
+                    act_action_agreement_safe_vs_executed_handoff_release_gripper_abs_delta=_optional_float(_safe_info_get(safety_info, "act_action_agreement_safe_vs_executed_handoff_release_gripper_abs_delta")),
                     min_h=min_h,
+                    live_min_clearance=_optional_float(live_min_clearance),
+                    live_h_violation_threshold=_optional_float(_safe_info_get(safety_info, "live_h_violation_threshold")),
+                    live_h_violation_source=_optional_str(_safe_info_get(safety_info, "live_h_violation_source")),
+                    live_h_argmin_pair_label=_optional_str(_safe_info_get(safety_info, "live_h_argmin_pair_label")),
+                    live_h_argmin_pair_index=_optional_int(_safe_info_get(safety_info, "live_h_argmin_pair_index")),
+                    live_h_argmin_dist_sq=_optional_float(_safe_info_get(safety_info, "live_h_argmin_dist_sq")),
+                    live_h_argmin_combined_radius=_optional_float(_safe_info_get(safety_info, "live_h_argmin_combined_radius")),
+                    live_h_argmin_robot_radius=_optional_float(_safe_info_get(safety_info, "live_h_argmin_robot_radius")),
+                    live_h_argmin_human_radius=_optional_float(_safe_info_get(safety_info, "live_h_argmin_human_radius")),
+                    live_h_clearance_values=_jsonable_trace_value(_safe_info_get(safety_info, "live_h_clearance_values")),
+                    live_raw_min_h=_optional_float(_safe_info_get(safety_info, "live_raw_min_h")),
+                    live_raw_min_h_pair_label=_optional_str(_safe_info_get(safety_info, "live_raw_min_h_pair_label")),
                     h_values=h_values,
+                    h_argmin_horizon_index=_optional_int(_safe_info_get(
+                        safety_info,
+                        "h_argmin_horizon_index",
+                        h_attribution_info.get("h_argmin_horizon_index"),
+                    )),
+                    h_argmin_pair_index=_optional_int(_safe_info_get(
+                        safety_info,
+                        "h_argmin_pair_index",
+                        h_attribution_info.get("h_argmin_pair_index"),
+                    )),
+                    h_argmin_robot_part=_optional_str(_safe_info_get(
+                        safety_info,
+                        "h_argmin_robot_part",
+                        h_attribution_info.get("h_argmin_robot_part"),
+                    )),
+                    h_argmin_human_part=_optional_str(_safe_info_get(
+                        safety_info,
+                        "h_argmin_human_part",
+                        h_attribution_info.get("h_argmin_human_part"),
+                    )),
+                    h_argmin_human_capsule_index=_optional_int(_safe_info_get(
+                        safety_info,
+                        "h_argmin_human_capsule_index",
+                        h_attribution_info.get("h_argmin_human_capsule_index"),
+                    )),
+                    h_argmin_human_arm_index=_optional_int(_safe_info_get(
+                        safety_info,
+                        "h_argmin_human_arm_index",
+                        h_attribution_info.get("h_argmin_human_arm_index"),
+                    )),
+                    h_pair_values_at_argmin=_jsonable_trace_value(_safe_info_get(
+                        safety_info,
+                        "h_pair_values_at_argmin",
+                        h_attribution_info.get("h_pair_values_at_argmin"),
+                    )),
                     h_violation=h_violation,
                     live_h_monitor_skipped=bool(live_h_monitor_skipped),
                     chunk_min_clearance=_safe_info_get(safety_info, "min_clearance"),
@@ -10262,16 +9591,10 @@ def main():
                     base_delta=base_delta,
                     non_arm_delta=non_arm_delta,
                     full_delta=full_delta,
-                    per_step_action_delta_norm=full_delta,
-                    per_step_arm_delta_norm=arm_delta,
-                    per_step_base_delta_norm=base_delta,
                     chunk_arm_delta=chunk_arm_delta,
                     chunk_base_delta=chunk_base_delta,
                     chunk_non_arm_delta=chunk_non_arm_delta,
                     chunk_full_delta=chunk_full_delta,
-                    chunk_action_delta_norm=chunk_full_delta,
-                    chunk_arm_delta_norm=chunk_arm_delta,
-                    chunk_base_delta_norm=chunk_base_delta,
                     chunk_modified_fraction=chunk_advantage_metrics["chunk_modified_fraction"],
                     chunk_modified_steps=chunk_advantage_metrics["chunk_modified_steps"],
                     chunk_first_modified_step=chunk_advantage_metrics["chunk_first_modified_step"],
@@ -10339,7 +9662,7 @@ def main():
                     deform_stage_min_clearance=_safe_info_get(
                         safety_info, "deform_stage_min_clearance"
                     ),
-                    deform_stage_accepted=_safe_info_get(safety_info, "deform_stage_accepted", _safe_info_get(safety_info, "yield_accepted")),
+                    deform_stage_accepted=_safe_info_get(safety_info, "deform_stage_accepted"),
                     recover_min_clearance=_safe_info_get(
                         safety_info, "recover_min_clearance"
                     ),
@@ -10349,7 +9672,12 @@ def main():
                     recover_target_index=_safe_info_get(
                         safety_info, "recover_target_index"
                     ),
-                    recover_accepted=_safe_info_get(safety_info, "recover_accepted", _safe_info_get(safety_info, "return_accepted")),
+                    recover_accepted=_safe_info_get(safety_info, "recover_accepted"),
+                    recover_corridor_accepted=_safe_info_get(
+                        safety_info,
+                        "recover_corridor_accepted",
+                        _safe_info_get(safety_info, "return_accepted"),
+                    ),
                     recover_required=_safe_info_get(safety_info, "recover_required"),
                     recovery_candidate_class=_safe_info_get(safety_info, "recovery_candidate_class"),
                     recover_reject_reason=_safe_info_get(safety_info, "recover_reject_reason"),
@@ -10394,6 +9722,17 @@ def main():
                         safety_info, "qd_rejoin_threshold"
                     ),
                     qd_rejoin_index=_safe_info_get(safety_info, "qd_rejoin_index"),
+                    deform_rejoin_available=_safe_info_get(safety_info, "deform_rejoin_available"),
+                    deform_rejoin_window_loss=_safe_info_get(safety_info, "deform_rejoin_window_loss"),
+                    deform_rejoin_q_loss=_safe_info_get(safety_info, "deform_rejoin_q_loss"),
+                    deform_rejoin_qd_loss=_safe_info_get(safety_info, "deform_rejoin_qd_loss"),
+                    deform_rejoin_action_loss=_safe_info_get(safety_info, "deform_rejoin_action_loss"),
+                    deform_rejoin_heading_loss=_safe_info_get(safety_info, "deform_rejoin_heading_loss"),
+                    deform_rejoin_q_dist=_safe_info_get(safety_info, "deform_rejoin_q_dist"),
+                    deform_rejoin_qd_dist=_safe_info_get(safety_info, "deform_rejoin_qd_dist"),
+                    deform_rejoin_action_dist=_safe_info_get(safety_info, "deform_rejoin_action_dist"),
+                    deform_rejoin_heading_cosine=_safe_info_get(safety_info, "deform_rejoin_heading_cosine"),
+                    deform_rejoin_best_window_offset=_safe_info_get(safety_info, "deform_rejoin_best_window_offset"),
                     ee_rejoin_loss=_safe_info_get(safety_info, "ee_rejoin_loss"),
                     ee_rejoin_dist=_safe_info_get(safety_info, "ee_rejoin_dist"),
                     ee_rejoin_threshold=_safe_info_get(
@@ -10425,6 +9764,16 @@ def main():
                         safety_info, "existing_optimization_loss"
                     ),
                     smoothness_loss=_safe_info_get(safety_info, "smoothness_loss"),
+                    deform_envelope_loss=_safe_info_get(safety_info, "deform_envelope_loss"),
+                    deform_envelope_first_delta=_safe_info_get(safety_info, "deform_envelope_first_delta"),
+                    deform_envelope_first_violation=_safe_info_get(safety_info, "deform_envelope_first_violation"),
+                    deform_envelope_avoid_rate_loss=_safe_info_get(safety_info, "deform_envelope_avoid_rate_loss"),
+                    deform_envelope_return_rate_loss=_safe_info_get(safety_info, "deform_envelope_return_rate_loss"),
+                    deform_envelope_max_rate=_safe_info_get(safety_info, "deform_envelope_max_rate"),
+                    deform_envelope_terminal_delta=_safe_info_get(safety_info, "deform_envelope_terminal_delta"),
+                    deform_envelope_terminal_violation=_safe_info_get(safety_info, "deform_envelope_terminal_violation"),
+                    deform_envelope_terminal_loss=_safe_info_get(safety_info, "deform_envelope_terminal_loss"),
+                    deform_envelope_acceleration_loss=_safe_info_get(safety_info, "deform_envelope_acceleration_loss"),
                     total_loss=_safe_info_get(safety_info, "total_loss"),
                     fallback_used=_safe_info_get(safety_info, "fallback_used"),
                     act_resume_index=_safe_info_get(safety_info, "act_resume_index"),
@@ -10438,16 +9787,110 @@ def main():
                     committed_rejoin_index=_safe_info_get(safety_info, "committed_rejoin_index"),
                     committed_chunk_started=_safe_info_get(safety_info, "committed_chunk_started"),
                     committed_chunk_completed=_safe_info_get(safety_info, "committed_chunk_completed"),
+                    committed_receding_horizon_replan=_safe_info_get(safety_info, "committed_receding_horizon_replan"),
+                    committed_receding_horizon_reason=_safe_info_get(safety_info, "committed_receding_horizon_reason"),
+                    committed_receding_horizon_prefix_steps=_safe_info_get(safety_info, "committed_receding_horizon_prefix_steps"),
+                    committed_receding_horizon_remaining_steps=_safe_info_get(safety_info, "committed_receding_horizon_remaining_steps"),
+                    committed_receding_recover_steps=_safe_info_get(safety_info, "committed_receding_recover_steps"),
+                    committed_nominal_tube_tracking_applied=_safe_info_get(safety_info, "committed_nominal_tube_tracking_applied"),
+                    committed_nominal_tube_tracking_source=_safe_info_get(safety_info, "committed_nominal_tube_tracking_source"),
+                    committed_nominal_tube_tracking_target_index=_safe_info_get(safety_info, "committed_nominal_tube_tracking_target_index"),
+                    committed_nominal_tube_tracking_sequential_targeting=_safe_info_get(safety_info, "committed_nominal_tube_tracking_sequential_targeting"),
+                    committed_nominal_tube_tracking_sequence_step=_safe_info_get(safety_info, "committed_nominal_tube_tracking_sequence_step"),
+                    committed_nominal_tube_tracking_desired_target_index=_safe_info_get(safety_info, "committed_nominal_tube_tracking_desired_target_index"),
+                    committed_nominal_tube_tracking_sequence_reset=_safe_info_get(safety_info, "committed_nominal_tube_tracking_sequence_reset"),
+                    committed_nominal_tube_tracking_sequence_hold_due_to_actual_error=_safe_info_get(safety_info, "committed_nominal_tube_tracking_sequence_hold_due_to_actual_error"),
+                    committed_nominal_tube_tracking_q_l2_before=_safe_info_get(safety_info, "committed_nominal_tube_tracking_q_l2_before"),
+                    committed_nominal_tube_tracking_q_l2_after=_safe_info_get(safety_info, "committed_nominal_tube_tracking_q_l2_after"),
+                    committed_nominal_tube_tracking_q_window_l2_before=_safe_info_get(safety_info, "committed_nominal_tube_tracking_q_window_l2_before"),
+                    committed_nominal_tube_tracking_q_window_l2_after=_safe_info_get(safety_info, "committed_nominal_tube_tracking_q_window_l2_after"),
+                    committed_nominal_tube_tracking_live_window_min_l2=_safe_info_get(safety_info, "committed_nominal_tube_tracking_live_window_min_l2"),
+                    committed_nominal_tube_tracking_live_window_l2_mean=_safe_info_get(safety_info, "committed_nominal_tube_tracking_live_window_l2_mean"),
+                    committed_nominal_tube_tracking_live_window_l2_max=_safe_info_get(safety_info, "committed_nominal_tube_tracking_live_window_l2_max"),
+                    committed_nominal_tube_tracking_live_window_slot_count=_safe_info_get(safety_info, "committed_nominal_tube_tracking_live_window_slot_count"),
+                    committed_nominal_tube_tracking_q_max_abs_before=_safe_info_get(safety_info, "committed_nominal_tube_tracking_q_max_abs_before"),
+                    committed_nominal_tube_tracking_selected_resume_window_index=_safe_info_get(safety_info, "committed_nominal_tube_tracking_selected_resume_window_index"),
+                    committed_nominal_tube_tracking_selected_resume_score=_safe_info_get(safety_info, "committed_nominal_tube_tracking_selected_resume_score"),
+                    committed_nominal_tube_tracking_resume_score_before=_safe_info_get(safety_info, "committed_nominal_tube_tracking_resume_score_before"),
+                    committed_nominal_tube_tracking_resume_score_after=_safe_info_get(safety_info, "committed_nominal_tube_tracking_resume_score_after"),
+                    committed_nominal_tube_tracking_heading_error_before=_safe_info_get(safety_info, "committed_nominal_tube_tracking_heading_error_before"),
+                    committed_nominal_tube_tracking_heading_error_after=_safe_info_get(safety_info, "committed_nominal_tube_tracking_heading_error_after"),
+                    committed_nominal_tube_tracking_rollout_solver=_safe_info_get(safety_info, "committed_nominal_tube_tracking_rollout_solver"),
+                    committed_nominal_tube_tracking_servo_mode=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_mode"),
+                    committed_nominal_tube_tracking_servo_scale=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_scale"),
+                    committed_nominal_tube_tracking_servo_boost_active=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_boost_active"),
+                    committed_nominal_tube_tracking_servo_adaptive_slowdown_active=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_adaptive_slowdown_active"),
+                    committed_nominal_tube_tracking_servo_previous_negative_streak=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_previous_negative_streak"),
+                    committed_nominal_tube_tracking_adaptive_retargeted=_safe_info_get(safety_info, "committed_nominal_tube_tracking_adaptive_retargeted"),
+                    committed_nominal_tube_tracking_servo_boost_scale=_safe_info_get(safety_info, "committed_nominal_tube_tracking_servo_boost_scale"),
+                    committed_nominal_tube_tracking_response_gain_source=_safe_info_get(safety_info, "committed_nominal_tube_tracking_response_gain_source"),
+                    committed_nominal_tube_tracking_response_gain_mean=_safe_info_get(safety_info, "committed_nominal_tube_tracking_response_gain_mean"),
+                    committed_nominal_tube_tracking_response_gain_min=_safe_info_get(safety_info, "committed_nominal_tube_tracking_response_gain_min"),
+                    committed_nominal_tube_tracking_response_gain_max=_safe_info_get(safety_info, "committed_nominal_tube_tracking_response_gain_max"),
+                    committed_nominal_tube_tracking_solver_candidate_count=_safe_info_get(safety_info, "committed_nominal_tube_tracking_solver_candidate_count"),
+                    committed_nominal_tube_tracking_best_candidate=_safe_info_get(safety_info, "committed_nominal_tube_tracking_best_candidate"),
+                    committed_nominal_tube_tracking_solver_loss=_safe_info_get(safety_info, "committed_nominal_tube_tracking_solver_loss"),
+                    committed_nominal_tube_tracking_rollout_predicted_improvement=_safe_info_get(safety_info, "committed_nominal_tube_tracking_rollout_predicted_improvement"),
+                    committed_nominal_tube_tracking_actual_improvement=_safe_info_get(safety_info, "committed_nominal_tube_tracking_actual_improvement"),
+                    committed_nominal_tube_tracking_negative_actual_improvement_streak=_safe_info_get(safety_info, "committed_nominal_tube_tracking_negative_actual_improvement_streak"),
+                    committed_nominal_tube_tracking_max_negative_actual_steps=_safe_info_get(safety_info, "committed_nominal_tube_tracking_max_negative_actual_steps"),
+                    committed_nominal_tube_tracking_failed=_safe_info_get(safety_info, "committed_nominal_tube_tracking_failed"),
+                    committed_nominal_tube_tracking_min_predicted_improvement=_safe_info_get(safety_info, "committed_nominal_tube_tracking_min_predicted_improvement"),
+                    committed_nominal_tube_tracking_retargeted=_safe_info_get(safety_info, "committed_nominal_tube_tracking_retargeted"),
+                    committed_nominal_tube_tracking_retarget_count=_safe_info_get(safety_info, "committed_nominal_tube_tracking_retarget_count"),
+                    committed_nominal_tube_tracking_action_delta_l2=_safe_info_get(safety_info, "committed_nominal_tube_tracking_action_delta_l2"),
+                    committed_nominal_tube_tracking_done_threshold=_safe_info_get(safety_info, "committed_nominal_tube_tracking_done_threshold"),
+                    committed_nominal_tube_tracking_ready=_safe_info_get(safety_info, "committed_nominal_tube_tracking_ready"),
+                    committed_nominal_tube_tracking_max_recover_steps=_safe_info_get(safety_info, "committed_nominal_tube_tracking_max_recover_steps"),
+                    committed_receding_horizon_deferred=_safe_info_get(safety_info, "committed_receding_horizon_deferred"),
+                    committed_receding_horizon_defer_reason=_safe_info_get(safety_info, "committed_receding_horizon_defer_reason"),
+                    committed_receding_horizon_step_cap_reached=_safe_info_get(safety_info, "committed_receding_horizon_step_cap_reached"),
                     committed_aborted_due_to_safety=_safe_info_get(safety_info, "committed_aborted_due_to_safety"),
                     committed_repaired_step=_safe_info_get(safety_info, "committed_repaired_step"),
                     committed_repair_min_clearance=_safe_info_get(safety_info, "committed_repair_min_clearance"),
                     committed_repair_clearance_gain=_safe_info_get(safety_info, "committed_repair_clearance_gain"),
+                    committed_repair_time_ms=_safe_info_get(safety_info, "committed_repair_time_ms"),
+                    committed_repair_safety_time_ms=_safe_info_get(safety_info, "committed_repair_safety_time_ms"),
+                    committed_action_safety_time_ms=_safe_info_get(safety_info, "committed_action_safety_time_ms"),
+                    committed_abort_brake_time_ms=_safe_info_get(safety_info, "committed_abort_brake_time_ms"),
                     recover_steps_executed=_safe_info_get(safety_info, "recover_steps_executed", _safe_info_get(safety_info, "return_steps_executed")),
                     deform_steps_executed=_safe_info_get(safety_info, "deform_steps_executed", _safe_info_get(safety_info, "yield_steps_executed")),
                     resume_from_committed_rejoin=_safe_info_get(safety_info, "resume_from_committed_rejoin"),
                     request_action_history_reset_after_recovery=_safe_info_get(safety_info, "request_action_history_reset_after_recovery"),
+                    implicit_action_history_reset_after_intervention=_safe_info_get(safety_info, "implicit_action_history_reset_after_intervention"),
+                    recovery_action_history_reset_request_reason=_safe_info_get(safety_info, "recovery_action_history_reset_request_reason"),
                     recovery_action_history_reset=_safe_info_get(safety_info, "recovery_action_history_reset"),
                     recovery_action_history_reset_count=_safe_info_get(safety_info, "recovery_action_history_reset_count"),
+                    recovery_action_history_reset_config=_safe_info_get(safety_info, "recovery_action_history_reset_config"),
+                    recovery_action_history_reset_reason=_safe_info_get(safety_info, "recovery_action_history_reset_reason"),
+                    recovery_low_level_hold_sync=_safe_info_get(safety_info, "recovery_low_level_hold_sync"),
+                    recovery_low_level_hold_sync_count=_safe_info_get(safety_info, "recovery_low_level_hold_sync_count"),
+                    recovery_visual_history_reset=_safe_info_get(safety_info, "recovery_visual_history_reset"),
+                    recovery_visual_history_reset_count=_safe_info_get(safety_info, "recovery_visual_history_reset_count"),
+                    recovery_visual_history_seed=_safe_info_get(safety_info, "recovery_visual_history_seed"),
+                    recovery_visual_history_seed_count=_safe_info_get(safety_info, "recovery_visual_history_seed_count"),
+                    recovery_visual_history_seed_source_count=_safe_info_get(safety_info, "recovery_visual_history_seed_source_count"),
+                    recovery_policy_obs_history_seed=_safe_info_get(safety_info, "recovery_policy_obs_history_seed"),
+                    recovery_policy_obs_history_seed_count=_safe_info_get(safety_info, "recovery_policy_obs_history_seed_count"),
+                    recovery_policy_obs_history_seed_source_count=_safe_info_get(safety_info, "recovery_policy_obs_history_seed_source_count"),
+                    post_recovery_act_bridge_started=_safe_info_get(safety_info, "post_recovery_act_bridge_started"),
+                    post_recovery_act_bridge_active=_safe_info_get(safety_info, "post_recovery_act_bridge_active"),
+                    post_recovery_act_bridge_steps_left=_safe_info_get(safety_info, "post_recovery_act_bridge_steps_left"),
+                    post_recovery_act_bridge_total_steps=_safe_info_get(safety_info, "post_recovery_act_bridge_total_steps"),
+                    post_recovery_act_bridge_step_index=_safe_info_get(safety_info, "post_recovery_act_bridge_step_index"),
+                    post_recovery_act_bridge_last_recovery_step=_safe_info_get(safety_info, "post_recovery_act_bridge_last_recovery_step"),
+                    post_recovery_act_bridge_fresh_action_seed_pending=_safe_info_get(safety_info, "post_recovery_act_bridge_fresh_action_seed_pending"),
+                    post_recovery_act_bridge_fresh_action_seed_count=_safe_info_get(safety_info, "post_recovery_act_bridge_fresh_action_seed_count"),
+                    post_recovery_act_bridge_fresh_action_seed_reset_count=_safe_info_get(safety_info, "post_recovery_act_bridge_fresh_action_seed_reset_count"),
+                    post_recovery_act_bridge_fresh_action_seed_source=_safe_info_get(safety_info, "post_recovery_act_bridge_fresh_action_seed_source"),
+                    action_bridge_last_recovery_vs_resume_l2=_safe_info_get(safety_info, "action_bridge_last_recovery_vs_resume_l2"),
+                    action_bridge_last_recovery_vs_resume_cosine=_safe_info_get(safety_info, "action_bridge_last_recovery_vs_resume_cosine"),
+                    action_bridge_last_recovery_arm_l2=_safe_info_get(safety_info, "action_bridge_last_recovery_arm_l2"),
+                    action_bridge_last_recovery_gripper_delta=_safe_info_get(safety_info, "action_bridge_last_recovery_gripper_delta"),
+                    action_bridge_temporal_history_slot_count=_safe_info_get(safety_info, "action_bridge_temporal_history_slot_count"),
+                    action_bridge_temporal_history_vs_resume_l2=_safe_info_get(safety_info, "action_bridge_temporal_history_vs_resume_l2"),
+                    action_bridge_resume_first_action_norm=_safe_info_get(safety_info, "action_bridge_resume_first_action_norm"),
+                    action_bridge_last_recovery_action_norm=_safe_info_get(safety_info, "action_bridge_last_recovery_action_norm"),
                     committed_abort_step=_safe_info_get(safety_info, "committed_abort_step"),
                     committed_abort_mode=_safe_info_get(safety_info, "committed_abort_mode"),
                     committed_abort_index=_safe_info_get(safety_info, "committed_abort_index"),
@@ -10517,6 +9960,40 @@ def main():
                     committed_suffix_replan_required_clearance=_safe_info_get(safety_info, "committed_suffix_replan_required_clearance"),
                     committed_opportunistic_resume=_safe_info_get(safety_info, "committed_opportunistic_resume"),
                     committed_released_for_act_resume=_safe_info_get(safety_info, "committed_released_for_act_resume"),
+                    committed_rejoin_resume_tube_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_score"),
+                    committed_rejoin_resume_tube_ok=_safe_info_get(safety_info, "committed_rejoin_resume_tube_ok"),
+                    committed_rejoin_resume_tube_min_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_min_score"),
+                    committed_rejoin_resume_tube_component_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_component_score"),
+                    committed_rejoin_resume_tube_min_component_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_min_component_score"),
+                    committed_rejoin_resume_tube_component_ok=_safe_info_get(safety_info, "committed_rejoin_resume_tube_component_ok"),
+                    committed_rejoin_resume_tube_terminal_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_terminal_score"),
+                    committed_rejoin_resume_tube_path_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_path_score"),
+                    committed_rejoin_resume_tube_progress_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_progress_score"),
+                    committed_rejoin_resume_tube_heading_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_heading_score"),
+                    committed_rejoin_resume_tube_clearance_score=_safe_info_get(safety_info, "committed_rejoin_resume_tube_clearance_score"),
+                    committed_rejoin_resume_tube_terminal_dist=_safe_info_get(safety_info, "committed_rejoin_resume_tube_terminal_dist"),
+                    committed_rejoin_resume_tube_terminal_delta=_safe_info_get(safety_info, "committed_rejoin_resume_tube_terminal_delta"),
+                    committed_rejoin_resume_tube_q_error=_safe_info_get(safety_info, "committed_rejoin_resume_tube_q_error"),
+                    committed_rejoin_resume_tube_terminal_threshold=_safe_info_get(safety_info, "committed_rejoin_resume_tube_terminal_threshold"),
+                    committed_rejoin_resume_tube_ordered_loss=_safe_info_get(safety_info, "committed_rejoin_resume_tube_ordered_loss"),
+                    committed_rejoin_resume_tube_prefix_min_clearance=_safe_info_get(safety_info, "committed_rejoin_resume_tube_prefix_min_clearance"),
+                    committed_rejoin_resume_tube_required_clearance=_safe_info_get(safety_info, "committed_rejoin_resume_tube_required_clearance"),
+                    committed_rejoin_resume_tube_prefix_safe=_safe_info_get(safety_info, "committed_rejoin_resume_tube_prefix_safe"),
+                    committed_rejoin_resume_tube_terminal_ok=_safe_info_get(safety_info, "committed_rejoin_resume_tube_terminal_ok"),
+                    committed_rejoin_resume_allowed=_safe_info_get(safety_info, "committed_rejoin_resume_allowed"),
+                    committed_rejoin_resume_blocked=_safe_info_get(safety_info, "committed_rejoin_resume_blocked"),
+                    committed_rejoin_resume_block_reason=_safe_info_get(safety_info, "committed_rejoin_resume_block_reason"),
+                    committed_soft_handoff_release_to_main_filter=_safe_info_get(safety_info, "committed_soft_handoff_release_to_main_filter"),
+                    committed_soft_handoff_release_reason=_safe_info_get(safety_info, "committed_soft_handoff_release_reason"),
+                    committed_soft_handoff_prefix_min_clearance=_safe_info_get(safety_info, "committed_soft_handoff_prefix_min_clearance"),
+                    committed_soft_handoff_required_clearance=_safe_info_get(safety_info, "committed_soft_handoff_required_clearance"),
+                    committed_soft_handoff_live_min_clearance=_safe_info_get(safety_info, "committed_soft_handoff_live_min_clearance"),
+                    committed_soft_handoff_live_prefix_safe=_safe_info_get(safety_info, "committed_soft_handoff_live_prefix_safe"),
+                    committed_soft_handoff_prefix_safe=_safe_info_get(safety_info, "committed_soft_handoff_prefix_safe"),
+                    committed_soft_handoff_prefix_ok=_safe_info_get(safety_info, "committed_soft_handoff_prefix_ok"),
+                    committed_soft_handoff_resume_tube_score=_safe_info_get(safety_info, "committed_soft_handoff_resume_tube_score"),
+                    committed_soft_handoff_resume_tube_ok=_safe_info_get(safety_info, "committed_soft_handoff_resume_tube_ok"),
+                    committed_soft_handoff_resume_tube_component_score=_safe_info_get(safety_info, "committed_soft_handoff_resume_tube_component_score"),
                     committed_recovery_budget_exit=_safe_info_get(safety_info, "committed_recovery_budget_exit"),
                     committed_replan_due_to_recovery_budget=_safe_info_get(safety_info, "committed_replan_due_to_recovery_budget"),
                     committed_opportunistic_resume_available=_safe_info_get(safety_info, "committed_opportunistic_resume_available"),
@@ -10526,10 +10003,290 @@ def main():
                     committed_opportunistic_resume_min_clearance=_safe_info_get(safety_info, "committed_opportunistic_resume_min_clearance"),
                     committed_opportunistic_resume_required_clearance=_safe_info_get(safety_info, "committed_opportunistic_resume_required_clearance"),
                     committed_opportunistic_resume_rejoin_index=_safe_info_get(safety_info, "committed_opportunistic_resume_rejoin_index"),
+                    committed_opportunistic_resume_tube_ok=_safe_info_get(safety_info, "committed_opportunistic_resume_tube_ok"),
+                    committed_opportunistic_resume_tube_score=_safe_info_get(safety_info, "committed_opportunistic_resume_tube_score"),
+                    committed_opportunistic_resume_tube_component_score=_safe_info_get(safety_info, "committed_opportunistic_resume_tube_component_score"),
+                    committed_opportunistic_resume_affordance_ok=_safe_info_get(safety_info, "committed_opportunistic_resume_affordance_ok"),
+                    committed_opportunistic_resume_affordance_score=_safe_info_get(safety_info, "committed_opportunistic_resume_affordance_score"),
+                    committed_opportunistic_resume_affordance_component_score=_safe_info_get(safety_info, "committed_opportunistic_resume_affordance_component_score"),
                     committed_recover_steps_since_act=_safe_info_get(safety_info, "committed_recover_steps_since_act"),
                     max_recover_steps_before_act_resume=_safe_info_get(safety_info, "max_recover_steps_before_act_resume"),
+                    max_recover_steps_with_progress=_safe_info_get(safety_info, "max_recover_steps_with_progress"),
+                    extend_recovery_budget_on_progress=_safe_info_get(safety_info, "extend_recovery_budget_on_progress"),
+                    recovery_budget_extended=_safe_info_get(safety_info, "recovery_budget_extended"),
+                    recovery_budget_extended_count=_safe_info_get(safety_info, "recovery_budget_extended_count"),
+                    recovery_budget_live_q_dist=_safe_info_get(safety_info, "recovery_budget_live_q_dist"),
+                    recovery_budget_best_q_dist=_safe_info_get(safety_info, "recovery_budget_best_q_dist"),
+                    recovery_budget_progress_delta=_safe_info_get(safety_info, "recovery_budget_progress_delta"),
+                    recovery_budget_progress_ok=_safe_info_get(safety_info, "recovery_budget_progress_ok"),
+                    recovery_budget_no_progress_count=_safe_info_get(safety_info, "recovery_budget_no_progress_count"),
+                    recovery_budget_no_progress_limit=_safe_info_get(safety_info, "recovery_budget_no_progress_limit"),
+                    recovery_budget_q_rejoin_index=_safe_info_get(safety_info, "recovery_budget_q_rejoin_index"),
+                    staged_recovery_enabled=_safe_info_get(safety_info, "staged_recovery_enabled"),
+                    staged_recovery_ordered_path_softened=_safe_info_get(safety_info, "staged_recovery_ordered_path_softened"),
+                    staged_recovery_progress_accepted=_safe_info_get(safety_info, "staged_recovery_progress_accepted"),
+                    staged_recovery_accept_reason=_safe_info_get(safety_info, "staged_recovery_accept_reason"),
+                    staged_recovery_safety_ok=_safe_info_get(safety_info, "staged_recovery_safety_ok"),
+                    staged_recovery_progress_ok=_safe_info_get(safety_info, "staged_recovery_progress_ok"),
+                    staged_recovery_reject_reason_before_progress=_safe_info_get(safety_info, "staged_recovery_reject_reason_before_progress"),
+                    staged_recovery_min_progress_delta=_safe_info_get(safety_info, "staged_recovery_min_progress_delta"),
+                    recover_handover_ready=_safe_info_get(safety_info, "recover_handover_ready"),
+                    recover_progress_only=_safe_info_get(safety_info, "recover_progress_only"),
+                    recovery_handover_pending=_safe_info_get(safety_info, "recovery_handover_pending"),
                     committed_suffix_replans_in_current_recovery=_safe_info_get(safety_info, "committed_suffix_replans_in_current_recovery"),
                     max_suffix_replans_per_recovery=_safe_info_get(safety_info, "max_suffix_replans_per_recovery"),
+                    mpc_recovery_enabled=_safe_info_get(safety_info, "mpc_recovery_enabled"),
+                    mpc_recovery_active=_safe_info_get(safety_info, "mpc_recovery_active"),
+                    mpc_recovery_replan_attempted=_safe_info_get(safety_info, "mpc_recovery_replan_attempted"),
+                    mpc_recovery_replan_accepted=_safe_info_get(safety_info, "mpc_recovery_replan_accepted"),
+                    mpc_recovery_replan_rejected=_safe_info_get(safety_info, "mpc_recovery_replan_rejected"),
+                    mpc_recovery_replan_reject_reason=_safe_info_get(safety_info, "mpc_recovery_replan_reject_reason"),
+                    mpc_recovery_reference_index=_safe_info_get(safety_info, "mpc_recovery_reference_index"),
+                    mpc_recovery_horizon=_safe_info_get(safety_info, "mpc_recovery_horizon"),
+                    mpc_recovery_prefix_len=_safe_info_get(safety_info, "mpc_recovery_prefix_len"),
+                    mpc_recovery_replan_count=_safe_info_get(safety_info, "mpc_recovery_replan_count"),
+                    mpc_recovery_accepted_count=_safe_info_get(safety_info, "mpc_recovery_accepted_count"),
+                    mpc_recovery_rejected_count=_safe_info_get(safety_info, "mpc_recovery_rejected_count"),
+                    mpc_recovery_replans_in_current_recovery=_safe_info_get(safety_info, "mpc_recovery_replans_in_current_recovery"),
+                    mpc_recovery_max_replans_per_recovery=_safe_info_get(safety_info, "mpc_recovery_max_replans_per_recovery"),
+                    mpc_recovery_require_live_progress=_safe_info_get(safety_info, "mpc_recovery_require_live_progress"),
+                    mpc_recovery_min_progress_delta=_safe_info_get(safety_info, "mpc_recovery_min_progress_delta"),
+                    mpc_recovery_live_q_dist_before=_safe_info_get(safety_info, "mpc_recovery_live_q_dist_before"),
+                    mpc_recovery_live_q_dist_after=_safe_info_get(safety_info, "mpc_recovery_live_q_dist_after"),
+                    mpc_recovery_live_q_progress_delta=_safe_info_get(safety_info, "mpc_recovery_live_q_progress_delta"),
+                    mpc_recovery_live_rejoin_index_before=_safe_info_get(safety_info, "mpc_recovery_live_rejoin_index_before"),
+                    mpc_recovery_live_rejoin_index_after=_safe_info_get(safety_info, "mpc_recovery_live_rejoin_index_after"),
+                    mpc_recovery_live_progress_ok=_safe_info_get(safety_info, "mpc_recovery_live_progress_ok"),
+                    mpc_recovery_prefix_replay_step=_safe_info_get(safety_info, "mpc_recovery_prefix_replay_step"),
+                    mpc_recovery_recover_local_index=_safe_info_get(safety_info, "mpc_recovery_recover_local_index"),
+                    committed_state_mismatch_ignored_for_mpc_prefix=_safe_info_get(safety_info, "committed_state_mismatch_ignored_for_mpc_prefix"),
+                    mpc_recovery_no_progress_count=_safe_info_get(safety_info, "mpc_recovery_no_progress_count"),
+                    mpc_recovery_no_progress_limit=_safe_info_get(safety_info, "mpc_recovery_no_progress_limit"),
+                    mpc_recovery_no_progress_reject_count=_safe_info_get(safety_info, "mpc_recovery_no_progress_reject_count"),
+                    mpc_recovery_budget_escape=_safe_info_get(safety_info, "mpc_recovery_budget_escape"),
+                    mpc_recovery_budget_escape_count=_safe_info_get(safety_info, "mpc_recovery_budget_escape_count"),
+                    mpc_recovery_target_tube_available=_safe_info_get(safety_info, "mpc_recovery_target_tube_available"),
+                    mpc_recovery_target_tube_ok=_safe_info_get(safety_info, "mpc_recovery_target_tube_ok"),
+                    mpc_recovery_target_tube_progress_ok=_safe_info_get(safety_info, "mpc_recovery_target_tube_progress_ok"),
+                    mpc_recovery_target_tube_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_loss"),
+                    mpc_recovery_target_tube_terminal_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_loss"),
+                    mpc_recovery_target_tube_terminal_dist=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_dist"),
+                    mpc_recovery_target_tube_min_path_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_min_path_loss"),
+                    mpc_recovery_target_tube_min_path_dist=_safe_info_get(safety_info, "mpc_recovery_target_tube_min_path_dist"),
+                    mpc_recovery_target_tube_loss_threshold=_safe_info_get(safety_info, "mpc_recovery_target_tube_loss_threshold"),
+                    mpc_recovery_target_tube_dist_threshold=_safe_info_get(safety_info, "mpc_recovery_target_tube_dist_threshold"),
+                    mpc_recovery_target_tube_current_local_index=_safe_info_get(safety_info, "mpc_recovery_target_tube_current_local_index"),
+                    mpc_recovery_target_tube_terminal_local_index=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_local_index"),
+                    mpc_recovery_target_tube_local_index_progress=_safe_info_get(safety_info, "mpc_recovery_target_tube_local_index_progress"),
+                    mpc_recovery_target_tube_target_index=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_index"),
+                    mpc_recovery_target_tube_heading_cosine=_safe_info_get(safety_info, "mpc_recovery_target_tube_heading_cosine"),
+                    mpc_recovery_target_tube_progress_projection=_safe_info_get(safety_info, "mpc_recovery_target_tube_progress_projection"),
+                    mpc_recovery_target_tube_target_tangent_norm=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_tangent_norm"),
+                    mpc_recovery_target_tube_terminal_delta_norm=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_delta_norm"),
+                    mpc_recovery_target_tube_terminal_error_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_error_l2"),
+                    mpc_recovery_target_tube_window_len=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_len"),
+                    mpc_recovery_target_tube_requested_window_len=_safe_info_get(safety_info, "mpc_recovery_target_tube_requested_window_len"),
+                    mpc_recovery_target_tube_window_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_loss"),
+                    mpc_recovery_target_tube_window_total_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_total_loss"),
+                    mpc_recovery_target_tube_window_dist=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dist"),
+                    mpc_recovery_target_tube_window_error_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_error_l2"),
+                    mpc_recovery_target_tube_window_dq_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_loss"),
+                    mpc_recovery_target_tube_window_dq_dist=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_dist"),
+                    mpc_recovery_target_tube_window_action_loss=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_action_loss"),
+                    mpc_recovery_target_tube_window_action_dist=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_action_dist"),
+                    mpc_recovery_target_tube_window_q_frame_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_q_frame_l2"),
+                    mpc_recovery_target_tube_window_q_frame_l2_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_q_frame_l2_mean"),
+                    mpc_recovery_target_tube_window_q_frame_l2_max=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_q_frame_l2_max"),
+                    mpc_recovery_target_tube_window_wrist_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_wrist_l2"),
+                    mpc_recovery_target_tube_window_wrist_l2_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_wrist_l2_mean"),
+                    mpc_recovery_target_tube_window_wrist_l2_max=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_wrist_l2_max"),
+                    mpc_recovery_target_tube_window_left_wrist_abs=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_left_wrist_abs"),
+                    mpc_recovery_target_tube_window_left_wrist_abs_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_left_wrist_abs_mean"),
+                    mpc_recovery_target_tube_window_left_wrist_abs_max=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_left_wrist_abs_max"),
+                    mpc_recovery_target_tube_window_right_wrist_abs=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_right_wrist_abs"),
+                    mpc_recovery_target_tube_window_right_wrist_abs_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_right_wrist_abs_mean"),
+                    mpc_recovery_target_tube_window_right_wrist_abs_max=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_right_wrist_abs_max"),
+                    mpc_recovery_target_tube_window_recovery_step_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_recovery_step_l2"),
+                    mpc_recovery_target_tube_window_target_step_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_target_step_l2"),
+                    mpc_recovery_target_tube_window_step_l2_error=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_step_l2_error"),
+                    mpc_recovery_target_tube_window_step_l2_error_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_step_l2_error_mean"),
+                    mpc_recovery_target_tube_window_step_l2_error_max=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_step_l2_error_max"),
+                    mpc_recovery_target_tube_window_dq_error_l2=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_error_l2"),
+                    mpc_recovery_target_tube_window_dq_cosine=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_cosine"),
+                    mpc_recovery_target_tube_window_dq_cosine_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_cosine_mean"),
+                    mpc_recovery_target_tube_window_dq_cosine_min=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_cosine_min"),
+                    mpc_recovery_target_tube_window_dq_norm_ratio=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_norm_ratio"),
+                    mpc_recovery_target_tube_window_dq_norm_ratio_mean=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_norm_ratio_mean"),
+                    mpc_recovery_target_tube_window_dq_norm_ratio_min=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_norm_ratio_min"),
+                    mpc_recovery_target_tube_window_start_local_index=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_start_local_index"),
+                    mpc_recovery_target_tube_window_end_local_index=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_end_local_index"),
+                    mpc_recovery_target_tube_window_weight=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_weight"),
+                    mpc_recovery_target_tube_window_dq_weight=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_dq_weight"),
+                    mpc_recovery_target_tube_window_action_weight=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_action_weight"),
+                    mpc_recovery_target_tube_terminal_delta=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_delta"),
+                    mpc_recovery_target_tube_q_error=_safe_info_get(safety_info, "mpc_recovery_target_tube_q_error"),
+                    mpc_recovery_target_tube_terminal_q=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_q"),
+                    mpc_recovery_target_tube_target_q=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_q"),
+                    mpc_recovery_planned_q_seq=_safe_info_get(safety_info, "mpc_recovery_planned_q_seq"),
+                    mpc_recovery_planned_action_seq=_safe_info_get(safety_info, "mpc_recovery_planned_action_seq"),
+                    mpc_recovery_target_tube_window_q=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_q"),
+                    mpc_recovery_target_tube_target_window_q=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_window_q"),
+                    mpc_recovery_target_tube_window_action=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_action"),
+                    mpc_recovery_target_tube_target_window_action=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_window_action"),
+                    mpc_recovery_target_tube_terminal_valid_delta=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_valid_delta"),
+                    mpc_recovery_target_tube_terminal_weighted_delta=_safe_info_get(safety_info, "mpc_recovery_target_tube_terminal_weighted_delta"),
+                    mpc_recovery_target_tube_state_indices=_safe_info_get(safety_info, "mpc_recovery_target_tube_state_indices"),
+                    mpc_recovery_target_tube_state_weights=_safe_info_get(safety_info, "mpc_recovery_target_tube_state_weights"),
+                    mpc_recovery_target_tube_target_source=_safe_info_get(safety_info, "mpc_recovery_target_tube_target_source"),
+                    mpc_recovery_target_tube_window_start=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_start"),
+                    mpc_recovery_target_tube_window_end=_safe_info_get(safety_info, "mpc_recovery_target_tube_window_end"),
+                    mpc_recovery_target_tube_live_prefix_safe=_safe_info_get(safety_info, "mpc_recovery_target_tube_live_prefix_safe"),
+                    mpc_recovery_target_tube_live_prefix_best_min_clearance=_safe_info_get(safety_info, "mpc_recovery_target_tube_live_prefix_best_min_clearance"),
+                    mpc_recovery_q_rejoin_overridden_by_tube=_safe_info_get(safety_info, "mpc_recovery_q_rejoin_overridden_by_tube"),
+                    mpc_recovery_original_reject_reason=_safe_info_get(safety_info, "mpc_recovery_original_reject_reason"),
+                    mpc_handoff_attempted=_safe_info_get(safety_info, "mpc_handoff_attempted"),
+                    mpc_handoff_accepted=_safe_info_get(safety_info, "mpc_handoff_accepted"),
+                    mpc_handoff_rejected=_safe_info_get(safety_info, "mpc_handoff_rejected"),
+                    mpc_handoff_reject_reason=_safe_info_get(safety_info, "mpc_handoff_reject_reason"),
+                    mpc_handoff_reason=_safe_info_get(safety_info, "mpc_handoff_reason"),
+                    mpc_handoff_attempt_count=_safe_info_get(safety_info, "mpc_handoff_attempt_count"),
+                    mpc_handoff_accept_count=_safe_info_get(safety_info, "mpc_handoff_accept_count"),
+                    mpc_handoff_reject_count=_safe_info_get(safety_info, "mpc_handoff_reject_count"),
+                    mpc_handoff_scoring_history_snapshot_available=_safe_info_get(safety_info, "mpc_handoff_scoring_history_snapshot_available"),
+                    mpc_handoff_scoring_history_mutated=_safe_info_get(safety_info, "mpc_handoff_scoring_history_mutated"),
+                    mpc_handoff_scoring_history_mutation_delta=_optional_float(_safe_info_get(safety_info, "mpc_handoff_scoring_history_mutation_delta")),
+                    mpc_handoff_scoring_history_before_cur_step=_optional_int(_safe_info_get(safety_info, "mpc_handoff_scoring_history_before_cur_step")),
+                    mpc_handoff_scoring_history_after_cur_step=_optional_int(_safe_info_get(safety_info, "mpc_handoff_scoring_history_after_cur_step")),
+                    mpc_handoff_act_window_available=_safe_info_get(safety_info, "mpc_handoff_act_window_available"),
+                    mpc_handoff_pose_dist=_safe_info_get(safety_info, "mpc_handoff_pose_dist"),
+                    mpc_handoff_pose_tube_dist_threshold=_safe_info_get(safety_info, "mpc_handoff_pose_tube_dist_threshold"),
+                    mpc_handoff_pose_tube_ok=_safe_info_get(safety_info, "mpc_handoff_pose_tube_ok"),
+                    mpc_handoff_actual_direction_available=_safe_info_get(safety_info, "mpc_handoff_actual_direction_available"),
+                    mpc_handoff_actual_direction_source=_safe_info_get(safety_info, "mpc_handoff_actual_direction_source"),
+                    mpc_handoff_previous_q_available=_safe_info_get(safety_info, "mpc_handoff_previous_q_available"),
+                    mpc_handoff_previous_q_adjacent=_safe_info_get(safety_info, "mpc_handoff_previous_q_adjacent"),
+                    mpc_handoff_target_source=_safe_info_get(safety_info, "mpc_handoff_target_source"),
+                    mpc_handoff_heading_cosine=_safe_info_get(safety_info, "mpc_handoff_heading_cosine"),
+                    mpc_handoff_heading_cosine_threshold=_safe_info_get(safety_info, "mpc_handoff_heading_cosine_threshold"),
+                    mpc_handoff_heading_ok=_safe_info_get(safety_info, "mpc_handoff_heading_ok"),
+                    mpc_handoff_progress_projection=_safe_info_get(safety_info, "mpc_handoff_progress_projection"),
+                    mpc_handoff_progress_ok=_safe_info_get(safety_info, "mpc_handoff_progress_ok"),
+                    mpc_handoff_release_action_safe=_safe_info_get(safety_info, "mpc_handoff_release_action_safe"),
+                    mpc_handoff_action_agreement_override_enabled=_safe_info_get(safety_info, "mpc_handoff_action_agreement_override_enabled"),
+                    mpc_handoff_action_agreement_source=_safe_info_get(safety_info, "mpc_handoff_action_agreement_source"),
+                    mpc_handoff_resume_readiness_required=_safe_info_get(safety_info, "mpc_handoff_resume_readiness_required"),
+                    mpc_handoff_resume_allowed=_safe_info_get(safety_info, "mpc_handoff_resume_allowed"),
+                    mpc_handoff_resume_block_reason=_safe_info_get(safety_info, "mpc_handoff_resume_block_reason"),
+                    mpc_handoff_action_agreement_l2_threshold=_safe_info_get(safety_info, "mpc_handoff_action_agreement_l2_threshold"),
+                    mpc_handoff_action_agreement_cosine_threshold=_safe_info_get(safety_info, "mpc_handoff_action_agreement_cosine_threshold"),
+                    mpc_handoff_action_agreement_arm_l2_threshold=_safe_info_get(safety_info, "mpc_handoff_action_agreement_arm_l2_threshold"),
+                    mpc_handoff_action_agreement_l2_ok=_safe_info_get(safety_info, "mpc_handoff_action_agreement_l2_ok"),
+                    mpc_handoff_action_agreement_cosine_ok=_safe_info_get(safety_info, "mpc_handoff_action_agreement_cosine_ok"),
+                    mpc_handoff_action_agreement_arm_l2_ok=_safe_info_get(safety_info, "mpc_handoff_action_agreement_arm_l2_ok"),
+                    mpc_handoff_action_agreement_ok=_safe_info_get(safety_info, "mpc_handoff_action_agreement_ok"),
+                    mpc_handoff_action_agreement_live_ok=_safe_info_get(safety_info, "mpc_handoff_action_agreement_live_ok"),
+                    mpc_handoff_action_agreement_override_allowed=_safe_info_get(safety_info, "mpc_handoff_action_agreement_override_allowed"),
+                    mpc_handoff_action_agreement_override_reason=_safe_info_get(safety_info, "mpc_handoff_action_agreement_override_reason"),
+                    mpc_handoff_heading_ok_raw=_safe_info_get(safety_info, "mpc_handoff_heading_ok_raw"),
+                    mpc_handoff_progress_ok_raw=_safe_info_get(safety_info, "mpc_handoff_progress_ok_raw"),
+                    mpc_handoff_heading_ok_effective=_safe_info_get(safety_info, "mpc_handoff_heading_ok_effective"),
+                    mpc_handoff_progress_ok_effective=_safe_info_get(safety_info, "mpc_handoff_progress_ok_effective"),
+                    mpc_handoff_heading_overridden_by_action_agreement=_safe_info_get(safety_info, "mpc_handoff_heading_overridden_by_action_agreement"),
+                    mpc_handoff_progress_overridden_by_action_agreement=_safe_info_get(safety_info, "mpc_handoff_progress_overridden_by_action_agreement"),
+                    mpc_handoff_act_vs_release_action_l2=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_l2"),
+                    mpc_handoff_act_vs_release_action_max_abs=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_max_abs"),
+                    mpc_handoff_act_vs_release_action_cosine=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_cosine"),
+                    mpc_handoff_act_vs_release_action_dim=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_dim"),
+                    mpc_handoff_act_vs_release_action_arm_l2=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_arm_l2"),
+                    mpc_handoff_act_vs_release_action_arm_max_abs=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_arm_max_abs"),
+                    mpc_handoff_act_vs_release_action_arm_dim=_safe_info_get(safety_info, "mpc_handoff_act_vs_release_action_arm_dim"),
+                    mpc_handoff_act_vs_target_action_l2=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_l2"),
+                    mpc_handoff_act_vs_target_action_max_abs=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_max_abs"),
+                    mpc_handoff_act_vs_target_action_cosine=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_cosine"),
+                    mpc_handoff_act_vs_target_action_dim=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_dim"),
+                    mpc_handoff_act_vs_target_action_arm_l2=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_arm_l2"),
+                    mpc_handoff_act_vs_target_action_arm_max_abs=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_arm_max_abs"),
+                    mpc_handoff_act_vs_target_action_arm_dim=_safe_info_get(safety_info, "mpc_handoff_act_vs_target_action_arm_dim"),
+                    mpc_handoff_act_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_act_prefix_safe"),
+                    mpc_handoff_act_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_act_prefix_min_clearance")),
+                    mpc_handoff_shadow_prefix_available=_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_available"),
+                    mpc_handoff_shadow_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_safe"),
+                    mpc_handoff_shadow_prefix_reason=_optional_str(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_reason")),
+                    mpc_handoff_shadow_prefix_len=_optional_int(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_len")),
+                    mpc_handoff_shadow_prefix_target_start=_optional_int(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_target_start")),
+                    mpc_handoff_shadow_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_min_clearance")),
+                    mpc_handoff_shadow_prefix_required_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_required_clearance")),
+                    mpc_handoff_shadow_prefix_clearance_margin=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_prefix_clearance_margin")),
+                    mpc_handoff_shadow_act_prefix_available=_safe_info_get(safety_info, "mpc_handoff_shadow_act_prefix_available"),
+                    mpc_handoff_shadow_act_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_shadow_act_prefix_safe"),
+                    mpc_handoff_shadow_act_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_act_prefix_min_clearance")),
+                    mpc_handoff_shadow_act_prefix_clearance_margin=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_act_prefix_clearance_margin")),
+                    mpc_handoff_shadow_target_prefix_available=_safe_info_get(safety_info, "mpc_handoff_shadow_target_prefix_available"),
+                    mpc_handoff_shadow_target_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_shadow_target_prefix_safe"),
+                    mpc_handoff_shadow_target_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_target_prefix_min_clearance")),
+                    mpc_handoff_shadow_target_prefix_clearance_margin=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_target_prefix_clearance_margin")),
+                    mpc_handoff_shadow_release_act_prefix_available=_safe_info_get(safety_info, "mpc_handoff_shadow_release_act_prefix_available"),
+                    mpc_handoff_shadow_release_act_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_shadow_release_act_prefix_safe"),
+                    mpc_handoff_shadow_release_act_prefix_min_clearance=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_release_act_prefix_min_clearance")),
+                    mpc_handoff_shadow_release_act_prefix_clearance_margin=_optional_float(_safe_info_get(safety_info, "mpc_handoff_shadow_release_act_prefix_clearance_margin")),
+                    mpc_handoff_live_prefix_required=_safe_info_get(safety_info, "mpc_handoff_live_prefix_required"),
+                    mpc_handoff_live_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_live_prefix_safe"),
+                    mpc_handoff_live_prefix_safe_count=_safe_info_get(safety_info, "mpc_handoff_live_prefix_safe_count"),
+                    mpc_handoff_live_prefix_eval_count=_safe_info_get(safety_info, "mpc_handoff_live_prefix_eval_count"),
+                    mpc_handoff_live_prefix_best_min_clearance=_safe_info_get(safety_info, "mpc_handoff_live_prefix_best_min_clearance"),
+                    mpc_handoff_live_prefix_required_clearance=_safe_info_get(safety_info, "mpc_handoff_live_prefix_required_clearance"),
+                    mpc_handoff_live_prefix_best_start=_safe_info_get(safety_info, "mpc_handoff_live_prefix_best_start"),
+                    mpc_handoff_rejoin_index=_safe_info_get(safety_info, "mpc_handoff_rejoin_index"),
+                    mpc_handoff_resume_tube_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_score"),
+                    mpc_handoff_resume_tube_ok=_safe_info_get(safety_info, "mpc_handoff_resume_tube_ok"),
+                    mpc_handoff_resume_tube_min_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_min_score"),
+                    mpc_handoff_resume_tube_component_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_component_score"),
+                    mpc_handoff_resume_tube_min_component_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_min_component_score"),
+                    mpc_handoff_resume_tube_component_ok=_safe_info_get(safety_info, "mpc_handoff_resume_tube_component_ok"),
+                    mpc_handoff_resume_tube_terminal_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_terminal_score"),
+                    mpc_handoff_resume_tube_path_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_path_score"),
+                    mpc_handoff_resume_tube_progress_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_progress_score"),
+                    mpc_handoff_resume_tube_heading_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_heading_score"),
+                    mpc_handoff_resume_tube_clearance_score=_safe_info_get(safety_info, "mpc_handoff_resume_tube_clearance_score"),
+                    mpc_handoff_resume_tube_terminal_dist=_safe_info_get(safety_info, "mpc_handoff_resume_tube_terminal_dist"),
+                    mpc_handoff_resume_tube_terminal_threshold=_safe_info_get(safety_info, "mpc_handoff_resume_tube_terminal_threshold"),
+                    mpc_handoff_resume_tube_ordered_loss=_safe_info_get(safety_info, "mpc_handoff_resume_tube_ordered_loss"),
+                    mpc_handoff_resume_tube_prefix_min_clearance=_safe_info_get(safety_info, "mpc_handoff_resume_tube_prefix_min_clearance"),
+                    mpc_handoff_resume_tube_required_clearance=_safe_info_get(safety_info, "mpc_handoff_resume_tube_required_clearance"),
+                    mpc_handoff_resume_tube_prefix_safe=_safe_info_get(safety_info, "mpc_handoff_resume_tube_prefix_safe"),
+                    mpc_handoff_resume_tube_terminal_ok=_safe_info_get(safety_info, "mpc_handoff_resume_tube_terminal_ok"),
+                    mpc_bridge_direction_available=_safe_info_get(safety_info, "mpc_bridge_direction_available"),
+                    mpc_bridge_direction_ok=_safe_info_get(safety_info, "mpc_bridge_direction_ok"),
+                    mpc_bridge_heading_ok=_safe_info_get(safety_info, "mpc_bridge_heading_ok"),
+                    mpc_bridge_progress_ok=_safe_info_get(safety_info, "mpc_bridge_progress_ok"),
+                    mpc_bridge_heading_cosine=_safe_info_get(safety_info, "mpc_bridge_heading_cosine"),
+                    mpc_bridge_progress_projection=_safe_info_get(safety_info, "mpc_bridge_progress_projection"),
+                    mpc_bridge_direction_loss=_safe_info_get(safety_info, "mpc_bridge_direction_loss"),
+                    mpc_bridge_direction_weight=_safe_info_get(safety_info, "mpc_bridge_direction_weight"),
+                    mpc_bridge_weighted_direction_loss=_safe_info_get(safety_info, "mpc_bridge_weighted_direction_loss"),
+                    mpc_bridge_live_prefix_available=_safe_info_get(safety_info, "mpc_bridge_live_prefix_available"),
+                    mpc_bridge_live_prefix_clearance_ok=_safe_info_get(safety_info, "mpc_bridge_live_prefix_clearance_ok"),
+                    mpc_bridge_live_prefix_min_clearance=_safe_info_get(safety_info, "mpc_bridge_live_prefix_min_clearance"),
+                    mpc_bridge_live_prefix_required_clearance=_safe_info_get(safety_info, "mpc_bridge_live_prefix_required_clearance"),
+                    mpc_bridge_live_prefix_clearance_loss=_safe_info_get(safety_info, "mpc_bridge_live_prefix_clearance_loss"),
+                    mpc_bridge_live_prefix_clearance_weight=_safe_info_get(safety_info, "mpc_bridge_live_prefix_clearance_weight"),
+                    mpc_bridge_target_source=_safe_info_get(safety_info, "mpc_bridge_target_source"),
+                    mpc_bridge_target_live_prefix_safe=_safe_info_get(safety_info, "mpc_bridge_target_live_prefix_safe"),
+                    mpc_bridge_target_live_prefix_fallback_selected=_safe_info_get(safety_info, "mpc_bridge_target_live_prefix_fallback_selected"),
+                    mpc_bridge_target_live_prefix_min_clearance=_safe_info_get(safety_info, "mpc_bridge_target_live_prefix_min_clearance"),
+                    mpc_bridge_target_live_prefix_best_min_clearance=_safe_info_get(safety_info, "mpc_bridge_target_live_prefix_best_min_clearance"),
+                    mpc_bridge_target_live_prefix_required_clearance=_safe_info_get(safety_info, "mpc_bridge_target_live_prefix_required_clearance"),
+                    mpc_bridge_target_window_start=_safe_info_get(safety_info, "mpc_bridge_target_window_start"),
+                    mpc_bridge_replans_in_current_recovery=_safe_info_get(safety_info, "mpc_bridge_replans_in_current_recovery"),
+                    mpc_bridge_max_replans_per_recovery=_safe_info_get(safety_info, "mpc_bridge_max_replans_per_recovery"),
+                    mpc_bridge_replan_cooldown_remaining=_safe_info_get(safety_info, "mpc_bridge_replan_cooldown_remaining"),
+                    mpc_bridge_replan_cooldown_active=_safe_info_get(safety_info, "mpc_bridge_replan_cooldown_active"),
+                    mpc_bridge_replan_metric_improved=_safe_info_get(safety_info, "mpc_bridge_replan_metric_improved"),
+                    mpc_bridge_replan_under_cap=_safe_info_get(safety_info, "mpc_bridge_replan_under_cap"),
+                    mpc_bridge_replan_suppressed_reason=_safe_info_get(safety_info, "mpc_bridge_replan_suppressed_reason"),
+                    mpc_bridge_replan_heading_improved=_safe_info_get(safety_info, "mpc_bridge_replan_heading_improved"),
+                    mpc_bridge_replan_progress_improved=_safe_info_get(safety_info, "mpc_bridge_replan_progress_improved"),
+                    mpc_bridge_replan_clearance_improved=_safe_info_get(safety_info, "mpc_bridge_replan_clearance_improved"),
                     planned_q_at_index_before_suffix_replan=_safe_info_get(safety_info, "planned_q_at_index_before_suffix_replan"),
                     actual_q_at_suffix_replan=_safe_info_get(safety_info, "actual_q_at_suffix_replan"),
                     actual_q_at_replay=_safe_info_get(safety_info, "actual_q_at_replay"),
@@ -10540,6 +10297,22 @@ def main():
                     recover_step=diagnostic_flags["recover_step"],
                     brake_step=diagnostic_flags["brake_step"],
                     fallback_step=diagnostic_flags["fallback_step"],
+                    brake_temporal_ensemble_bypass=_safe_info_get(
+                        safety_info,
+                        "brake_temporal_ensemble_bypass",
+                    ),
+                    brake_action_history_reset_count=_safe_info_get(
+                        safety_info,
+                        "brake_action_history_reset_count",
+                    ),
+                    brake_low_level_hold_sync_count=_safe_info_get(
+                        safety_info,
+                        "brake_low_level_hold_sync_count",
+                    ),
+                    brake_robot_freeze_count=_safe_info_get(
+                        safety_info,
+                        "brake_robot_freeze_count",
+                    ),
                     optimized_attempt_step=diagnostic_flags["optimized_attempt_step"],
                     optimized_accepted_step=diagnostic_flags["optimized_accepted_step"],
                     unsafe_streak=_safe_info_get(safety_info, "unsafe_streak"),
@@ -10553,6 +10326,15 @@ def main():
                     recovery_optimization_skipped=_safe_info_get(safety_info, "recovery_optimization_skipped"),
                     recovery_optimization_skip_reason=_safe_info_get(safety_info, "recovery_optimization_skip_reason"),
                     recovery_optimization_skipped_count=_safe_info_get(safety_info, "recovery_optimization_skipped_count"),
+                    recovery_attempt_reset_after_brake_timeout=_safe_info_get(safety_info, "recovery_attempt_reset_after_brake_timeout"),
+                    recovery_attempt_reset_count=_safe_info_get(safety_info, "recovery_attempt_reset_count"),
+                    recovery_attempt_reset_reason=_safe_info_get(safety_info, "recovery_attempt_reset_reason"),
+                    recovery_attempt_reset_brake_streak=_safe_info_get(safety_info, "recovery_attempt_reset_brake_streak"),
+                    recovery_attempt_reset_steps_since_previous=_safe_info_get(safety_info, "recovery_attempt_reset_steps_since_previous"),
+                    recovery_attempt_reset_previous_attempts=_safe_info_get(safety_info, "recovery_attempt_reset_previous_attempts"),
+                    recovery_attempt_reset_previous_cooldown=_safe_info_get(safety_info, "recovery_attempt_reset_previous_cooldown"),
+                    recovery_attempt_reset_hold_clearance=_safe_info_get(safety_info, "recovery_attempt_reset_hold_clearance"),
+                    recovery_attempt_reset_min_hold_clearance=_safe_info_get(safety_info, "recovery_attempt_reset_min_hold_clearance"),
                     temporary_blocker_waiting=_safe_info_get(safety_info, "temporary_blocker_waiting"),
                     deform_trigger_reason=_safe_info_get(safety_info, "deform_trigger_reason"),
                     nominal_became_safe_after_brake=_safe_info_get(safety_info, "nominal_became_safe_after_brake"),
@@ -10561,11 +10343,6 @@ def main():
                     deform_suppressed_by_temporary_wait=_safe_info_get(safety_info, "deform_suppressed_by_temporary_wait"),
                     deform_after_persistent_block=_safe_info_get(safety_info, "deform_after_persistent_block"),
                     deform_replan_count=_safe_info_get(safety_info, "deform_replan_count"),
-                    recover_replan_count=_safe_info_get(
-                        safety_info,
-                        "recover_replan_count",
-                        _safe_info_get(safety_info, "recovery_replan_count"),
-                    ),
                     recovery_replan_count=_safe_info_get(safety_info, "recovery_replan_count"),
                     recovery_target_feasible=_safe_info_get(safety_info, "recovery_target_feasible"),
                     stale_recovery_attempted=_safe_info_get(safety_info, "stale_recovery_attempted"),
@@ -10576,16 +10353,40 @@ def main():
                     deform_anchor_is_current=_safe_info_get(safety_info, "deform_anchor_is_current"),
                     emergency_brake_steps=_safe_info_get(safety_info, "emergency_brake_steps"),
                     emergency_brake_immediate_unsafe=_safe_info_get(safety_info, "emergency_brake_immediate_unsafe"),
-                    optimized_candidate_count=_safe_info_get(safety_info, "optimized_candidate_count"),
+                    optimized_path_count=_safe_info_get(
+                        safety_info,
+                        "optimized_path_count",
+                        _safe_info_get(safety_info, "optimized_candidate_count"),
+                    ),
                     optimized_solution_count=_safe_info_get(safety_info, "optimized_solution_count"),
-                    fallback_candidate_count=_safe_info_get(safety_info, "fallback_candidate_count"),
-                    fallback_candidate_accepted_count=_safe_info_get(safety_info, "fallback_candidate_accepted_count"),
-                    candidate_fallback_enabled=_safe_info_get(safety_info, "candidate_fallback_enabled"),
+                    fallback_path_count=_safe_info_get(
+                        safety_info,
+                        "fallback_path_count",
+                        _safe_info_get(safety_info, "fallback_candidate_count"),
+                    ),
+                    fallback_path_accepted_count=_safe_info_get(
+                        safety_info,
+                        "fallback_path_accepted_count",
+                        _safe_info_get(safety_info, "fallback_candidate_accepted_count"),
+                    ),
+                    path_fallback_enabled=_safe_info_get(
+                        safety_info,
+                        "path_fallback_enabled",
+                        _safe_info_get(safety_info, "candidate_fallback_enabled"),
+                    ),
                     optimized_rejected_count=_safe_info_get(safety_info, "optimized_rejected_count"),
-                    deform_candidate_count=_safe_info_get(safety_info, "deform_candidate_count"),
+                    deform_path_count=_safe_info_get(
+                        safety_info,
+                        "deform_path_count",
+                        _safe_info_get(safety_info, "deform_candidate_count"),
+                    ),
                     deform_accepted_count=_safe_info_get(safety_info, "deform_accepted_count"),
                     deform_rejected_count=_safe_info_get(safety_info, "deform_rejected_count"),
-                    recover_candidate_count=_safe_info_get(safety_info, "recover_candidate_count"),
+                    recover_path_count=_safe_info_get(
+                        safety_info,
+                        "recover_path_count",
+                        _safe_info_get(safety_info, "recover_candidate_count"),
+                    ),
                     recover_accepted_count=_safe_info_get(safety_info, "recover_accepted_count"),
                     recover_rejected_count=_safe_info_get(safety_info, "recover_rejected_count"),
                     safe_corridor_recovery_count=_safe_info_get(safety_info, "safe_corridor_recovery_count"),
@@ -10609,8 +10410,16 @@ def main():
                     accepted_deform_steps=_safe_info_get(safety_info, "accepted_deform_steps"),
                     accepted_recover_steps=_safe_info_get(safety_info, "accepted_recover_steps"),
                     fallback_brake_after_reject_count=_safe_info_get(safety_info, "fallback_brake_after_reject_count"),
-                    accepted_candidate_type=_safe_info_get(safety_info, "accepted_candidate_type"),
-                    accepted_candidate_name=_safe_info_get(safety_info, "accepted_candidate_name"),
+                    accepted_path_type=_safe_info_get(
+                        safety_info,
+                        "accepted_path_type",
+                        _safe_info_get(safety_info, "accepted_candidate_type"),
+                    ),
+                    accepted_path_name=_safe_info_get(
+                        safety_info,
+                        "accepted_path_name",
+                        _safe_info_get(safety_info, "accepted_candidate_name"),
+                    ),
                     acceptance_type=_safe_info_get(safety_info, "acceptance_type"),
                     safe_prefix_len=_safe_info_get(safety_info, "safe_prefix_len"),
                     immediate_clearance=_safe_info_get(safety_info, "immediate_clearance"),
@@ -10627,11 +10436,38 @@ def main():
                     recover_direction_ok=_safe_info_get(safety_info, "recover_direction_ok"),
                     recover_direction_alignment_available=_safe_info_get(safety_info, "recover_direction_alignment_available"),
                     recover_direction_alignment_weight=_safe_info_get(safety_info, "recover_direction_alignment_weight"),
+                    recover_act_direction_available=_safe_info_get(safety_info, "recover_act_direction_available"),
+                    recover_act_progress_loss=_safe_info_get(safety_info, "recover_act_progress_loss"),
+                    recover_act_heading_loss=_safe_info_get(safety_info, "recover_act_heading_loss"),
+                    recover_act_direction_loss=_safe_info_get(safety_info, "recover_act_direction_loss"),
+                    recover_act_progress_projection=_safe_info_get(safety_info, "recover_act_progress_projection"),
+                    recover_act_target_progress=_safe_info_get(safety_info, "recover_act_target_progress"),
+                    recover_act_heading_cosine=_safe_info_get(safety_info, "recover_act_heading_cosine"),
+                    recover_act_heading_cosine_min=_safe_info_get(safety_info, "recover_act_heading_cosine_min"),
+                    recover_act_progress_ok=_safe_info_get(safety_info, "recover_act_progress_ok"),
+                    recover_act_heading_ok=_safe_info_get(safety_info, "recover_act_heading_ok"),
+                    recover_act_progress_weight=_safe_info_get(safety_info, "recover_act_progress_weight"),
+                    recover_act_heading_weight=_safe_info_get(safety_info, "recover_act_heading_weight"),
+                    recover_min_act_heading_cosine=_safe_info_get(safety_info, "recover_min_act_heading_cosine"),
                     recover_ordered_path_available=_safe_info_get(safety_info, "recover_ordered_path_available"),
                     recover_ordered_target_index=_safe_info_get(safety_info, "recover_ordered_target_index"),
                     recover_ordered_horizon=_safe_info_get(safety_info, "recover_ordered_horizon"),
                     recover_ordered_pose_loss=_safe_info_get(safety_info, "recover_ordered_pose_loss"),
                     recover_ordered_delta_loss=_safe_info_get(safety_info, "recover_ordered_delta_loss"),
+                    recover_ordered_waypoint_pose_loss=_safe_info_get(safety_info, "recover_ordered_waypoint_pose_loss"),
+                    recover_ordered_waypoint_rmse=_safe_info_get(safety_info, "recover_ordered_waypoint_rmse"),
+                    recover_ordered_heading_loss=_safe_info_get(safety_info, "recover_ordered_heading_loss"),
+                    recover_ordered_heading_cosine=_safe_info_get(safety_info, "recover_ordered_heading_cosine"),
+                    recover_ordered_heading_cosine_min=_safe_info_get(safety_info, "recover_ordered_heading_cosine_min"),
+                    recover_ordered_heading_cosine_threshold=_safe_info_get(safety_info, "recover_ordered_heading_cosine_threshold"),
+                    recover_ordered_backtrack_count=_safe_info_get(safety_info, "recover_ordered_backtrack_count"),
+                    recover_ordered_monotonic_ok=_safe_info_get(safety_info, "recover_ordered_monotonic_ok"),
+                    recover_ordered_pose_tube_threshold=_safe_info_get(safety_info, "recover_ordered_pose_tube_threshold"),
+                    recover_ordered_pose_tube_ok=_safe_info_get(safety_info, "recover_ordered_pose_tube_ok"),
+                    recover_ordered_waypoint_tube_ok=_safe_info_get(safety_info, "recover_ordered_waypoint_tube_ok"),
+                    recover_ordered_strict_ok=_safe_info_get(safety_info, "recover_ordered_strict_ok"),
+                    recover_ordered_waypoint_index_start=_safe_info_get(safety_info, "recover_ordered_waypoint_index_start"),
+                    recover_ordered_waypoint_index_end=_safe_info_get(safety_info, "recover_ordered_waypoint_index_end"),
                     recover_ordered_loss=_safe_info_get(safety_info, "recover_ordered_loss"),
                     recover_ordered_pose_weight=_safe_info_get(safety_info, "recover_ordered_pose_weight"),
                     recover_ordered_delta_weight=_safe_info_get(safety_info, "recover_ordered_delta_weight"),
@@ -10643,16 +10479,204 @@ def main():
                     nominal_rejoin_suppressed_reason=_safe_info_get(safety_info, "nominal_rejoin_suppressed_reason"),
                     nominal_rejoin_clearance=_safe_info_get(safety_info, "nominal_rejoin_clearance"),
                     nominal_rejoin_safe_prefix_len=_safe_info_get(safety_info, "nominal_rejoin_safe_prefix_len"),
+                    nominal_rejoin_window_start=_safe_info_get(safety_info, "nominal_rejoin_window_start"),
+                    nominal_rejoin_window_end=_safe_info_get(safety_info, "nominal_rejoin_window_end"),
+                    nominal_rejoin_window_len=_safe_info_get(safety_info, "nominal_rejoin_window_len"),
+                    nominal_rejoin_window_type=_safe_info_get(safety_info, "nominal_rejoin_window_type"),
+                    safe_rejoin_window_found=_safe_info_get(safety_info, "safe_rejoin_window_found"),
+                    short_staging_window_found=_safe_info_get(safety_info, "short_staging_window_found"),
                     recover_task_progress_score=_safe_info_get(safety_info, "recover_task_progress_score"),
                     recover_score_total=_safe_info_get(safety_info, "recover_score_total"),
                     recover_rejoin_weight_effective=_safe_info_get(safety_info, "recover_rejoin_weight_effective"),
                     recover_step_since_deform=_safe_info_get(safety_info, "recover_step_since_deform"),
+                    recover_resume_tube_weight=_safe_info_get(safety_info, "recover_resume_tube_weight"),
+                    recover_resume_tube_score=_safe_info_get(safety_info, "recover_resume_tube_score"),
+                    recover_resume_tube_ok=_safe_info_get(safety_info, "recover_resume_tube_ok"),
+                    recover_resume_tube_min_score=_safe_info_get(safety_info, "recover_resume_tube_min_score"),
+                    recover_resume_tube_component_score=_safe_info_get(safety_info, "recover_resume_tube_component_score"),
+                    recover_resume_tube_min_component_score=_safe_info_get(safety_info, "recover_resume_tube_min_component_score"),
+                    recover_resume_tube_component_ok=_safe_info_get(safety_info, "recover_resume_tube_component_ok"),
+                    recover_resume_tube_terminal_score=_safe_info_get(safety_info, "recover_resume_tube_terminal_score"),
+                    recover_resume_tube_path_score=_safe_info_get(safety_info, "recover_resume_tube_path_score"),
+                    recover_resume_tube_progress_score=_safe_info_get(safety_info, "recover_resume_tube_progress_score"),
+                    recover_resume_tube_heading_score=_safe_info_get(safety_info, "recover_resume_tube_heading_score"),
+                    recover_resume_tube_clearance_score=_safe_info_get(safety_info, "recover_resume_tube_clearance_score"),
+                    recover_resume_tube_terminal_dist=_safe_info_get(safety_info, "recover_resume_tube_terminal_dist"),
+                    recover_resume_tube_terminal_delta=_safe_info_get(safety_info, "recover_resume_tube_terminal_delta"),
+                    recover_resume_tube_q_error=_safe_info_get(safety_info, "recover_resume_tube_q_error"),
+                    recover_resume_tube_terminal_threshold=_safe_info_get(safety_info, "recover_resume_tube_terminal_threshold"),
+                    recover_resume_tube_ordered_loss=_safe_info_get(safety_info, "recover_resume_tube_ordered_loss"),
+                    recover_resume_tube_prefix_min_clearance=_safe_info_get(safety_info, "recover_resume_tube_prefix_min_clearance"),
+                    recover_resume_tube_required_clearance=_safe_info_get(safety_info, "recover_resume_tube_required_clearance"),
+                    recover_resume_tube_prefix_safe=_safe_info_get(safety_info, "recover_resume_tube_prefix_safe"),
+                    recover_resume_tube_terminal_ok=_safe_info_get(safety_info, "recover_resume_tube_terminal_ok"),
+                    recover_resume_window_available=_safe_info_get(safety_info, "recover_resume_window_available"),
+                    recover_resume_window_len=_safe_info_get(safety_info, "recover_resume_window_len"),
+                    recover_resume_window_requested_len=_safe_info_get(safety_info, "recover_resume_window_requested_len"),
+                    recover_resume_window_loss=_safe_info_get(safety_info, "recover_resume_window_loss"),
+                    recover_resume_window_total_loss=_safe_info_get(safety_info, "recover_resume_window_total_loss"),
+                    recover_resume_window_dist=_safe_info_get(safety_info, "recover_resume_window_dist"),
+                    recover_resume_window_error_l2=_safe_info_get(safety_info, "recover_resume_window_error_l2"),
+                    recover_resume_window_dq_loss=_safe_info_get(safety_info, "recover_resume_window_dq_loss"),
+                    recover_resume_window_dq_dist=_safe_info_get(safety_info, "recover_resume_window_dq_dist"),
+                    recover_resume_window_action_loss=_safe_info_get(safety_info, "recover_resume_window_action_loss"),
+                    recover_resume_window_action_dist=_safe_info_get(safety_info, "recover_resume_window_action_dist"),
+                    recover_resume_window_q_frame_l2=_safe_info_get(safety_info, "recover_resume_window_q_frame_l2"),
+                    recover_resume_window_q_frame_l2_mean=_safe_info_get(safety_info, "recover_resume_window_q_frame_l2_mean"),
+                    recover_resume_window_q_frame_l2_max=_safe_info_get(safety_info, "recover_resume_window_q_frame_l2_max"),
+                    recover_resume_window_wrist_l2=_safe_info_get(safety_info, "recover_resume_window_wrist_l2"),
+                    recover_resume_window_wrist_l2_mean=_safe_info_get(safety_info, "recover_resume_window_wrist_l2_mean"),
+                    recover_resume_window_wrist_l2_max=_safe_info_get(safety_info, "recover_resume_window_wrist_l2_max"),
+                    recover_resume_window_left_wrist_abs=_safe_info_get(safety_info, "recover_resume_window_left_wrist_abs"),
+                    recover_resume_window_left_wrist_abs_mean=_safe_info_get(safety_info, "recover_resume_window_left_wrist_abs_mean"),
+                    recover_resume_window_left_wrist_abs_max=_safe_info_get(safety_info, "recover_resume_window_left_wrist_abs_max"),
+                    recover_resume_window_right_wrist_abs=_safe_info_get(safety_info, "recover_resume_window_right_wrist_abs"),
+                    recover_resume_window_right_wrist_abs_mean=_safe_info_get(safety_info, "recover_resume_window_right_wrist_abs_mean"),
+                    recover_resume_window_right_wrist_abs_max=_safe_info_get(safety_info, "recover_resume_window_right_wrist_abs_max"),
+                    recover_resume_window_recovery_step_l2=_safe_info_get(safety_info, "recover_resume_window_recovery_step_l2"),
+                    recover_resume_window_target_step_l2=_safe_info_get(safety_info, "recover_resume_window_target_step_l2"),
+                    recover_resume_window_step_l2_error=_safe_info_get(safety_info, "recover_resume_window_step_l2_error"),
+                    recover_resume_window_step_l2_error_mean=_safe_info_get(safety_info, "recover_resume_window_step_l2_error_mean"),
+                    recover_resume_window_step_l2_error_max=_safe_info_get(safety_info, "recover_resume_window_step_l2_error_max"),
+                    recover_resume_window_dq_error_l2=_safe_info_get(safety_info, "recover_resume_window_dq_error_l2"),
+                    recover_resume_window_dq_cosine=_safe_info_get(safety_info, "recover_resume_window_dq_cosine"),
+                    recover_resume_window_dq_cosine_mean=_safe_info_get(safety_info, "recover_resume_window_dq_cosine_mean"),
+                    recover_resume_window_dq_cosine_min=_safe_info_get(safety_info, "recover_resume_window_dq_cosine_min"),
+                    recover_resume_window_dq_norm_ratio=_safe_info_get(safety_info, "recover_resume_window_dq_norm_ratio"),
+                    recover_resume_window_dq_norm_ratio_mean=_safe_info_get(safety_info, "recover_resume_window_dq_norm_ratio_mean"),
+                    recover_resume_window_dq_norm_ratio_min=_safe_info_get(safety_info, "recover_resume_window_dq_norm_ratio_min"),
+                    recover_resume_window_start_local_index=_safe_info_get(safety_info, "recover_resume_window_start_local_index"),
+                    recover_resume_window_end_local_index=_safe_info_get(safety_info, "recover_resume_window_end_local_index"),
+                    recover_resume_window_weight=_safe_info_get(safety_info, "recover_resume_window_weight"),
+                    recover_resume_window_dq_weight=_safe_info_get(safety_info, "recover_resume_window_dq_weight"),
+                    recover_resume_window_action_weight=_safe_info_get(safety_info, "recover_resume_window_action_weight"),
+                    recover_resume_window_q=_safe_info_get(safety_info, "recover_resume_window_q"),
+                    recover_resume_window_target_q=_safe_info_get(safety_info, "recover_resume_window_target_q"),
+                    recover_resume_window_action=_safe_info_get(safety_info, "recover_resume_window_action"),
+                    recover_resume_window_target_action=_safe_info_get(safety_info, "recover_resume_window_target_action"),
+                    recover_resume_affordance_weight=_safe_info_get(safety_info, "recover_resume_affordance_weight"),
+                    recover_resume_affordance_bonus=_safe_info_get(safety_info, "recover_resume_affordance_bonus"),
+                    recover_resume_affordance_loss=_safe_info_get(safety_info, "recover_resume_affordance_loss"),
+                    recover_resume_affordance_score_gap=_safe_info_get(safety_info, "recover_resume_affordance_score_gap"),
+                    recover_resume_affordance_component_gap=_safe_info_get(safety_info, "recover_resume_affordance_component_gap"),
+                    recover_resume_affordance_enabled=_safe_info_get(safety_info, "recover_resume_affordance_enabled"),
+                    recover_resume_affordance_available=_safe_info_get(safety_info, "recover_resume_affordance_available"),
+                    recover_resume_affordance_task_relevant=_safe_info_get(safety_info, "recover_resume_affordance_task_relevant"),
+                    recover_resume_affordance_score=_safe_info_get(safety_info, "recover_resume_affordance_score"),
+                    recover_resume_affordance_ok=_safe_info_get(safety_info, "recover_resume_affordance_ok"),
+                    recover_resume_affordance_min_score=_safe_info_get(safety_info, "recover_resume_affordance_min_score"),
+                    recover_resume_affordance_component_score=_safe_info_get(safety_info, "recover_resume_affordance_component_score"),
+                    recover_resume_affordance_min_component_score=_safe_info_get(safety_info, "recover_resume_affordance_min_component_score"),
+                    recover_resume_affordance_target_distance=_safe_info_get(safety_info, "recover_resume_affordance_target_distance"),
+                    recover_resume_affordance_target_distance_score=_safe_info_get(safety_info, "recover_resume_affordance_target_distance_score"),
+                    recover_resume_affordance_contact_score=_safe_info_get(safety_info, "recover_resume_affordance_contact_score"),
+                    recover_resume_affordance_progress_score=_safe_info_get(safety_info, "recover_resume_affordance_progress_score"),
+                    recover_resume_affordance_alignment_score=_safe_info_get(safety_info, "recover_resume_affordance_alignment_score"),
+                    recover_resume_affordance_continuity_score=_safe_info_get(safety_info, "recover_resume_affordance_continuity_score"),
+                    recover_resume_affordance_safety_score=_safe_info_get(safety_info, "recover_resume_affordance_safety_score"),
+                    recover_resume_affordance_interaction_context=_safe_info_get(safety_info, "recover_resume_affordance_interaction_context"),
+                    recover_final_resume_gate_checked=_safe_info_get(safety_info, "recover_final_resume_gate_checked"),
+                    recover_final_resume_gate_allowed=_safe_info_get(safety_info, "recover_final_resume_gate_allowed"),
+                    recover_final_resume_gate_rejected=_safe_info_get(safety_info, "recover_final_resume_gate_rejected"),
+                    recover_final_resume_gate_reject_reason=_safe_info_get(safety_info, "recover_final_resume_gate_reject_reason"),
+                    recover_final_resume_gate_affordance_available=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_available"),
+                    recover_final_resume_gate_affordance_task_relevant=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_task_relevant"),
+                    recover_final_resume_gate_affordance_ok=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_ok"),
+                    recover_final_resume_gate_affordance_score=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_score"),
+                    recover_final_resume_gate_affordance_component_score=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_component_score"),
+                    recover_final_resume_gate_affordance_component_threshold=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_component_threshold"),
+                    recover_final_resume_gate_affordance_target_distance=_safe_info_get(safety_info, "recover_final_resume_gate_affordance_target_distance"),
+                    recover_final_resume_gate_window_q_frame_l2_mean=_safe_info_get(safety_info, "recover_final_resume_gate_window_q_frame_l2_mean"),
+                    recover_final_resume_gate_window_q_frame_l2_mean_threshold=_safe_info_get(safety_info, "recover_final_resume_gate_window_q_frame_l2_mean_threshold"),
+                    recover_final_resume_gate_window_q_frame_l2_max=_safe_info_get(safety_info, "recover_final_resume_gate_window_q_frame_l2_max"),
+                    recover_final_resume_gate_window_q_frame_l2_max_threshold=_safe_info_get(safety_info, "recover_final_resume_gate_window_q_frame_l2_max_threshold"),
+                    recover_final_resume_gate_window_dq_cosine_min=_safe_info_get(safety_info, "recover_final_resume_gate_window_dq_cosine_min"),
+                    recover_final_resume_gate_window_dq_cosine_threshold=_safe_info_get(safety_info, "recover_final_resume_gate_window_dq_cosine_threshold"),
+                    recover_final_resume_gate_window_step_l2_error_max=_safe_info_get(safety_info, "recover_final_resume_gate_window_step_l2_error_max"),
+                    recover_final_resume_gate_window_step_l2_error_threshold=_safe_info_get(safety_info, "recover_final_resume_gate_window_step_l2_error_threshold"),
+                    mpc_handoff_resume_affordance_score=_safe_info_get(safety_info, "mpc_handoff_resume_affordance_score"),
+                    mpc_handoff_resume_affordance_ok=_safe_info_get(safety_info, "mpc_handoff_resume_affordance_ok"),
+                    mpc_handoff_resume_affordance_component_score=_safe_info_get(safety_info, "mpc_handoff_resume_affordance_component_score"),
+                    mpc_handoff_resume_affordance_target_distance=_safe_info_get(safety_info, "mpc_handoff_resume_affordance_target_distance"),
+                    mpc_handoff_resume_affordance_contact_score=_safe_info_get(safety_info, "mpc_handoff_resume_affordance_contact_score"),
+                    mpc_handoff_resume_affordance_interaction_context=_safe_info_get(safety_info, "mpc_handoff_interaction_context"),
+                    committed_rejoin_resume_affordance_score=_safe_info_get(safety_info, "committed_rejoin_resume_affordance_score"),
+                    committed_rejoin_resume_affordance_ok=_safe_info_get(safety_info, "committed_rejoin_resume_affordance_ok"),
+                    committed_rejoin_resume_affordance_component_score=_safe_info_get(safety_info, "committed_rejoin_resume_affordance_component_score"),
+                    committed_rejoin_resume_affordance_target_distance=_safe_info_get(safety_info, "committed_rejoin_resume_affordance_target_distance"),
+                    committed_rejoin_resume_affordance_contact_score=_safe_info_get(safety_info, "committed_rejoin_resume_affordance_contact_score"),
+                    committed_rejoin_resume_affordance_interaction_context=_safe_info_get(safety_info, "committed_rejoin_interaction_context"),
+                    committed_soft_handoff_resume_affordance_score=_safe_info_get(safety_info, "committed_soft_handoff_resume_affordance_score"),
+                    committed_soft_handoff_resume_affordance_ok=_safe_info_get(safety_info, "committed_soft_handoff_resume_affordance_ok"),
+                    committed_soft_handoff_resume_affordance_component_score=_safe_info_get(safety_info, "committed_soft_handoff_resume_affordance_component_score"),
+                    recover_batch_fixed_cost_time_ms=_safe_info_get(safety_info, "recover_batch_fixed_cost_time_ms"),
+                    recover_batch_target_rollout_time_ms=_safe_info_get(safety_info, "recover_batch_target_rollout_time_ms"),
+                    recover_batch_progress_score_time_ms=_safe_info_get(safety_info, "recover_batch_progress_score_time_ms"),
+                    recover_batch_rejoin_score_time_ms=_safe_info_get(safety_info, "recover_batch_rejoin_score_time_ms"),
+                    recover_batch_ordered_terms_time_ms=_safe_info_get(safety_info, "recover_batch_ordered_terms_time_ms"),
+                    recover_batch_loss_build_time_ms=_safe_info_get(safety_info, "recover_batch_loss_build_time_ms"),
+                    recover_batch_total_time_ms=_safe_info_get(safety_info, "recover_batch_total_time_ms"),
+                    optimizer_method=_safe_info_get(safety_info, "optimizer_method"),
+                    gradient_iterations_run=_safe_info_get(safety_info, "gradient_iterations_run"),
+                    gradient_early_stopped=_safe_info_get(safety_info, "gradient_early_stopped"),
+                    gradient_max_iters=_safe_info_get(safety_info, "gradient_max_iters"),
+                    gradient_samples=_safe_info_get(safety_info, "gradient_samples"),
+                    gradient_eps=_safe_info_get(safety_info, "gradient_eps"),
+                    gradient_path_early_stopped=_safe_info_get(
+                        safety_info,
+                        "gradient_path_early_stopped",
+                        _safe_info_get(safety_info, "gradient_candidate_early_stopped"),
+                    ),
+                    gradient_batched_line_search=_safe_info_get(safety_info, "gradient_batched_line_search"),
+                    gradient_line_search_batch_evaluations=_safe_info_get(safety_info, "gradient_line_search_batch_evaluations"),
+                    gradient_line_search_batch_size=_safe_info_get(safety_info, "gradient_line_search_batch_size"),
+                    gradient_jax_scan_used=_safe_info_get(safety_info, "gradient_jax_scan_used"),
+                    gradient_jax_scan_used_count=_safe_info_get(safety_info, "gradient_jax_scan_used_count"),
+                    gradient_full_jax_scan_used=_safe_info_get(safety_info, "gradient_full_jax_scan_used"),
+                    gradient_full_jax_scan_time_ms=_safe_info_get(safety_info, "gradient_full_jax_scan_time_ms"),
+                    fixed_shape_jax_optimizer_loop=_safe_info_get(safety_info, "fixed_shape_jax_optimizer_loop"),
+                    jax_scan_cost_kind=_safe_info_get(safety_info, "jax_scan_cost_kind"),
+                    optimizer_evaluations=_safe_info_get(safety_info, "optimizer_evaluations"),
+                    gradient_initial_records_time_ms=_safe_info_get(safety_info, "gradient_initial_records_time_ms"),
+                    deform_gradient_initial_records_time_ms=_safe_info_get(safety_info, "deform_gradient_initial_records_time_ms"),
+                    return_gradient_initial_records_time_ms=_safe_info_get(safety_info, "return_gradient_initial_records_time_ms"),
+                    deform_gradient_initial_batch_cost_time_ms=_safe_info_get(safety_info, "deform_gradient_initial_batch_cost_time_ms"),
+                    return_gradient_initial_batch_cost_time_ms=_safe_info_get(safety_info, "return_gradient_initial_batch_cost_time_ms"),
+                    gradient_initial_project_time_ms=_safe_info_get(safety_info, "gradient_initial_project_time_ms"),
+                    gradient_initial_batch_cost_time_ms=_safe_info_get(safety_info, "gradient_initial_batch_cost_time_ms"),
+                    gradient_initial_record_build_time_ms=_safe_info_get(safety_info, "gradient_initial_record_build_time_ms"),
+                    gradient_initial_sort_time_ms=_safe_info_get(safety_info, "gradient_initial_sort_time_ms"),
+                    gradient_direction_sample_time_ms=_safe_info_get(safety_info, "gradient_direction_sample_time_ms"),
+                    gradient_perturb_control_time_ms=_safe_info_get(safety_info, "gradient_perturb_control_time_ms"),
+                    gradient_perturb_project_time_ms=_safe_info_get(safety_info, "gradient_perturb_project_time_ms"),
+                    gradient_perturb_records_time_ms=_safe_info_get(safety_info, "gradient_perturb_records_time_ms"),
+                    gradient_line_control_time_ms=_safe_info_get(safety_info, "gradient_line_control_time_ms"),
+                    gradient_line_project_time_ms=_safe_info_get(safety_info, "gradient_line_project_time_ms"),
+                    gradient_line_records_time_ms=_safe_info_get(safety_info, "gradient_line_records_time_ms"),
+                    deform_optimizer_time_ms=_safe_info_get(safety_info, "deform_optimizer_time_ms"),
+                    return_optimizer_time_ms=_safe_info_get(safety_info, "return_optimizer_time_ms"),
+                    explicit_optimizer_time_ms=_safe_info_get(safety_info, "explicit_optimizer_time_ms"),
+                    precomputed_step0_filter_used=_safe_info_get(safety_info, "precomputed_step0_filter_used"),
+                    precomputed_step0_filter_time_ms=_safe_info_get(safety_info, "precomputed_step0_filter_time_ms"),
+                    committed_suffix_optimizer_time_ms=_safe_info_get(safety_info, "committed_suffix_optimizer_time_ms"),
+                    committed_plan_rollout_time_ms=_safe_info_get(safety_info, "committed_plan_rollout_time_ms"),
+                    committed_plan_safety_time_ms=_safe_info_get(safety_info, "committed_plan_safety_time_ms"),
+                    committed_plan_diagnostics_time_ms=_safe_info_get(safety_info, "committed_plan_diagnostics_time_ms"),
+                    fixed_shape_jax_cost=_safe_info_get(safety_info, "fixed_shape_jax_cost"),
+                    fixed_shape_jax_safety=_safe_info_get(safety_info, "fixed_shape_jax_safety"),
+                    fixed_shape_safety_method=_safe_info_get(safety_info, "fixed_shape_safety_method"),
+                    fixed_shape_cost_batch_size=_safe_info_get(safety_info, "fixed_shape_cost_batch_size"),
+                    fixed_shape_cost_original_batch_size=_safe_info_get(safety_info, "fixed_shape_cost_original_batch_size"),
+                    fixed_shape_cost_padding=_safe_info_get(safety_info, "fixed_shape_cost_padding"),
+                    fixed_shape_rollout_time_ms=_safe_info_get(safety_info, "fixed_shape_rollout_time_ms"),
+                    fixed_shape_safety_time_ms=_safe_info_get(safety_info, "fixed_shape_safety_time_ms"),
+                    fixed_shape_jax_reduce_time_ms=_safe_info_get(safety_info, "fixed_shape_jax_reduce_time_ms"),
                     cem_iterations_run=_safe_info_get(safety_info, "cem_iterations_run"),
                     cem_early_stopped=_safe_info_get(safety_info, "cem_early_stopped"),
                     cem_max_iters=_safe_info_get(safety_info, "cem_max_iters"),
                     cem_population=_safe_info_get(safety_info, "cem_population"),
-                    yield_cem_iterations_run=_safe_info_get(safety_info, "yield_cem_iterations_run"),
-                    yield_cem_early_stopped=_safe_info_get(safety_info, "yield_cem_early_stopped"),
+                    deform_cem_iterations_run=_safe_info_get(safety_info, "deform_cem_iterations_run"),
+                    deform_cem_early_stopped=_safe_info_get(safety_info, "deform_cem_early_stopped"),
                     return_cem_iterations_run=_safe_info_get(safety_info, "return_cem_iterations_run"),
                     return_cem_early_stopped=_safe_info_get(safety_info, "return_cem_early_stopped"),
                     nominal_rejoin_available_count=_safe_info_get(safety_info, "nominal_rejoin_available_count"),
@@ -10665,6 +10689,15 @@ def main():
                     mean_recover_cosine_to_nominal=_safe_info_get(safety_info, "mean_recover_cosine_to_nominal"),
                     mean_recover_direction_cosine=_safe_info_get(safety_info, "mean_recover_direction_cosine"),
                     mean_recover_direction_loss=_safe_info_get(safety_info, "mean_recover_direction_loss"),
+                    mean_recover_act_progress_loss=_safe_info_get(safety_info, "mean_recover_act_progress_loss"),
+                    mean_recover_act_heading_loss=_safe_info_get(safety_info, "mean_recover_act_heading_loss"),
+                    mean_recover_act_direction_loss=_safe_info_get(safety_info, "mean_recover_act_direction_loss"),
+                    mean_recover_act_progress_projection=_safe_info_get(safety_info, "mean_recover_act_progress_projection"),
+                    mean_recover_act_target_progress=_safe_info_get(safety_info, "mean_recover_act_target_progress"),
+                    mean_recover_act_heading_cosine=_safe_info_get(safety_info, "mean_recover_act_heading_cosine"),
+                    min_recover_act_heading_cosine=_safe_info_get(safety_info, "min_recover_act_heading_cosine"),
+                    recover_act_progress_ok_count=_safe_info_get(safety_info, "recover_act_progress_ok_count"),
+                    recover_act_heading_ok_count=_safe_info_get(safety_info, "recover_act_heading_ok_count"),
                     mean_recover_task_progress_score=_safe_info_get(safety_info, "mean_recover_task_progress_score"),
                     mean_recover_ordered_pose_loss=_safe_info_get(safety_info, "mean_recover_ordered_pose_loss"),
                     mean_recover_ordered_delta_loss=_safe_info_get(safety_info, "mean_recover_ordered_delta_loss"),
@@ -10677,20 +10710,223 @@ def main():
                     controlled_action_delta_norm=_safe_info_get(safety_info, "controlled_action_delta_norm"),
                     arm_delta_norm=_safe_info_get(safety_info, "arm_delta_norm"),
                     gripper_latched=_safe_info_get(safety_info, "gripper_latched"),
+
+                    contact_rich_state=_safe_info_get(safety_info, "contact_rich_state"),
+                    contact_rich_pause_enabled=_safe_info_get(safety_info, "contact_rich_pause_enabled"),
+                    contact_rich_pause_active=_safe_info_get(safety_info, "contact_rich_pause_active"),
+                    contact_rich_pause_signal=_safe_info_get(safety_info, "contact_rich_pause_signal"),
+                    contact_rich_pause_raw_signal=_safe_info_get(safety_info, "contact_rich_pause_raw_signal"),
+                    contact_rich_pause_reason=_safe_info_get(safety_info, "contact_rich_pause_reason"),
+                    contact_rich_pause_metadata_signal=_safe_info_get(safety_info, "contact_rich_pause_metadata_signal"),
+                    contact_rich_pause_gripper_signal=_safe_info_get(safety_info, "contact_rich_pause_gripper_signal"),
+                    contact_rich_pause_gripper_value=_safe_info_get(safety_info, "contact_rich_pause_gripper_value"),
+                    contact_rich_pause_progress_allowed=_safe_info_get(safety_info, "contact_rich_pause_progress_allowed"),
+                    contact_rich_pause_hold_remaining=_safe_info_get(safety_info, "contact_rich_pause_hold_remaining"),
+                    contact_rich_pause_clear_steps=_safe_info_get(safety_info, "contact_rich_pause_clear_steps"),
+                    contact_rich_pause_only=_safe_info_get(safety_info, "contact_rich_pause_only"),
+                    deformation_blocked_by_contact_rich_state=_safe_info_get(safety_info, "deformation_blocked_by_contact_rich_state"),
                     gripper_latch_dim=_safe_info_get(safety_info, "gripper_latch_dim"),
                     safe_gripper_action=_safe_info_get(safety_info, "safe_gripper_action"),
                     raw_gripper_action=_safe_info_get(safety_info, "raw_gripper_action"),
                     phase_reanchor_steps_left=_safe_info_get(safety_info, "phase_reanchor_steps_left"),
+                    phase_reanchor_phase=_safe_info_get(safety_info, "phase_reanchor_phase"),
                     phase_reanchor_base_cmd_xy=_safe_info_get(safety_info, "phase_reanchor_base_cmd_xy"),
+                    phase_reanchor_base_cmd_normalized_xy=_safe_info_get(safety_info, "phase_reanchor_base_cmd_normalized_xy"),
+                    phase_reanchor_base_cmd_effective_raw_xy=_safe_info_get(safety_info, "phase_reanchor_base_cmd_effective_raw_xy"),
+                    phase_reanchor_base_cmd_clip_delta_norm=_safe_info_get(safety_info, "phase_reanchor_base_cmd_clip_delta_norm"),
+                    phase_reanchor_temporal_ensemble_bypass=_safe_info_get(safety_info, "phase_reanchor_temporal_ensemble_bypass"),
+                    phase_reanchor_temporal_ensemble_bypass_count=_safe_info_get(safety_info, "phase_reanchor_temporal_ensemble_bypass_count"),
                     phase_reanchor_ee_error_xy=_safe_info_get(safety_info, "phase_reanchor_ee_error_xy"),
                     phase_reanchor_drawer_fraction=_safe_info_get(safety_info, "phase_reanchor_drawer_fraction"),
                     phase_reanchor_ee_to_handle_dist=_safe_info_get(safety_info, "phase_reanchor_ee_to_handle_dist"),
+                    phase_reanchor_ee_to_target_dist=_safe_info_get(safety_info, "phase_reanchor_ee_to_target_dist"),
+                    phase_reanchor_arm_hold_enabled=_safe_info_get(safety_info, "phase_reanchor_arm_hold_enabled"),
+                    phase_reanchor_arm_hold_reason=_safe_info_get(safety_info, "phase_reanchor_arm_hold_reason"),
+                    phase_reanchor_arm_servo_enabled=_safe_info_get(safety_info, "phase_reanchor_arm_servo_enabled"),
+                    phase_reanchor_arm_servo_reason=_safe_info_get(safety_info, "phase_reanchor_arm_servo_reason"),
+                    phase_reanchor_arm_servo_rank=_safe_info_get(safety_info, "phase_reanchor_arm_servo_rank"),
+                    phase_reanchor_arm_servo_error_norm=_safe_info_get(safety_info, "phase_reanchor_arm_servo_error_norm"),
+                    phase_reanchor_arm_servo_delta_norm=_safe_info_get(safety_info, "phase_reanchor_arm_servo_delta_norm"),
+                    phase_reanchor_arm_servo_command_norm=_safe_info_get(safety_info, "phase_reanchor_arm_servo_command_norm"),
+                    phase_reanchor_arm_servo_action_delta_norm=_safe_info_get(safety_info, "phase_reanchor_arm_servo_action_delta_norm"),
+                    phase_reanchor_arm_servo_target_source=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_source"),
+                    phase_reanchor_arm_servo_target_episode=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_episode"),
+                    phase_reanchor_arm_servo_target_start_step=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_start_step"),
+                    phase_reanchor_arm_servo_target_step=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_step"),
+                    phase_reanchor_arm_servo_target_window_index=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_window_index"),
+                    phase_reanchor_arm_servo_target_window_score=_safe_info_get(safety_info, "phase_reanchor_arm_servo_target_window_score"),
+                    phase_reanchor_nominal_reentry_selection_reason=_safe_info_get(safety_info, "phase_reanchor_nominal_reentry_selection_reason"),
+                    phase_reanchor_nominal_reentry_live_target_distance=_safe_info_get(safety_info, "phase_reanchor_nominal_reentry_live_target_distance"),
+                    phase_reanchor_live_taskspace_guard_active=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_guard_active"),
+                    phase_reanchor_live_taskspace_suppress_q_servo=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_suppress_q_servo"),
+                    phase_reanchor_live_taskspace_suppress_q_servo_reason=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_suppress_q_servo_reason"),
+                    phase_reanchor_live_taskspace_distance=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_distance"),
+                    phase_reanchor_live_taskspace_distance_source=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_distance_source"),
+                    phase_reanchor_live_taskspace_best_distance=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_best_distance"),
+                    phase_reanchor_live_taskspace_worsen_count=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_worsen_count"),
+                    phase_reanchor_live_taskspace_stop_requested=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_stop_requested"),
+                    phase_reanchor_live_taskspace_stop_reason=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_stop_reason"),
+                    phase_reanchor_live_taskspace_elapsed_steps=_safe_info_get(safety_info, "phase_reanchor_live_taskspace_elapsed_steps"),
+                    phase_reanchor_live_release_ready=_safe_info_get(safety_info, "phase_reanchor_live_release_ready"),
+                    phase_reanchor_live_release_reason=_safe_info_get(safety_info, "phase_reanchor_live_release_reason"),
+                    phase_reanchor_live_release_target_error=_safe_info_get(safety_info, "phase_reanchor_live_release_target_error"),
+                    phase_reanchor_live_release_handle_dist=_safe_info_get(safety_info, "phase_reanchor_live_release_handle_dist"),
+                    phase_reanchor_task_point_source=_safe_info_get(safety_info, "phase_reanchor_task_point_source"),
+                    phase_reanchor_task_point_requested_source=_safe_info_get(safety_info, "phase_reanchor_task_point_requested_source"),
+                    phase_reanchor_task_point_fallback_reason=_safe_info_get(safety_info, "phase_reanchor_task_point_fallback_reason"),
+                    phase_reanchor_control_task_point_source=_safe_info_get(safety_info, "phase_reanchor_control_task_point_source"),
+                    phase_reanchor_control_task_point_requested_source=_safe_info_get(safety_info, "phase_reanchor_control_task_point_requested_source"),
+                    phase_reanchor_control_task_point_fallback_reason=_safe_info_get(safety_info, "phase_reanchor_control_task_point_fallback_reason"),
+                    phase_reanchor_control_ee_to_handle_dist=_safe_info_get(safety_info, "phase_reanchor_control_ee_to_handle_dist"),
+                    phase_reanchor_control_ee_to_target_dist=_safe_info_get(safety_info, "phase_reanchor_control_ee_to_target_dist"),
+                    phase_reanchor_control_error_source=_safe_info_get(safety_info, "phase_reanchor_control_error_source"),
+                    phase_reanchor_handle_assist_enabled=_safe_info_get(safety_info, "phase_reanchor_handle_assist_enabled"),
+                    phase_reanchor_handle_assist_reason=_safe_info_get(safety_info, "phase_reanchor_handle_assist_reason"),
+                    phase_reanchor_handle_assist_error_norm=_safe_info_get(safety_info, "phase_reanchor_handle_assist_error_norm"),
+                    phase_reanchor_handle_assist_base_cmd_xy=_safe_info_get(safety_info, "phase_reanchor_handle_assist_base_cmd_xy"),
+                    phase_reanchor_site_ee_to_handle_dist=_safe_info_get(safety_info, "phase_reanchor_site_ee_to_handle_dist"),
+                    phase_reanchor_site_ee_to_target_dist=_safe_info_get(safety_info, "phase_reanchor_site_ee_to_target_dist"),
+                    phase_reanchor_gripper_to_handle_dist=_safe_info_get(safety_info, "phase_reanchor_gripper_to_handle_dist"),
+                    phase_reanchor_gripper_to_target_dist=_safe_info_get(safety_info, "phase_reanchor_gripper_to_target_dist"),
+                    phase_reanchor_gripper_site_xy_error=_safe_info_get(safety_info, "phase_reanchor_gripper_site_xy_error"),
+                    phase_reanchor_task_point_geometry_untrusted=_safe_info_get(safety_info, "phase_reanchor_task_point_geometry_untrusted"),
+                    phase_reanchor_live_extension_started=_safe_info_get(safety_info, "phase_reanchor_live_extension_started"),
+                    phase_reanchor_live_extension_count=_safe_info_get(safety_info, "phase_reanchor_live_extension_count"),
+                    phase_reanchor_live_extension_budget_exhausted=_safe_info_get(safety_info, "phase_reanchor_live_extension_budget_exhausted"),
+                    phase_reanchor_early_release_triggered=_safe_info_get(safety_info, "phase_reanchor_early_release_triggered"),
+                    phase_reanchor_early_release_reason=_safe_info_get(safety_info, "phase_reanchor_early_release_reason"),
+                    phase_reanchor_early_release_arm_q_error=_safe_info_get(safety_info, "phase_reanchor_early_release_arm_q_error"),
+                    phase_reanchor_bridge_contact_ready=_safe_info_get(safety_info, "phase_reanchor_bridge_contact_ready"),
+                    phase_reanchor_bridge_contact_reason=_safe_info_get(safety_info, "phase_reanchor_bridge_contact_reason"),
+                    phase_reanchor_bridge_contact_handle_dist=_safe_info_get(safety_info, "phase_reanchor_bridge_contact_handle_dist"),
+                    phase_reanchor_bridge_contact_handle_limit=_safe_info_get(safety_info, "phase_reanchor_bridge_contact_handle_limit"),
+                    phase_reanchor_bridge_preload_validated=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_validated"),
+                    phase_reanchor_bridge_preload_reason=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_reason"),
+                    phase_reanchor_bridge_preload_steps=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_steps"),
+                    phase_reanchor_bridge_preload_progress_delta=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_progress_delta"),
+                    phase_reanchor_bridge_preload_progress_abs=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_progress_abs"),
+                    phase_reanchor_bridge_preload_handle_dist=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_handle_dist"),
+                    phase_reanchor_bridge_preload_handle_limit=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_handle_limit"),
+                    phase_reanchor_bridge_preload_progress_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_progress_ok"),
+                    phase_reanchor_bridge_preload_handle_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_handle_ok"),
+                    phase_reanchor_bridge_preload_validation_source=_safe_info_get(safety_info, "phase_reanchor_bridge_preload_validation_source"),
+                    phase_reanchor_preload_gripper_forced=_safe_info_get(safety_info, "phase_reanchor_preload_gripper_forced"),
+                    phase_reanchor_preload_gripper_limit=_safe_info_get(safety_info, "phase_reanchor_preload_gripper_limit"),
+                    phase_reanchor_preload_target_grasp=_safe_info_get(safety_info, "phase_reanchor_preload_target_grasp"),
+                    phase_reanchor_preload_grasp_limit=_safe_info_get(safety_info, "phase_reanchor_preload_grasp_limit"),
+                    phase_reanchor_preload_pull_probe_enabled=_safe_info_get(safety_info, "phase_reanchor_preload_pull_probe_enabled"),
+                    phase_reanchor_preload_pull_probe_reason=_safe_info_get(safety_info, "phase_reanchor_preload_pull_probe_reason"),
+                    phase_reanchor_preload_pull_probe_axis_xy=_safe_info_get(safety_info, "phase_reanchor_preload_pull_probe_axis_xy"),
+                    phase_reanchor_preload_pull_probe_step=_safe_info_get(safety_info, "phase_reanchor_preload_pull_probe_step"),
+                    phase_reanchor_preload_pull_probe_delta_norm=_safe_info_get(safety_info, "phase_reanchor_preload_pull_probe_delta_norm"),
+                    phase_reanchor_early_release_act_grace=_safe_info_get(safety_info, "phase_reanchor_early_release_act_grace"),
+                    phase_reanchor_early_release_act_grace_steps=_safe_info_get(safety_info, "phase_reanchor_early_release_act_grace_steps"),
+                    phase_reanchor_live_ee_servo_enabled=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_enabled"),
+                    phase_reanchor_live_ee_servo_reason=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_reason"),
+                    phase_reanchor_live_ee_servo_error_norm=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_error_norm"),
+                    phase_reanchor_live_ee_servo_delta_norm=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_delta_norm"),
+                    phase_reanchor_live_ee_servo_command_norm=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_command_norm"),
+                    phase_reanchor_live_ee_servo_jacobian_rank=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_jacobian_rank"),
+                    phase_reanchor_live_ee_servo_nominal_reg=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_nominal_reg"),
+                    phase_reanchor_live_ee_servo_fk_site_xy_error=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_fk_site_xy_error"),
+                    phase_reanchor_live_ee_servo_fk_gripper_xy_error=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_fk_gripper_xy_error"),
+                    phase_reanchor_live_ee_servo_predicted_error_before=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_predicted_error_before"),
+                    phase_reanchor_live_ee_servo_predicted_error_after=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_predicted_error_after"),
+                    phase_reanchor_live_ee_servo_geometry_untrusted=_safe_info_get(safety_info, "phase_reanchor_live_ee_servo_geometry_untrusted"),
+                    phase_reanchor_suppressed_q_servo_arm_hold=_safe_info_get(safety_info, "phase_reanchor_suppressed_q_servo_arm_hold"),
+                    phase_reanchor_bridge_history_seed=_safe_info_get(safety_info, "phase_reanchor_bridge_history_seed"),
+                    phase_reanchor_bridge_seed_mode=_safe_info_get(safety_info, "phase_reanchor_bridge_seed_mode"),
+                    phase_reanchor_bridge_seed_reason=_safe_info_get(safety_info, "phase_reanchor_bridge_seed_reason"),
+                    phase_reanchor_bridge_seed_blockers=_safe_info_get(safety_info, "phase_reanchor_bridge_seed_blockers"),
+                    phase_reanchor_bridge_nominal_history_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_history_ok"),
+                    phase_reanchor_bridge_nominal_action_window_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_action_window_ok"),
+                    phase_reanchor_bridge_live_taskspace_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_live_taskspace_ok"),
+                    phase_reanchor_bridge_policy_step_before=_safe_info_get(safety_info, "phase_reanchor_bridge_policy_step_before"),
+                    phase_reanchor_bridge_policy_step_after=_safe_info_get(safety_info, "phase_reanchor_bridge_policy_step_after"),
+                    phase_reanchor_bridge_policy_step_source=_safe_info_get(safety_info, "phase_reanchor_bridge_policy_step_source"),
+                    phase_reanchor_bridge_post_seed_act_vs_nominal_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_post_seed_act_vs_nominal_l2"),
+                    phase_reanchor_bridge_post_seed_act_vs_nominal_cosine=_safe_info_get(safety_info, "phase_reanchor_bridge_post_seed_act_vs_nominal_cosine"),
+                    phase_reanchor_bridge_post_seed_action_seed_count=_safe_info_get(safety_info, "phase_reanchor_bridge_post_seed_action_seed_count"),
+                    phase_reanchor_bridge_post_seed_action_agreement_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_post_seed_action_agreement_ok"),
+                    phase_reanchor_bridge_requires_post_seed_action_agreement=_safe_info_get(safety_info, "phase_reanchor_bridge_requires_post_seed_action_agreement"),
+                    phase_reanchor_bridge_temporal_stats_source=_safe_info_get(safety_info, "phase_reanchor_bridge_temporal_stats_source"),
+                    phase_reanchor_bridge_visual_seed_count=_safe_info_get(safety_info, "phase_reanchor_bridge_visual_seed_count"),
+                    phase_reanchor_bridge_visual_seed_source_count=_safe_info_get(safety_info, "phase_reanchor_bridge_visual_seed_source_count"),
+                    phase_reanchor_bridge_frame_stack_seed_count=_safe_info_get(safety_info, "phase_reanchor_bridge_frame_stack_seed_count"),
+                    phase_reanchor_bridge_obs_seed_source=_safe_info_get(safety_info, "phase_reanchor_bridge_obs_seed_source"),
+                    phase_reanchor_bridge_obs_seed_window_count=_safe_info_get(safety_info, "phase_reanchor_bridge_obs_seed_window_count"),
+                    phase_reanchor_bridge_obs_seed_restore_count=_safe_info_get(safety_info, "phase_reanchor_bridge_obs_seed_restore_count"),
+                    phase_reanchor_bridge_action_seed_count=_safe_info_get(safety_info, "phase_reanchor_bridge_action_seed_count"),
+                    phase_reanchor_bridge_action_seed_source=_safe_info_get(safety_info, "phase_reanchor_bridge_action_seed_source"),
+                    phase_reanchor_bridge_action_window_len=_safe_info_get(safety_info, "phase_reanchor_bridge_action_window_len"),
+                    phase_reanchor_bridge_act_vs_nominal_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_act_vs_nominal_l2"),
+                    phase_reanchor_bridge_act_vs_nominal_cosine=_safe_info_get(safety_info, "phase_reanchor_bridge_act_vs_nominal_cosine"),
+                    phase_reanchor_bridge_action_agreement_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_action_agreement_ok"),
+                    phase_reanchor_bridge_action_base_adapted=_safe_info_get(safety_info, "phase_reanchor_bridge_action_base_adapted"),
+                    phase_reanchor_bridge_action_base_adapted_dims=_safe_info_get(safety_info, "phase_reanchor_bridge_action_base_adapted_dims"),
+                    phase_reanchor_bridge_nominal_q_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_l2"),
+                    phase_reanchor_bridge_nominal_q_window_l2_mean=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_window_l2_mean"),
+                    phase_reanchor_bridge_nominal_q_window_l2_max=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_window_l2_max"),
+                    phase_reanchor_bridge_nominal_q_window_len=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_window_len"),
+                    phase_reanchor_bridge_nominal_q_adapted_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_adapted_l2"),
+                    phase_reanchor_bridge_nominal_q_adapted_window_l2_mean=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_adapted_window_l2_mean"),
+                    phase_reanchor_bridge_nominal_q_adapted_window_l2_max=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_adapted_window_l2_max"),
+                    phase_reanchor_bridge_nominal_q_adapted_dims=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_adapted_dims"),
+                    phase_reanchor_bridge_nominal_q_base_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_base_l2"),
+                    phase_reanchor_bridge_nominal_q_arm_l2=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_arm_l2"),
+                    phase_reanchor_bridge_nominal_q_track_base=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_track_base"),
+                    phase_reanchor_bridge_nominal_q_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_nominal_q_ok"),
+                    phase_reanchor_bridge_readiness_ok=_safe_info_get(safety_info, "phase_reanchor_bridge_readiness_ok"),
                     post_recovery_task_guard_active=_safe_info_get(safety_info, "post_recovery_task_guard_active"),
                     post_recovery_task_guard_steps_left=_safe_info_get(safety_info, "post_recovery_task_guard_steps_left"),
                     post_recovery_task_guard_reason=_safe_info_get(safety_info, "post_recovery_task_guard_reason"),
                     post_recovery_task_guard_best_progress=_safe_info_get(safety_info, "post_recovery_task_guard_best_progress"),
                     post_recovery_progress_regression=_safe_info_get(safety_info, "post_recovery_progress_regression"),
                     post_recovery_reanchor_started=_safe_info_get(safety_info, "post_recovery_reanchor_started"),
+                    post_recovery_no_progress_count=_safe_info_get(safety_info, "post_recovery_no_progress_count"),
+                    post_recovery_mid_progress_no_progress_count=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_no_progress_count",
+                    ),
+                    post_recovery_mid_progress_best_progress=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_best_progress",
+                    ),
+                    post_recovery_mid_progress_best_distance=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_best_distance",
+                    ),
+                    post_recovery_mid_progress_distance_regression=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_distance_regression",
+                    ),
+                    post_recovery_mid_progress_reseed_triggered=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_reseed_triggered",
+                    ),
+                    post_recovery_mid_progress_reseed_reset_count=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_reseed_reset_count",
+                    ),
+                    post_recovery_mid_progress_reseed_reason=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_reseed_reason",
+                    ),
+                    post_recovery_mid_progress_prior_action_seed_count=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_prior_action_seed_count",
+                    ),
+                    post_recovery_mid_progress_prior_action_seed_step=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_prior_action_seed_step",
+                    ),
+                    post_recovery_mid_progress_prior_action_seed_age=_safe_info_get(
+                        safety_info,
+                        "post_recovery_mid_progress_prior_action_seed_age",
+                    ),
+                    post_recovery_no_progress_triggered=_safe_info_get(safety_info, "post_recovery_no_progress_triggered"),
+                    post_recovery_no_progress_target_distance=_safe_info_get(safety_info, "post_recovery_no_progress_target_distance"),
+                    post_recovery_no_progress_distance_source=_safe_info_get(safety_info, "post_recovery_no_progress_distance_source"),
                     hold_immediate_clearance=_safe_info_get(safety_info, "hold_immediate_clearance"),
                     hold_horizon_min_clearance=_safe_info_get(safety_info, "hold_horizon_min_clearance"),
                     hold_acceptance_type=_safe_info_get(safety_info, "hold_acceptance_type"),
@@ -10809,10 +11045,7 @@ def main():
             episode_summary = summarise_chunk_episode(
                 episode_metrics,
                 diagnostics_cfg={
-                    "large_arm_delta_threshold": args.diagnostics_large_arm_delta_threshold,
-                    "large_base_delta_threshold": args.diagnostics_large_base_delta_threshold,
-                    "low_act_ratio_threshold": args.diagnostics_low_act_ratio_threshold,
-                    "high_fallback_ratio_threshold": args.diagnostics_high_fallback_ratio_threshold,
+                    **_safety_filter_section(args, "diagnostics"),
                     "success_threshold": args.phase_reanchor_done_threshold,
                 },
             )
@@ -10854,7 +11087,16 @@ def main():
                 episode_summary["frame_image_every"] = int(args.frame_image_every)
                 episode_summary["frame_image_count"] = int(len(episode_frames))
                 episode_summary["frame_image_paths"] = episode_frames
+            if mpc_replay_diagnostic_logging_enabled:
+                episode_summary["mpc_replay_diagnostic_events"] = int(
+                    len(episode_mpc_replay_diagnostic_records)
+                )
+            if nominal_rollout_diagnostic_logging_enabled:
+                episode_summary["nominal_rollout_diagnostic_events"] = int(
+                    len(episode_nominal_rollout_diagnostic_records)
+                )
             if trajectory_logging_enabled:
+                trajectory_cutoff_step = None
                 episode_summary["chunk_trajectory_trace_events"] = int(
                     len(episode_chunk_trajectory_records)
                 )
@@ -10864,6 +11106,7 @@ def main():
                 episode_summary["executed_policy_trajectory_samples"] = int(
                     len(episode_executed_policy_trajectory_samples)
                 )
+                episode_summary["trajectory_cutoff_step"] = trajectory_cutoff_step
                 if args.plot_chunk_trajectories_3d and (
                     episode_chunk_trajectory_records
                     or episode_human_arm_trajectory_samples
@@ -10927,6 +11170,19 @@ def main():
     final_summary["action_sequence"] = workspace_cfg.get("action_sequence", None)
     final_summary["video_time_base"] = args.video_time_base
     final_summary["video_stop_steps"] = video_stop_steps
+    if mpc_replay_diagnostic_logging_enabled:
+        final_summary["mpc_replay_diagnostic_events"] = int(
+            len(all_mpc_replay_diagnostic_records)
+        )
+        final_summary["mpc_replay_diagnostics_jsonl"] = str(mpc_replay_diagnostics_jsonl_path)
+        final_summary.update(_mpc_replay_error_summary(all_mpc_replay_diagnostic_records))
+    if nominal_rollout_diagnostic_logging_enabled:
+        final_summary["nominal_rollout_diagnostic_events"] = int(
+            len(all_nominal_rollout_diagnostic_records)
+        )
+        final_summary["nominal_rollout_diagnostics_jsonl"] = str(nominal_rollout_diagnostics_jsonl_path)
+        final_summary.update(_nominal_rollout_error_summary(all_nominal_rollout_diagnostic_records))
+
     if trajectory_logging_enabled:
         final_summary["chunk_trajectory_trace_events"] = int(
             len(all_chunk_trajectory_records)
@@ -10969,6 +11225,15 @@ def main():
         )
         final_summary["saved_actions"] = str(save_actions_path)
 
+    if mpc_replay_diagnostic_logging_enabled:
+        with mpc_replay_diagnostics_jsonl_path.open("w") as f:
+            for record in all_mpc_replay_diagnostic_records:
+                f.write(json.dumps(_jsonable_trace_value(record)) + "\n")
+    if nominal_rollout_diagnostic_logging_enabled:
+        with nominal_rollout_diagnostics_jsonl_path.open("w") as f:
+            for record in all_nominal_rollout_diagnostic_records:
+                f.write(json.dumps(_jsonable_trace_value(record)) + "\n")
+
     if trajectory_logging_enabled:
         with chunk_trajectory_jsonl_path.open("w") as f:
             for record in all_chunk_trajectory_records:
@@ -10982,7 +11247,7 @@ def main():
 
     with step_jsonl_path.open("w") as f:
         for metric in all_step_metrics:
-            f.write(json.dumps(asdict(metric)) + "\n")
+            f.write(json.dumps(_jsonable_trace_value(asdict(metric))) + "\n")
 
     with episode_summary_path.open("w") as f:
         json.dump(all_episode_summaries, f, indent=2)
@@ -11001,6 +11266,10 @@ def main():
     print("  step metrics:", step_jsonl_path)
     print("  episode summaries:", episode_summary_path)
     print("  final summary:", final_summary_path)
+    if mpc_replay_diagnostic_logging_enabled:
+        print("  mpc replay diagnostics:", mpc_replay_diagnostics_jsonl_path)
+    if nominal_rollout_diagnostic_logging_enabled:
+        print("  nominal rollout diagnostics:", nominal_rollout_diagnostics_jsonl_path)
     if trajectory_logging_enabled:
         print("  chunk trajectory traces:", chunk_trajectory_jsonl_path)
         print("  human arm trajectory:", human_arm_trajectory_jsonl_path)

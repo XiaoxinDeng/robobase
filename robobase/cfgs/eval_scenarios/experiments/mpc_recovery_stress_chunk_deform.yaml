@@ -1,0 +1,84 @@
+# @package _global_
+
+extends:
+  - default_human_arm_motion.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: chunk_deform_mpc_recovery_stress
+  description: >-
+    MPC recovery stress test for the default human-arm chunk-deform setup.
+    Thresholds and handover gates match the baseline standalone behavior
+    so we can run a true apples-to-apples end-to-end comparison.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+environment:
+  env: bigym/human_arm_drawer_top_open
+  # A mirror environment, we do not need it
+  safety_env: null
+  normalization_source: auto
+  hide_human_arm_policy_obs: true
+  enable_human_arm_collisions: false
+  visual_only_human_arm: false
+  freeze_human_arm: false
+  live_h_monitor: false
+  override:
+    - env.episode_length=400000
+    - env.manifest=/home/xd1125/.bigym/demonstrations/0.9.0/DrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/lightweight/manifest.json
+    - env.privileged_information=false
+    - env.require_mode_label=false
+    - frame_stack=4
+
+safety_filter:
+  overrides:
+    safechunk_acceptance:
+      allow_candidate_fallback: false
+      candidate_fallback_only_if_no_optimized_result: true
+      allow_fallback_path: false
+      hard_min_clearance: 0.0
+      desired_min_clearance: 0.04
+      prefix_min_clearance: 0.0
+    explicit_recovery:
+      mpc_recovery_enabled: true
+      mpc_recovery_horizon: 8
+      mpc_recovery_prefix_len: 2
+      mpc_recovery_max_replans_per_recovery: 0
+      mpc_recovery_require_ordered_progress: true
+      mpc_recovery_require_live_progress: true
+      mpc_recovery_min_progress_delta: 0.0001
+      mpc_recovery_no_progress_limit: 3
+      mpc_bridge_direction_hard_gate: true
+      max_recover_steps_before_act_resume: 16
+      max_recover_steps_with_progress: 8
+      recovery_budget_no_progress_limit: 1
+      recovery_budget_progress_epsilon: 0.005
+      opportunistic_act_resume: true
+      cancel_committed_on_nominal_safe: true
+      max_suffix_replans_per_recovery: 3
+      committed_suffix_replan_min_remaining: 1
+      replan_committed_suffix_on_state_mismatch: true
+      committed_state_error_action: replan
+      committed_state_mismatch_abort_requires_unsafe: true
+    recoverable_deform:
+      require_qd_rejoin: false
+      q_rejoin_threshold: 1.0
+      qd_rejoin_hard_threshold: 8.0
+    safechunk_recover:
+      require_ordered_path: true
+      require_direction_alignment: true
+      min_act_heading_cosine: 0.25
+      min_direction_cosine: 0.05
+    safechunk_recovery_corridor:
+      require_post_recovery_act_window: false
+      post_recovery_min_act_steps: 1
+
+eval_args:
+  condition: chunk_deform
+  log_chunk_trajectories: true
+  plot_chunk_trajectories_3d: true
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python eval_act_oscbf_safety_metrics.py --eval-config robobase/cfgs/eval_scenarios/experiments/mpc_recovery_stress_chunk_deform.yaml

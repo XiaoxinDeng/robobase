@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import mujoco
 import numpy as np
 
-from robobase.eval_utils import make_cfg, make_eval_env
+from robobase.safetyfilter.eval_utils.eval_utils import make_cfg, make_eval_env
 from robobase.safetyfilter.h1_state_bridge import extract_h1_state, get_bigym_task
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
 

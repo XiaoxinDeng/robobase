@@ -15,6 +15,7 @@ from robobase.envs.bigym import BiGymEnvFactory
 from robobase.safetyfilter.oscbf.oscbffilter import OSCBFFilter
 from robobase.workspace import Workspace
 from hydra import compose, initialize_config_dir
+from robobase.safetyfilter.safechunkdeform.stepmetrics import StepMetrics
 
 REPO = Path("/home/xd1125/Workspace/safe_bigym_hoi")
 ROBOBASE_CFG = REPO / "external/robobase/robobase/cfgs"
@@ -514,6 +515,12 @@ def _robot_arm_capsules_urdf(filt: OSCBFFilter, q_urdf: np.ndarray):
     return capsule_a, capsule_b, names
 
 
+def _empty_full_arm_h_monitor_result(return_details: bool):
+    if return_details:
+        return None, None, None, None, {}
+    return None, None, None, None
+
+
 def compute_oscbf_full_arm_h_monitor(
     filt: OSCBFFilter,
     env,
@@ -521,9 +528,13 @@ def compute_oscbf_full_arm_h_monitor(
     q_full: np.ndarray,
     qd_full: np.ndarray,
     robot_radius: float = 0.06,
+    clearance_threshold: float = 0.0,
+    return_details: bool = False,
 ):
     if filt.oscbf_config is None or filt.robot_model is None:
-        return None, None, None, None
+        return _empty_full_arm_h_monitor_result(return_details)
+
+    cfg = filt.oscbf_config
 
     try:
         q_urdf, _, _, _ = filt._build_urdf_surrogate_state_from_bigym(q_full, qd_full)
@@ -536,26 +547,101 @@ def compute_oscbf_full_arm_h_monitor(
         human_b = filt._transform_points(t_urdf_world, human_obstacles["capsule_b"])
         human_r = np.asarray(human_obstacles["capsule_radii"], dtype=np.float32)
 
-        robot_a, robot_b, robot_names = _robot_arm_capsules_urdf(filt, q_urdf)
+        q_urdf_arr = jnp.asarray(q_urdf, dtype=jnp.float32)
+        if hasattr(cfg, "_right_arm_capsules"):
+            robot_a, robot_b, cfg_robot_radii = cfg._right_arm_capsules(q_urdf_arr)
+            robot_names = ["right_shoulder_upper", "right_upperarm", "right_forearm"]
+            robot_radii = np.asarray(cfg_robot_radii, dtype=np.float32)
+            right_gripper_center = None
+            right_gripper_radius = None
+            if hasattr(cfg, "_right_gripper_sphere"):
+                right_gripper_center, right_gripper_radius = cfg._right_gripper_sphere(q_urdf_arr)
+        elif hasattr(cfg, "h_1"):
+            robot_a, robot_b, robot_names = _robot_arm_capsules_urdf(filt, q_urdf)
+            robot_radii = np.full((len(robot_a),), float(robot_radius), dtype=np.float32)
+            right_gripper_center = None
+            right_gripper_radius = None
+        else:
+            return _empty_full_arm_h_monitor_result(return_details)
+
         h_values = []
+        clearance_values = []
+        dist_sq_values = []
+        combined_radius_values = []
+        robot_radius_values = []
+        human_radius_values = []
         labels = []
+
+        def append_pair(robot_label, robot_radius_i, human_idx, dist_sq):
+            human_radius_i = float(human_r[human_idx])
+            combined_radius = float(robot_radius_i) + human_radius_i
+            dist_sq_f = float(dist_sq)
+            raw_h = dist_sq_f - combined_radius * combined_radius
+            signed_clearance = float(np.sqrt(max(dist_sq_f, 0.0)) - combined_radius)
+            h_values.append(raw_h)
+            clearance_values.append(signed_clearance)
+            dist_sq_values.append(dist_sq_f)
+            combined_radius_values.append(combined_radius)
+            robot_radius_values.append(float(robot_radius_i))
+            human_radius_values.append(human_radius_i)
+            labels.append(f"{robot_label}:human_capsule_{human_idx}")
+
         for r_idx, (ra, rb) in enumerate(zip(robot_a, robot_b)):
+            robot_radius_i = float(robot_radii[min(r_idx, len(robot_radii) - 1)])
+            robot_name = robot_names[min(r_idx, len(robot_names) - 1)]
             for h_idx, (ha, hb) in enumerate(zip(human_a, human_b)):
-                combined_radius = float(robot_radius + human_r[h_idx])
-                dist_sq = _segment_segment_distance_sq(ra, rb, ha, hb)
-                h_values.append(dist_sq - combined_radius * combined_radius)
-                labels.append(f"{robot_names[r_idx]}:human_capsule_{h_idx}")
+                append_pair(
+                    robot_name,
+                    robot_radius_i,
+                    h_idx,
+                    _segment_segment_distance_sq(ra, rb, ha, hb),
+                )
+
+        if right_gripper_center is not None and right_gripper_radius is not None:
+            gripper_center = np.asarray(right_gripper_center, dtype=np.float32)
+            gripper_radius = float(jnp.asarray(right_gripper_radius, dtype=jnp.float32))
+            for h_idx, (ha, hb) in enumerate(zip(human_a, human_b)):
+                append_pair(
+                    "right_wrist",
+                    gripper_radius,
+                    h_idx,
+                    _segment_segment_distance_sq(gripper_center, gripper_center, ha, hb),
+                )
 
         if not h_values:
-            return None, None, None, None
+            return _empty_full_arm_h_monitor_result(return_details)
+
         h_arr = np.asarray(h_values, dtype=np.float32)
-        min_idx = int(np.argmin(h_arr))
-        min_h = float(h_arr[min_idx])
-        return min_h, h_arr.tolist(), bool(min_h < 0.0), labels[min_idx]
+        clearance_arr = np.asarray(clearance_values, dtype=np.float32)
+        raw_min_idx = int(np.argmin(h_arr))
+        clearance_min_idx = int(np.argmin(clearance_arr))
+        min_h = float(h_arr[raw_min_idx])
+        min_clearance = float(clearance_arr[clearance_min_idx])
+        h_violation = bool(np.isfinite(min_clearance) and min_clearance < float(clearance_threshold))
+        label = labels[clearance_min_idx]
+
+        if not return_details:
+            return min_h, h_arr.tolist(), h_violation, label
+
+        details = {
+            "live_min_h": min_h,
+            "live_raw_min_h": min_h,
+            "live_raw_min_h_pair_label": labels[raw_min_idx],
+            "live_min_clearance": min_clearance,
+            "live_h_clearance_values": clearance_arr.tolist(),
+            "live_h_argmin_pair_index": clearance_min_idx,
+            "live_h_argmin_pair_label": label,
+            "live_h_argmin_dist_sq": float(dist_sq_values[clearance_min_idx]),
+            "live_h_argmin_combined_radius": float(combined_radius_values[clearance_min_idx]),
+            "live_h_argmin_robot_radius": float(robot_radius_values[clearance_min_idx]),
+            "live_h_argmin_human_radius": float(human_radius_values[clearance_min_idx]),
+            "live_h_violation_threshold": float(clearance_threshold),
+            "live_h_violation_source": "signed_clearance",
+        }
+        return min_h, h_arr.tolist(), h_violation, label, details
 
     except AttributeError:
-        return None, None, None, None
-
+        return _empty_full_arm_h_monitor_result(return_details)
 
 def robot_human_contact_pairs(env) -> Optional[list[str]]:
     try:

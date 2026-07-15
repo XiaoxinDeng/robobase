@@ -1,0 +1,34 @@
+# @package _global_
+
+extends:
+  - default_human_arm_motion.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: chunk_deform_opt_video_traj_2ep
+  description: >-
+    Two-episode optimized SafeChunk-Deform video/trajectory run using relaxed
+    recovery thresholds from run_chunk_deform_opt_video_traj_2ep_20260614_212034.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+environment: {}
+
+launch_example: >-
+  # Launch a tmux session to run the evaluation in the background
+  tmux new-session -d -s chunk_deform_opt_video_traj_2ep \
+    'TF_CPP_MIN_LOG_LEVEL=2 && cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+    /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/default_human_arm_motion_chunk_deform.yaml'
+
+  # Attach to the tmux session to view the evaluation output
+  tmux attach -t chunk_deform_opt_video_traj_2ep
+
+  # Or run the evaluation directly in the current shell (without tmux):
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+  eval_act_oscbf_safety_metrics.py \
+  --eval-config robobase/cfgs/eval_scenarios/experiments/default_human_arm_motion_chunk_deform.yaml

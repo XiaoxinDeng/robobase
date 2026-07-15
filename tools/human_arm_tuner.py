@@ -113,7 +113,7 @@ def build_cmd(v):
 
 def get_preview_env(v):
     global preview_env
-    from robobase.eval_utils import make_cfg, make_eval_env
+    from robobase.safetyfilter.eval_utils.eval_utils import make_cfg, make_eval_env
     if preview_env is not None:
         try: preview_env.close()
         except Exception: pass

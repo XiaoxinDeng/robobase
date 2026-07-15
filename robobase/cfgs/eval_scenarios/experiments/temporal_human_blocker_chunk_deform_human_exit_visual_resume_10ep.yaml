@@ -1,0 +1,43 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_human_exit_visual_resume_10ep
+  description: >-
+    SafeChunk-Deform run on the temporal human-arm blocker environment. This
+    reuses the default chunk-deform filter parameters and enables the filter's
+    temporary-blocker handling path.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    temporary_blocker:
+      enabled: true
+
+eval_args:
+  condition: chunk_deform
+  episodes: 10
+  steps: 300
+  seed: 1
+  continue_after_success: true
+  no_progress: true
+  log_chunk_trajectories: true
+  log_mpc_replay_diagnostics: true
+  mpc_replay_diagnostics_max_events: 300
+  plot_chunk_trajectories_3d: true
+  video_time_base: sim
+  stop_video_at_steps: 300
+  reset_action_history_after_human_exit: true
+  reset_visual_history_after_human_exit: true
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/temporal_human_blocker_chunk_deform_human_exit_visual_resume_10ep.yaml
