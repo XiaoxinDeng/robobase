@@ -2392,44 +2392,77 @@ class InterventionExecutionFactory:
         )
         return info
 
-    def evaluate_horizon_safety(self, obs: Any, q_seq: Any) -> dict[str, Any]:
+    def evaluate_horizon_safety(
+        self,
+        obs: Any,
+        q_seq: Any,
+        *,
+        predict_human_motion: bool | None = None,
+    ) -> dict[str, Any]:
         """Evaluate safety and clearance metrics for one planned trajectory."""
         q_seq = np.asarray(q_seq, dtype=np.float32)
         op = self._get_oscbf_operator()
-        for method_name in (
-            "compute_min_clearance",
-            "get_min_clearance",
-            "evaluate_safety",
-            "is_safe",
+        prediction_attr_was_set = False
+        previous_prediction_value = None
+        if predict_human_motion is not None and op is not None and hasattr(
+            op,
+            "predict_human_motion",
         ):
-            method = getattr(op, method_name, None)
-            if method is None:
-                continue
-            try:
-                result = self._call_safety_method(method, obs, q_seq)
-                return self._normalize_safety_result(result, q_seq.shape[0])
-            except Exception as exc:  # pragma: no cover - defensive integration path
-                logger.warning(
-                    "SafeChunk-Deform safety evaluation via %s failed: %s",
-                    method_name,
-                    exc,
-                )
+            previous_prediction_value = getattr(op, "predict_human_motion")
+            setattr(op, "predict_human_motion", bool(predict_human_motion))
+            prediction_attr_was_set = True
+        try:
+            for method_name in (
+                "compute_min_clearance",
+                "get_min_clearance",
+                "evaluate_safety",
+                "is_safe",
+            ):
+                method = getattr(op, method_name, None)
+                if method is None:
+                    continue
+                try:
+                    result = self._call_safety_method(method, obs, q_seq)
+                    info = self._normalize_safety_result(result, q_seq.shape[0])
+                    if predict_human_motion is not None:
+                        info["human_motion_prediction_override"] = bool(
+                            predict_human_motion
+                        )
+                        info["human_motion_prediction_override_applied"] = bool(
+                            prediction_attr_was_set
+                        )
+                    return info
+                except Exception as exc:  # pragma: no cover - defensive integration path
+                    logger.warning(
+                        "SafeChunk-Deform safety evaluation via %s failed: %s",
+                        method_name,
+                        exc,
+                    )
 
-        if not self._warned_no_safety_eval:
-            logger.warning(
-                "SafeChunk-Deform could not find a horizon clearance evaluator; "
-                "using conservative pass-through horizon evaluation."
-            )
-            self._warned_no_safety_eval = True
-        h = q_seq.shape[0]
-        return {
-            "horizon_safe": True,
-            "min_clearance": float("inf"),
-            "min_clearances": np.full(h, np.inf, dtype=np.float32),
-            "first_violation": None,
-            "unsafe_count": 0,
-            "safety_eval_available": False,
-        }
+            if not self._warned_no_safety_eval:
+                logger.warning(
+                    "SafeChunk-Deform could not find a horizon clearance evaluator; "
+                    "using conservative pass-through horizon evaluation."
+                )
+                self._warned_no_safety_eval = True
+            h = q_seq.shape[0]
+            info = {
+                "horizon_safe": True,
+                "min_clearance": float("inf"),
+                "min_clearances": np.full(h, np.inf, dtype=np.float32),
+                "first_violation": None,
+                "unsafe_count": 0,
+                "safety_eval_available": False,
+            }
+            if predict_human_motion is not None:
+                info["human_motion_prediction_override"] = bool(predict_human_motion)
+                info["human_motion_prediction_override_applied"] = bool(
+                    prediction_attr_was_set
+                )
+            return info
+        finally:
+            if prediction_attr_was_set:
+                setattr(op, "predict_human_motion", previous_prediction_value)
 
     def _call_safety_method(self, method: Any, obs: Any, q_seq: np.ndarray):
         """Call a single safety method across supported operator signatures."""
@@ -2479,7 +2512,7 @@ class InterventionExecutionFactory:
                 "min_clearances": min_clearances,
                 "first_violation": first_violation,
                 "unsafe_count": unsafe_count,
-                "safety_eval_available": True,
+                "safety_eval_available": bool(result.get("safety_eval_available", True)),
             }
             for key, value in result.items():
                 if key not in info and key != "clearances":

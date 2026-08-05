@@ -138,6 +138,55 @@ safety_filter:
         lambda_deform_smooth: 0.1
         lambda_retreat: 1.0
         deform_horizon: 4
+        pause_exit_smoothing:
+          enabled: true
+          steps: 1
+          first_alpha: 0.75
+          alpha_increment: 0.25
+          clearance_tolerance: 0.005
+
+        intervention_state:
+          enabled: true
+          intervention_policy: legacy
+          stop_counterfactual_enabled: true
+          goal_block_check_enabled: true
+          deformation_admissibility_enabled: true
+          pause_budget_steps: 0
+          resume_hysteresis_steps: 3
+          deform_commit_steps: 4
+          # The human blocker hold pose reaches the drawer interaction region
+          # at roughly 0.29 m clearance from the handle.
+          goal_block_radius: 0.30
+          goal_block_release_wait_steps: 20
+          max_terminal_deviation: 0.50
+          min_task_progress: 0.0
+          deform_valid_required_steps: 1
+          nominal_clear_required_steps: 3
+          deform_commit_min_steps: 0
+          deform_stall_required_steps: 3
+          min_deform_progress: 0.0
+          min_step_progress: 0.0
+          min_deform_velocity_ratio: 0.0
+          stop_action_threshold: 0.0
+          human_reconsider_distance: 0.03
+          nominal_change_threshold: 0.05
+          resume_blend_steps: 5
+          pause_deform_on_current_human_unsafe: true
+          pause_deform_min_clearance_threshold: 0.03
+          pause_deform_suppress_when_stop_sufficient: true
+          pause_deform_static_human_speed_threshold: 0.03
+          pause_deform_suppress_requires_goal_check: false
+          early_deform_suppress_when_stop_sufficient: true
+          early_deform_static_human_displacement_threshold: 0.02
+          stationary_human_local_escape_enabled: true
+          stationary_human_local_escape_max_steps: 6
+          policy_collision_slowdown_enabled: false
+          policy_collision_slowdown_factors: [0.95]
+          policy_collision_slowdown_max_steps: 1
+          policy_collision_slowdown_min_first_violation: 6
+          pause_guard_slowdown_enabled: true
+          pause_guard_slowdown_factors: [0.65, 0.45, 0.25, 0.10, 0.05]
+          pause_guard_slowdown_max_steps: 2
 
         optimized_deform:
           debug_safety_feasibility: true
@@ -279,10 +328,11 @@ safety_filter:
           staged_recovery_enabled: true
           allow_ordered_path_soft_fail_on_live_progress: true
           staged_recovery_min_progress_delta: 0.05
-          retry_cooldown_steps: 4
-          max_attempts_per_unsafe_streak: 3
-          # Treat sustained braking as a settle period: after enough safe hold/brake
-          # steps, reopen recovery instead of staying locked out by attempt_cap.
+          # Default route is deform/recovery first; brake remains the last fallback
+          # when no safe recoverable candidate can be accepted.
+          retry_cooldown_steps: 0
+          max_attempts_per_unsafe_streak: 0
+          # Legacy settle-period reset is kept harmless with no cooldown/attempt cap.
           reset_attempts_after_brake_timeout: true
           reset_attempts_brake_timeout_steps: 4
           reset_attempts_min_hold_clearance: 0.12

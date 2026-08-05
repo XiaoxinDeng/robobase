@@ -135,7 +135,7 @@ class Brake(InterventionExecutionFactory):
         return {
             "enabled": bool(cfg.get("enabled", False)),
             "prefer_brake_before_deform": bool(
-                cfg.get("prefer_brake_before_deform", True)
+                cfg.get("prefer_brake_before_deform", False)
             ),
             "min_unsafe_steps_before_deform": int(
                 cfg.get("min_unsafe_steps_before_deform", 8)
@@ -326,6 +326,87 @@ class Brake(InterventionExecutionFactory):
     def reset_execution_state(self) -> None:
         """Reset counters for a new episode or intervention streak."""
         self._init_execution_state()
+
+    def horizon_slowdown(
+        self,
+        obs: Any,
+        action_chunk: Any,
+        safety_info: Mapping[str, Any] | None,
+        *,
+        factors: tuple[float, ...] = (0.95,),
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        chunk, _ = self._as_chunk(action_chunk)
+        valid = self._valid_control_indices(chunk)
+        action_idx = self.controlled_action_indices[valid]
+        if not action_idx.size:
+            return chunk.copy(), {
+                "slowdown_safe": False,
+                "slowdown_applied": False,
+                "slowdown_skip_reason": "no_controlled_indices",
+            }
+
+        first_violation = None if safety_info is None else safety_info.get("first_violation")
+        try:
+            state_idx = self.controlled_state_indices[valid]
+            anchor = np.asarray(
+                self.deform._controlled_anchor(obs, chunk, action_idx, state_idx),
+                dtype=np.float32,
+            ).reshape(-1)
+        except Exception:  # noqa: BLE001
+            anchor = np.asarray(chunk[0, action_idx], dtype=np.float32).reshape(-1)
+
+        best_chunk: np.ndarray | None = None
+        best_info: dict[str, Any] | None = None
+        best_factor = None
+        best_clearance = float("-inf")
+        checked: list[float] = []
+        for raw_factor in factors:
+            try:
+                factor = float(raw_factor)
+            except Exception:  # noqa: BLE001
+                continue
+            factor = float(np.clip(factor, 0.0, 1.0))
+            checked.append(factor)
+            candidate = chunk.copy()
+            candidate[:, action_idx] = anchor[None, :] + factor * (
+                candidate[:, action_idx] - anchor[None, :]
+            )
+            q_seq = self.rollout_nominal_chunk(obs, candidate)
+            slow_safety = self.evaluate_horizon_safety(obs, q_seq)
+            clearance = float(slow_safety.get("min_clearance", float("-inf")))
+            if bool(slow_safety.get("horizon_safe", False)):
+                if best_chunk is None or factor > float(best_factor):
+                    best_chunk = candidate
+                    best_info = dict(slow_safety)
+                    best_factor = factor
+                    best_clearance = clearance
+            elif best_chunk is None and clearance > best_clearance:
+                best_info = dict(slow_safety)
+                best_clearance = clearance
+
+        if best_chunk is None:
+            return chunk.copy(), {
+                "slowdown_safe": False,
+                "slowdown_applied": False,
+                "slowdown_checked_factors": checked,
+                "slowdown_factor": None,
+                "slowdown_min_clearance": best_clearance,
+                "slowdown_first_violation": first_violation,
+                "slowdown_skip_reason": "no_safe_slowdown_factor",
+            }
+
+        info = {
+            "slowdown_safe": True,
+            "slowdown_applied": True,
+            "slowdown_checked_factors": checked,
+            "slowdown_factor": float(best_factor),
+            "slowdown_min_clearance": float(best_info.get("min_clearance", best_clearance)),
+            "slowdown_first_violation": first_violation,
+            "slowdown_unsafe_count": best_info.get("unsafe_count"),
+            "slowdown_horizon_safe": bool(best_info.get("horizon_safe", False)),
+            "slowdown_progress_scale": float(best_factor),
+        }
+        return best_chunk, info
 
     def horizon_brake(
         self,

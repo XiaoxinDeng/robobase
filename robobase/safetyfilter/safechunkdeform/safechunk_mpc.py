@@ -373,7 +373,7 @@ class MPCRecoveryController:
             recovery._current_replay_q(obs, **kwargs),
             dtype=np.float32,
         ).reshape(-1)
-        committed_id = 0 if recovery.committed_chunk is None else id(recovery.committed_chunk)
+        committed_id = int(getattr(recovery, "committed_sequence_id", 0))
         previous_q_available = self.last_actual_q is not None
         previous_q_adjacent = bool(
             self.last_actual_q_key is not None
@@ -393,8 +393,9 @@ class MPCRecoveryController:
             target_info = recovery.get_nominal_rejoin_target(
                 obs,
                 candidate_q=current_q,
-                require_live_prefix_safe=False,
+                require_live_prefix_safe=True,
                 live_prefix_len=int(getattr(recovery, "recover_act_frame_stack", 1)),
+                allow_best_live_prefix_when_unsafe=True,
             )
         except Exception as exc:  # noqa: BLE001
             self._reject_handoff(
@@ -590,6 +591,7 @@ class MPCRecoveryController:
                 actual_direction is not None
             ),
             "mpc_handoff_actual_direction_source": direction_source,
+            "mpc_handoff_committed_sequence_id": int(committed_id),
             "mpc_handoff_previous_q_available": bool(previous_q_available),
             "mpc_handoff_previous_q_adjacent": bool(previous_q_adjacent),
             "mpc_handoff_target_source": "selected_safe_rejoin_window",
@@ -883,7 +885,119 @@ class MPCRecoveryController:
                 "mpc_handoff_progress_ok": bool(progress_ok_effective),
             }
         )
+        bridge_ramp_enabled = bool(
+            getattr(recovery, "mpc_handoff_bridge_ramp_on_resume_not_ready", False)
+        )
+        bridge_ramp_max_steps = max(
+            0, int(getattr(recovery, "mpc_handoff_bridge_ramp_max_steps", 0))
+        )
+        bridge_ramp_budget_ok = bool(
+            bridge_ramp_max_steps <= 0
+            or int(recovery.committed_recover_steps_since_act) < bridge_ramp_max_steps
+        )
+        bridge_ramp_reason_ok = bool(
+            resume_readiness_required
+            and not resume_allowed
+            and str(resume_block_reason or "") == "resume_tube_not_ready"
+        )
+        bridge_ramp_allowed = bool(
+            bridge_ramp_enabled
+            and bridge_ramp_reason_ok
+            and action_agreement_ok
+            and bool(bridge_target_action_safe)
+            and release_len > 0
+            and bridge_ramp_budget_ok
+        )
+        handoff_terms.update(
+            {
+                "mpc_handoff_bridge_ramp_enabled": bool(bridge_ramp_enabled),
+                "mpc_handoff_bridge_ramp_max_steps": int(bridge_ramp_max_steps),
+                "mpc_handoff_bridge_ramp_budget_ok": bool(bridge_ramp_budget_ok),
+                "mpc_handoff_bridge_ramp_reason_ok": bool(bridge_ramp_reason_ok),
+                "mpc_handoff_bridge_ramp_allowed": bool(bridge_ramp_allowed),
+                "mpc_handoff_bridge_ramp_executed": False,
+                "mpc_handoff_bridge_ramp_block_reason": None
+                if bridge_ramp_allowed
+                else (
+                    "disabled"
+                    if not bridge_ramp_enabled
+                    else "not_resume_tube_blocked"
+                    if not bridge_ramp_reason_ok
+                    else "action_agreement_failed"
+                    if not action_agreement_ok
+                    else "target_action_unsafe"
+                    if not bool(bridge_target_action_safe)
+                    else "bridge_ramp_budget_exhausted"
+                    if not bridge_ramp_budget_ok
+                    else "unknown"
+                ),
+                "mpc_handoff_bridge_ramp_steps_since_act": int(
+                    recovery.committed_recover_steps_since_act
+                ),
+            }
+        )
         state_info.update(handoff_terms)
+
+        if bridge_ramp_allowed:
+            recovery.committed_chunk_index = min(int(idx) + 1, int(total))
+            if mode == "recover":
+                recovery.committed_recover_steps_since_act += 1
+            completed = bool(recovery.committed_chunk_index >= int(total))
+            self.handoff_reject_count += 1
+            info = dict(release_action_safety)
+            info.update(bridge_target_action_safety)
+            info.update(
+                {
+                    **state_info,
+                    **handoff_terms,
+                    "safety_mode": "horizon_deform",
+                    "mode": "committed_explicit_recovery",
+                    "deform_mode": "mpc_handoff_bridge_ramp_to_resume_tube",
+                    "deformation_source": "committed_explicit_recovery",
+                    "recovery_mode": "recover",
+                    "recovery_phase": "mpc_handoff_bridge_ramp_to_resume_tube",
+                    "committed_chunk_active": True,
+                    "committed_chunk_mode": mode,
+                    "committed_chunk_index": int(idx),
+                    "committed_chunk_length": int(total),
+                    "committed_chunk_completed": completed,
+                    "committed_released_for_act_resume": False,
+                    "committed_opportunistic_resume": False,
+                    "committed_recovery_budget_exit": False,
+                    "resume_from_committed_rejoin": False,
+                    "request_action_history_reset_after_recovery": False,
+                    "act_resume_supported": False,
+                    "mpc_handoff_attempted": True,
+                    "mpc_handoff_accepted": False,
+                    "mpc_handoff_rejected": True,
+                    "mpc_handoff_reject_reason": "bridge_ramp_resume_tube_not_ready",
+                    "mpc_handoff_reason": str(handoff_reason),
+                    "mpc_handoff_attempt_count": int(self.handoff_attempt_count),
+                    "mpc_handoff_accept_count": int(self.handoff_accept_count),
+                    "mpc_handoff_reject_count": int(self.handoff_reject_count),
+                    "mpc_handoff_bridge_ramp_executed": True,
+                    "mpc_handoff_bridge_ramp_block_reason": None,
+                    "mpc_handoff_bridge_ramp_release_to_act": False,
+                    "mpc_handoff_deferred_release_reason": str(
+                        resume_block_reason or "resume_readiness_not_ready"
+                    ),
+                    "recover_steps_executed": 1,
+                    "return_steps_executed": 0,
+                    "deform_steps_executed": 0,
+                    "fallback_used": False,
+                    "optimized_accepted": True,
+                    "deform_safe": True,
+                    "is_safe": True,
+                    "is_recoverable": True,
+                }
+            )
+            if recovery.committed_rejoin_diagnostics:
+                for key, value in recovery.committed_rejoin_diagnostics.items():
+                    info.setdefault(key, value)
+            if completed:
+                recovery._clear_committed_chunk()
+            recovery.last_info = info
+            return release_chunk.reshape(original_shape), info
 
         if resume_readiness_required and not resume_allowed:
             self._reject_handoff(

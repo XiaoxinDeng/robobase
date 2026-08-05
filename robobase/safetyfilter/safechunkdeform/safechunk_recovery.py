@@ -424,6 +424,12 @@ class Recovery(InterventionExecutionFactory):
         self.mpc_handoff_use_selected_act_action_if_safe: bool = bool(
             explicit_cfg.get("mpc_handoff_use_selected_act_action_if_safe", False)
         )
+        self.mpc_handoff_bridge_ramp_on_resume_not_ready: bool = bool(
+            explicit_cfg.get("mpc_handoff_bridge_ramp_on_resume_not_ready", False)
+        )
+        self.mpc_handoff_bridge_ramp_max_steps: int = max(
+            0, int(explicit_cfg.get("mpc_handoff_bridge_ramp_max_steps", 0))
+        )
         self.mpc_handoff_shadow_prefix_len: int = max(
             1, int(explicit_cfg.get("mpc_handoff_shadow_prefix_len", 4))
         )
@@ -942,6 +948,7 @@ class Recovery(InterventionExecutionFactory):
         self.committed_chunk_index: int = 0
         self.committed_chunk_mode: str | None = None
         self.committed_chunk_modes: list[str] = []
+        self.committed_sequence_id: int = 0
         self.committed_rejoin_index: int | None = None
         self.committed_until_complete: bool = False
         self.committed_planned_q_seq: np.ndarray | None = None
@@ -3868,6 +3875,12 @@ class Recovery(InterventionExecutionFactory):
             "mpc_handoff_use_selected_act_action_if_safe": bool(
                 cfg.get("mpc_handoff_use_selected_act_action_if_safe", False)
             ),
+            "mpc_handoff_bridge_ramp_on_resume_not_ready": bool(
+                cfg.get("mpc_handoff_bridge_ramp_on_resume_not_ready", False)
+            ),
+            "mpc_handoff_bridge_ramp_max_steps": int(
+                cfg.get("mpc_handoff_bridge_ramp_max_steps", 0)
+            ),
             "mpc_handoff_shadow_prefix_len": int(
                 cfg.get("mpc_handoff_shadow_prefix_len", 4)
             ),
@@ -4012,9 +4025,9 @@ class Recovery(InterventionExecutionFactory):
             ),
             "ordered_backtrack_tolerance": int(cfg.get("ordered_backtrack_tolerance", 0)),
             "require_ordered_path": bool(cfg.get("require_ordered_path", True)),
-            "retry_cooldown_steps": int(cfg.get("retry_cooldown_steps", 4)),
+            "retry_cooldown_steps": int(cfg.get("retry_cooldown_steps", 0)),
             "max_attempts_per_unsafe_streak": int(
-                cfg.get("max_attempts_per_unsafe_streak", 3)
+                cfg.get("max_attempts_per_unsafe_streak", 0)
             ),
             "reset_attempts_after_brake_timeout": bool(
                 cfg.get("reset_attempts_after_brake_timeout", True)
@@ -4356,6 +4369,10 @@ class Recovery(InterventionExecutionFactory):
                 "committed_reject_reason": str(exc),
             }
 
+        self.committed_sequence_id += 1
+        if hasattr(self, "mpc"):
+            self.mpc.last_actual_q = None
+            self.mpc.last_actual_q_key = None
         self.committed_chunk = chunk.copy()
         self.committed_chunk_index = 0
         self.committed_chunk_modes = modes[:total]
@@ -7022,7 +7039,25 @@ class Recovery(InterventionExecutionFactory):
         state_diagnostics["committed_opportunistic_resume_reason"] = (
             "deferred_to_main_safechunk_filter"
         )
-        if mode == "recover":
+        fsm_handoff_min_commit_ok = True
+        try:
+            fsm = getattr(self.parent, "intervention_fsm", None)
+            if (
+                fsm is not None
+                and getattr(fsm.config, "enabled", False)
+                and str(getattr(fsm, "mode", ""))
+                == "InterventionMode.DEFORM_COMMIT"
+            ):
+                fsm_handoff_min_commit_ok = bool(fsm.can_handoff_from_deform())
+        except Exception:  # noqa: BLE001
+            fsm_handoff_min_commit_ok = True
+        state_diagnostics["intervention_fsm_handoff_min_commit_ok"] = bool(
+            fsm_handoff_min_commit_ok
+        )
+        state_diagnostics["intervention_fsm_handoff_block_reason"] = (
+            None if fsm_handoff_min_commit_ok else "deform_commit_min_steps"
+        )
+        if mode == "recover" and fsm_handoff_min_commit_ok:
             resume_result = self.mpc.try_handoff_to_act(
                 obs,
                 nominal_chunk,
@@ -7037,21 +7072,36 @@ class Recovery(InterventionExecutionFactory):
         if resume_result is not None:
             resumed_action, resumed_info = resume_result
             release_info = dict(resumed_info or {})
+            release_to_act = bool(
+                release_info.get("mpc_handoff_bridge_ramp_release_to_act", True)
+            )
             release_info.update(
                 self._act_release_terms(
-                    reason="mpc_handoff",
-                    allowed=True,
-                    block_reason=None,
-                    reset_history=bool(
+                    reason="mpc_handoff" if release_to_act else "mpc_handoff_bridge_ramp",
+                    allowed=release_to_act,
+                    block_reason=None
+                    if release_to_act
+                    else str(
                         release_info.get(
+                            "mpc_handoff_deferred_release_reason",
+                            "resume_tube_not_ready",
+                        )
+                    ),
+                    reset_history=bool(
+                        release_to_act
+                        and release_info.get(
                             "request_action_history_reset_after_recovery",
                             True,
                         )
                     ),
-                    resume_index=release_info.get("act_resume_index"),
+                    resume_index=release_info.get("act_resume_index") if release_to_act else None,
                     activate_window=False,
                 )
             )
+            if not release_to_act:
+                release_info["committed_released_for_act_resume"] = False
+                release_info["request_action_history_reset_after_recovery"] = False
+                release_info["act_resume_index"] = None
             self._fill_recover_affordance_metrics(release_info)
             return resumed_action, release_info
         if (
@@ -7244,6 +7294,7 @@ class Recovery(InterventionExecutionFactory):
         )
         if (
             mode == "recover"
+            and fsm_handoff_min_commit_ok
             and handoff_reject_reason in soft_handoff_reasons
             and soft_handoff_prefix_ok
             and live_safe
