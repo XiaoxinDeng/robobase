@@ -10,6 +10,16 @@ from bigym.envs.cupboards import (
     DrawersAllOpen,
     DrawersAllClose,
 )
+from bigym.envs.cupboards_with_human_arm import (
+    HumanArmDrawerTopOpen,
+    HumanArmDrawerTopClose,
+    HumanArmDrawersAllOpen,
+    HumanArmDrawersAllClose,
+    HumanArmWallCupboardOpen,
+    HumanArmWallCupboardClose,
+    HumanArmCupboardsOpenAll,
+    HumanArmCupboardsCloseAll,
+)
 from bigym.envs.dishwasher import (
     DishwasherOpen,
     DishwasherClose,
@@ -75,6 +85,14 @@ TASK_MAP = dict(
     wall_cupboard_close=WallCupboardClose,  # 3000, 10
     cupboards_open_all=CupboardsOpenAll,  # 22500, 25
     cupboards_close_all=CupboardsCloseAll,  # 15500, 25
+    human_arm_drawer_top_open=HumanArmDrawerTopOpen,
+    human_arm_drawer_top_close=HumanArmDrawerTopClose,
+    human_arm_drawers_open_all=HumanArmDrawersAllOpen,
+    human_arm_drawers_close_all=HumanArmDrawersAllClose,
+    human_arm_wall_cupboard_open=HumanArmWallCupboardOpen,
+    human_arm_wall_cupboard_close=HumanArmWallCupboardClose,
+    human_arm_cupboards_open_all=HumanArmCupboardsOpenAll,
+    human_arm_cupboards_close_all=HumanArmCupboardsCloseAll,
     take_cups=TakeCups,  # 10500, 25
     put_cups=PutCups,  # 8500, 20
     pick_box=PickBox,  # 13500, 25

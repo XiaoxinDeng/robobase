@@ -1,0 +1,15 @@
+# @package _global_
+
+extends: []
+
+scenario:
+  name: act_oscbf
+  description: ACT policy filtered one action at a time by OSCBF.
+
+environment: {}
+
+safety_filter:
+  config: oscbf.yaml
+
+eval_args:
+  condition: oscbf

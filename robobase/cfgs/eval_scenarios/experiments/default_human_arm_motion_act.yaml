@@ -1,0 +1,20 @@
+# @package _global_
+
+extends:
+  - ../default_human_arm_motion.yaml
+  - ../methods/act.yaml
+
+scenario:
+  name: default_human_arm_motion_act
+  description: >-
+    ACT baseline in the default human-arm motion environment.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+environment: {}
+
+safety_filter: {}
+
+eval_args: {}

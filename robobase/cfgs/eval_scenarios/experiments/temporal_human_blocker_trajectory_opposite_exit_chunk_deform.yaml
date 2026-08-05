@@ -1,0 +1,53 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: temporal_human_blocker_trajectory_opposite_exit_chunk_deform
+  description: >-
+    The arm enters from one side and exits to the other side, creating a non-returning crossing obstacle that clears after exit.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    temporary_blocker:
+      enabled: true
+
+environment:
+  override:
+    - +env.enable_temporary_human_blocker=true
+    - +env.trigger_dist=1.20
+    - +env.enter_duration=1.10
+    - +env.hold_duration=0.90
+    - +env.exit_duration=1.10
+    - +env.natural_motion_scale=0.90
+    - +env.q_outside=[-0.70,-0.30,0.0,0.0,-0.35,1.20]
+    - +env.q_block=[0.50,0.30,0.0,1.50,-0.46,1.00]
+    - +env.q_exit=[0.92,-0.34,0.0,0.0,-0.35,1.20]
+
+eval_args:
+  condition: chunk_deform
+  episodes: 10
+  steps: 300
+  seed: 1
+  continue_after_success: true
+  no_progress: true
+  log_chunk_trajectories: true
+  log_mpc_replay_diagnostics: true
+  mpc_replay_diagnostics_max_events: 300
+  plot_chunk_trajectories_3d: true
+  video_time_base: sim
+  stop_video_at_steps: 300
+  reset_action_history_after_human_exit: true
+  reset_visual_history_after_human_exit: true
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/temporal_human_blocker_trajectory_opposite_exit_chunk_deform.yaml

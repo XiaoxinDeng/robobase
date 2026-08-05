@@ -1,0 +1,43 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker_chunk_deform_force_planned_recovery_q_ablation.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_force_nominal_resume_window_ablation
+  description: >-
+    Eval-only ablation: when recovery has found its closest original ACT
+    nominal 4-frame resume window, set MuJoCo robot q/qvel to each
+    nominal window frame without stepping physics actions, and seed ACT's
+    stacked observation context from those forced states. This tests whether
+    ACT can resume from ACT's own closest
+    nominal trajectory context if the recovery action-execution/model mismatch
+    is removed completely.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+eval_args:
+  hide_human_arm_policy_obs: true
+  ablation_force_planned_recovery_q_source_mode: original_nominal_window
+  ablation_force_planned_recovery_q_seed_policy_window: true
+  # Near-teleport ablation: build the 4-frame observation stack with
+  # set_state + physics.forward(), not env.step(action) replay.
+  ablation_force_planned_recovery_q_window_mode: set_state_only
+  ablation_force_planned_recovery_q_replay_sequence: false
+  ablation_force_planned_recovery_q_sync_low_level_state: true
+  ablation_force_planned_recovery_q_window_len: 4
+  # Keep this strict: if recover_resume_window_target_q is absent, skip instead
+  # of falling back to an interpolated recovery/planned window.
+  ablation_force_planned_recovery_q_window_interpolate: false
+  ablation_force_planned_recovery_q_reset_history: false
+  ablation_force_planned_recovery_q_pure_act_resume_steps: 40
+  episodes: 2
+  steps: 300
+
+launch_example: >-
+  cd /home/xd1125/Workspace/safe_bigym_hoi/external/robobase && \
+  TF_CPP_MIN_LOG_LEVEL=2 /home/xd1125/miniconda3/envs/safe_bigym_hoi/bin/python \
+    eval_act_oscbf_safety_metrics.py \
+    --eval-config robobase/cfgs/eval_scenarios/experiments/temporal_human_blocker_chunk_deform_force_nominal_resume_window_ablation.yaml

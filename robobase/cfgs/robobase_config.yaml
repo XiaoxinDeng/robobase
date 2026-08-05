@@ -4,13 +4,15 @@ defaults:
   - method: null
   - intrinsic_reward_module: null
   - launch: null
+  - safety_filter: oscbf
   - override hydra/launcher: joblib
 
 # Universal settings
 create_train_env: true
 num_train_envs: 1
 replay_size_before_train: 2000
-num_pretrain_steps: 0
+num_pretrain_steps: 0 # Only used when replay.type=uniform
+num_pretrain_epochs: 10000  # Only used when replay.type=epoch
 num_train_frames: 1100000
 eval_every_steps: 10000
 num_eval_episodes: 10
@@ -39,6 +41,10 @@ action_sequence: 1 # ActionSequenceWrapper
 execution_length: 1  # If execution_length < action_sequence, we use receding horizon control
 temporal_ensemble: true  # Temporal ensemling only applicable to action sequence > 1
 temporal_ensemble_gain: 0.01
+action_smoothing:
+  enabled: false  # Eval-only EMA smoothing in RecedingHorizonControl.
+  alpha: 0.0  # smooth = alpha * previous_action + (1 - alpha) * current_action.
+  ignore_last_dims: 0  # For BiGym H1, set to 2 to leave grippers unsmoothed.
 use_standardization: false  # Demo-based standardization for action space
 use_min_max_normalization: false  # Demo-based min-max normalization for action space
 min_max_margin: 0.0  # If set to > 0, introduce margin for demo-driven min-max normalization
@@ -46,6 +52,7 @@ norm_obs: false
 
 # Replay buffer settings
 replay:
+  type: epoch  # uniform: infinite random stream, epoch: finite shuffled epoch batches
   prioritization: false
   size: 1000000
   gamma: 0.99
@@ -64,7 +71,7 @@ wandb:  # weight and bias
   use: true
   project: act_bigym
   entity: younggyo
-  name: act
+  name: test_run
 
 tb:  # TensorBoard
   use: false
@@ -80,6 +87,7 @@ log_train_video: false
 log_eval_video: true
 log_pretrain_every: 100
 save_csv: false
+
 
 hydra:
   run:

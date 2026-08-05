@@ -14,22 +14,77 @@ from robobase.envs.wrappers import (
     ConcatDim,
     RecedingHorizonControl,
 )
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from bigym.utils.observation_config import ObservationConfig, CameraConfig
 from bigym.action_modes import PelvisDof
 import multiprocessing as mp
 import logging
 import numpy as np
 
-from demonstrations.demo import DemoStep
-from demonstrations.demo_store import DemoStore
+from demonstrations.demo import DemoStep, Demo
+from demonstrations.demo_store import DemoStore, DemoNotFoundError
+from demonstrations.demo_converter import DemoConverter
 from demonstrations.utils import Metadata
 
 from typing import List, Dict, Tuple, Callable
 import copy
+import inspect
+from bigym.const import CACHE_PATH
+import os
+import json
+from pathlib import Path
+from pathlib import Path
+from demonstrations.demo import Demo
+from collections import defaultdict
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(levelname)s] %(message)s",
+)
 
 UNIT_TEST = False
 
+def _validate_mode_labels_from_info(cfg, demos):
+    require_mode_label = cfg.env.get("require_mode_label", False)
+
+    if not require_mode_label:
+        return demos
+
+    kept = []
+    dropped = []
+    error_type = {'1': "success", 
+                  "-1": "Missing Info", 
+                  "-2":"mode_label Not found in info", 
+                  "-3": "Failed to convert to int type"}
+    for demo in demos:
+        demo_uuid = str(demo.uuid)
+        ok = 1
+
+        for i, ts in enumerate(demo.timesteps):
+            if ts.info is None:
+                ok = -1
+                break
+            if "mode_label" not in ts.info:
+                ok = -2
+                break
+
+            try:
+                ts.info["mode_label"] = int(ts.info["mode_label"])
+            except Exception:
+                ok = -3
+                break
+
+        if ok:
+            kept.append(demo)
+        else:
+            dropped.append(demo_uuid)
+            logging.warning(f"Dropping demo; {error_type[ok]}")
+
+    print(f"[mode_label] kept {len(kept)} demos with info labels, dropped {len(dropped)} without valid labels")
+    if dropped:
+        print("[mode_label] dropped uuids:", dropped[:10])
+
+    return kept
 
 def rescale_demo_actions(
     rescale_fn: Callable, demos: List[List[DemoStep]], cfg: DictConfig
@@ -99,6 +154,7 @@ class BiGymEnvFactory(EnvFactory):
 
         if not demo_env:
             if not train:
+                action_smoothing = cfg.get("action_smoothing", {})
                 env = RecedingHorizonControl(
                     env,
                     cfg.action_sequence,
@@ -106,6 +162,11 @@ class BiGymEnvFactory(EnvFactory):
                     cfg.execution_length,
                     temporal_ensemble=cfg.temporal_ensemble,
                     gain=cfg.temporal_ensemble_gain,
+                    action_smoothing_enabled=action_smoothing.get("enabled", False),
+                    action_smoothing_alpha=action_smoothing.get("alpha", 0.0),
+                    action_smoothing_ignore_last_dims=action_smoothing.get(
+                        "ignore_last_dims", 0
+                    ),
                 )
             else:
                 env = ActionSequence(
@@ -144,16 +205,46 @@ class BiGymEnvFactory(EnvFactory):
                 floating_base=True,
             )
 
-        return bigym_class(
+        env_kwargs = dict(
             render_mode=cfg.env.render_mode,
             action_mode=action_mode,
             observation_config=ObservationConfig(
                 cameras=camera_configs if cfg.pixels else [],
                 proprioception=True,
-                privileged_information=False if cfg.pixels else True,
+                privileged_information=cfg.env.get(
+                    "privileged_information", (not cfg.pixels)
+                ),
             ),
             control_frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
         )
+        env_signature = inspect.signature(bigym_class.__init__).parameters
+        if "arm_action_mode" in env_signature:
+            env_kwargs["arm_action_mode"] = cfg.env.get("arm_action_mode", "scripted")
+
+        temporary_blocker_keys = [
+            "enable_temporary_human_blocker",
+            "trigger_dist",
+            "enter_duration",
+            "hold_duration",
+            "exit_duration",
+            "natural_motion_scale",
+            "exit_after_y_peak",
+            "max_blocker_joint_speed",
+            "q_outside",
+            "q_block",
+            "q_exit",
+            "human_joint_names",
+            "ee_site_name",
+            "handle_site_name",
+        ]
+        for key in temporary_blocker_keys:
+            if key in env_signature and key in cfg.env:
+                value = cfg.env.get(key)
+                if OmegaConf.is_config(value):
+                    value = OmegaConf.to_container(value, resolve=True)
+                env_kwargs[key] = value
+
+        return bigym_class(**env_kwargs)
 
     def make_train_env(self, cfg: DictConfig) -> gym.vector.VectorEnv:
         vec_env_class = gym.vector.SyncVectorEnv
@@ -184,29 +275,51 @@ class BiGymEnvFactory(EnvFactory):
 
         logging.info("Start to load demos.")
         env = self._create_env(cfg)
-
+        target_frequency = CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate
+        demo_manifest = cfg.env.get("manifest", None)
         demo_store = DemoStore()
+
         if np.isinf(num_demos):
             num_demos = -1
-
-        demos = demo_store.get_demos(
-            Metadata.from_env(env),
-            amount=num_demos,
-            frequency=CONTROL_FREQUENCY_MAX // cfg.env.demo_down_sample_rate,
-        )
-
+        if demo_manifest is not None:
+            logging.info(
+                "Loading Task %s from manifest: '%s'",
+                cfg.env.task_name, demo_manifest,
+            )
+            demos = self._load_demos_from_manifest(demo_manifest, num_demos)
+            logging.info(f"Loaded {len(demos)} demos from manifest.")
+        else:
+            logging.info(
+                "Loading from DemoStore: %s",
+                cfg.env.task_name,
+            )
+            try:
+                demos = demo_store.get_demos(
+                    Metadata.from_env(env),
+                    amount=num_demos,
+                    frequency=target_frequency,
+                )
+            except DemoNotFoundError:                
+                env.close()
+                raise
+        if len(demos) == 0:
+            raise RuntimeError(
+                f"No demos loaded from manifest: {demo_manifest}"
+            )
+        
         for demo in demos:
             for ts in demo.timesteps:
                 ts.observation = {
-                    k: np.array(v, dtype=np.float32) for k, v in ts.observation.items()
+                    k: np.array(v, dtype=np.uint8 if k.startswith("rgb_") else np.float32) # Save rgb as uint8, save others as float32
+                    for k, v in ts.observation.items() if k != "mode_label" or cfg.env.get("require_mode_label", False)
                 }
-
         env.close()
         logging.info("Finished loading demos.")
         return demos
 
     def collect_or_fetch_demos(self, cfg: DictConfig, num_demos: int):
         demos = self._get_demo_fn(cfg, num_demos)
+        demos = _validate_mode_labels_from_info(cfg, demos)
         self._raw_demos = demos
         self._action_stats = self._compute_action_stats(cfg, demos)
         self._obs_stats = self._compute_obs_stats(cfg, demos)
@@ -218,6 +331,24 @@ class BiGymEnvFactory(EnvFactory):
         )
         self._demos = self._demo_to_steps(cfg, demo_list)
 
+    def _load_demos_from_manifest(self, manifest_path: str, amount: int = -1):
+        manifest_path = Path(manifest_path).expanduser()
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            entries = json.load(f)
+
+        demos = []
+        for entry in entries:
+            # Filter unsuccessful tasks
+            if entry["success"] == 1:
+                demo_path = Path(entry["target_path"]).expanduser()
+                demo = Demo.from_safetensors(demo_path)   # replace with your actual demo loader
+                demos.append(demo)
+        
+        if amount is not None and amount > 0:
+            demos = demos[:amount]
+
+        return demos
+    
     def load_demos_into_replay(self, cfg: DictConfig, buffer, is_demo_buffer):
         """See base class for documentation."""
         assert hasattr(self, "_demos"), (
@@ -248,43 +379,86 @@ class BiGymEnvFactory(EnvFactory):
         )
         for _ in range(len(demos)):
             add_demo_to_replay_buffer(demo_env, buffer)
-
+            
     def _demo_to_steps(
         self, cfg: DictConfig, demo_list: List[List[DemoStep]]
     ) -> List[DemoStep]:
         ret_demos = []
 
+        demos_from_manifest = cfg.env.get("manifest", None) is not None
+
         for demo in demo_list:
             cur_demo = []
             last_timestep = False
-            
-            # Detect whether this demo is successful or not
-            rewards = []
-            for step in demo:
-                reward = step.reward
-                rewards.append(reward)
-            successful_demo = sum(rewards) > 0.25
-            
-            for i, step in enumerate(demo):
-                step.info.update({"demo": int(successful_demo)})
-                if i == 0:
-                    cur_demo.append((step.observation, step.info))
-                else:
-                    term, trunc = step.termination, step.truncation
+
+            if len(demo) == 0:
+                continue
+
+            if demos_from_manifest:
+                # Manifest-selected demos are treated as successful by construction.
+                successful_demo = True
+            else:
+                # Compute success from transition rewards only.
+                # Skip i == 0 because the first timestep is the reset / initial state
+                # and may not have a valid reward.
+                rewards = []
+                for i, step in enumerate(demo):
+                    if i == 0:
+                        continue
+
                     reward = step.reward
+                    if reward is None:
+                        raise RuntimeError(
+                            f"Reward is None in demo at transition step {i}"
+                        )
+
+                    rewards.append(float(reward))
+
+                successful_demo = sum(rewards) > 0.25
+
+            for i, step in enumerate(demo):
+                if step.info is None:
+                    step.info = {}
+
+                step.info.update({"demo": int(successful_demo)})
+
+                if i == 0:
+                    # Initial observation timestep: no reward / term / trunc payload.
+                    cur_demo.append((step.observation, step.info))
+                    continue
+
+                term, trunc = step.termination, step.truncation
+                reward = step.reward
+
+                # Be defensive in case reward is missing in some demos.
+                if reward is None:
+                    reward = 0.0
+
+                if demos_from_manifest:
+                    # Manifest demos are already filtered to successful recordings.
+                    # End on the final step or on explicit success flag in info.
+                    if i == len(demo) - 1 or bool(step.info.get("success", False)):
+                        if not (term or trunc):
+                            term = False
+                            trunc = True
+                        last_timestep = True
+                else:
+                    # Non-manifest demos: infer end-of-demo from final step or positive reward.
                     if i == len(demo) - 1 or reward > 0:
                         if not (term or trunc):
                             term = False
                             trunc = True
                         last_timestep = True
 
-                    cur_demo.append((step.observation, reward, term, trunc, step.info))
+                cur_demo.append((step.observation, reward, term, trunc, step.info))
+
                 if last_timestep:
                     break
+
             ret_demos.append(cur_demo)
 
         return ret_demos
-
+    
     def _compute_action_stats(
         self, cfg: DictConfig, demos: List[List[DemoStep]]
     ) -> Dict:
@@ -309,18 +483,37 @@ class BiGymEnvFactory(EnvFactory):
         }
         return action_stats
 
+
+
     def _compute_obs_stats(self, cfg: DictConfig, demos: List[List[DemoStep]]) -> Dict:
-        obs = []
+        per_key = defaultdict(list)
+        valid_keys = None
+
         for demo in demos:
             for step in demo.timesteps:
-                obs.append(step.observation)
+                obs = step.observation
 
-        keys = obs[0].keys()
-        obs = {key: np.stack([o[key] for o in obs], axis=0) for key in keys}
-        obs_mean = {key: np.mean(obs[key], 0) for key in keys}
-        obs_std = {key: np.std(obs[key], 0) for key in keys}
-        obs_min = {key: np.min(obs[key], 0) for key in keys}
-        obs_max = {key: np.max(obs[key], 0) for key in keys}
+                if valid_keys is None:
+                    valid_keys = [
+                        k for k, v in obs.items()
+                        if np.asarray(v).ndim == 1 and k != "proprioception_floating_base_actions"
+                    ]
+
+                for k in valid_keys:
+                    per_key[k].append(obs[k])
+
+        obs_mean = {}
+        obs_std = {}
+        obs_min = {}
+        obs_max = {}
+
+        for k, values in per_key.items():
+            arr = np.asarray(values, dtype=np.float32)
+            obs_mean[k] = arr.mean(axis=0)
+            obs_std[k] = arr.std(axis=0)
+            obs_min[k] = arr.min(axis=0)
+            obs_max[k] = arr.max(axis=0)
+
         obs_stats = {
             "mean": obs_mean,
             "std": obs_std,
@@ -328,7 +521,7 @@ class BiGymEnvFactory(EnvFactory):
             "min": obs_min,
         }
         return obs_stats
-
+    
     def _get_gripper_action_stats(
         self, cfg: DictConfig
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -343,3 +536,6 @@ class BiGymEnvFactory(EnvFactory):
             action_stats=self._action_stats,
             min_max_margin=cfg.min_max_margin,
         )
+
+
+

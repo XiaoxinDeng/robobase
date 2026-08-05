@@ -577,15 +577,28 @@ def add_demo_to_replay_buffer(wrapped_env: DemoEnv, replay_buffer: ReplayBuffer)
     while not (term or trunc):
         next_obs, rew, term, trunc, next_info = wrapped_env.step(fake_action)
         action = next_info.pop("demo_action")
+        mode_label = info.get("mode_label", None)   # align label with current obs
         assert np.all(action <= 1.0)
         assert np.all(action >= -1.0)
-        ep.append([obs, action, rew, term, trunc, info, next_info])
+        ep.append([obs, action, rew, term, trunc, info, next_info, mode_label])
         obs = next_obs
         info = next_info
     final_obs, _ = obs, info
 
-    for obs, action, rew, term, trunc, info, _ in ep:
-        replay_buffer.add(obs, action, rew, term, trunc, demo=info["demo"])
+    for obs, action, rew, term, trunc, info, _,  mode_label in ep:
+        kwargs = {"demo": info["demo"]}
+
+        if mode_label is not None:
+            kwargs["mode_label"] = np.asarray(mode_label, dtype=np.uint8)
+
+        replay_buffer.add(
+            obs,
+            action,
+            rew,
+            term,
+            trunc,
+            **kwargs,
+        )
 
     if not is_sequential:
         replay_buffer.add_final(final_obs)

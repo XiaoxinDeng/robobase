@@ -228,6 +228,7 @@ There are 4 common ways to use RoboBase:
 Option **2**, **3**, and **4** requires you importing RoboBase into your project, while option **1** you can install and use directly in the terminal with no new code.
 See below for details on each of these options.
 
+
 ### Running existing algorithms on existing environments
 
 From the root of the project, you can launch experiments from any of the supported environments.

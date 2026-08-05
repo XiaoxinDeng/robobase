@@ -17,7 +17,8 @@ from robobase.logger import Logger
 from robobase.replay_buffer.prioritized_replay_buffer import PrioritizedReplayBuffer
 from robobase.replay_buffer.replay_buffer import ReplayBuffer
 from robobase.replay_buffer.uniform_replay_buffer import UniformReplayBuffer
-
+from robobase.replay_buffer.epoch_replay_buffer import EpochReplayBuffer
+from robobase.safetyfilter.h1_state_bridge import extract_h1_state
 
 from pathlib import Path
 
@@ -26,8 +27,34 @@ import numpy as np
 import torch
 import gymnasium as gym
 from torch.utils.data import DataLoader
+import numpy as np
 
 torch.backends.cudnn.benchmark = True
+
+
+def _uses_epoch_replay(cfg: DictConfig) -> bool:
+    return str(cfg.replay.get("type", "uniform")).lower() == "epoch"
+
+
+def _create_replay_loader(cfg: DictConfig, replay_buffer: ReplayBuffer) -> DataLoader:
+    if _uses_epoch_replay(cfg):
+        if cfg.replay.num_workers != 0:
+            logging.warning("replay.type=epoch uses num_workers=0 because the buffer batches internally.")
+        return DataLoader(
+            replay_buffer,
+            batch_size=None,
+            num_workers=0,
+            pin_memory=cfg.replay.pin_memory,
+            worker_init_fn=_worker_init_fn,
+        )
+
+    return DataLoader(
+        replay_buffer,
+        batch_size=replay_buffer.batch_size,
+        num_workers=cfg.replay.num_workers,
+        pin_memory=cfg.replay.pin_memory,
+        worker_init_fn=_worker_init_fn,
+    )
 
 
 def _worker_init_fn(worker_id):
@@ -45,15 +72,35 @@ def _create_default_replay_buffer(
     extra_replay_elements = spaces.Dict({})
     if cfg.demos != 0:
         extra_replay_elements["demo"] = spaces.Box(0, 1, shape=(), dtype=np.uint8)
+    if cfg.env.get("require_mode_label", False):
+        extra_replay_elements["mode_label"] = spaces.Box(
+            low=0,
+            high=2,
+            shape=(),
+            dtype=np.uint8,
+        )
     # Create replay_class with buffer-specific hyperparameters
-    replay_class = UniformReplayBuffer
-    if cfg.replay.prioritization:
+    replay_type = str(cfg.replay.get("type", "uniform")).lower()
+    if replay_type not in {"uniform", "epoch"}:
+        raise ValueError(f"Unsupported replay.type={replay_type!r}; use 'uniform' or 'epoch'.")
+    if cfg.replay.prioritization and replay_type == "epoch":
+        raise ValueError("replay.type=epoch is not compatible with prioritized replay")
+
+    if replay_type == "epoch":
+        replay_class = EpochReplayBuffer
+    elif cfg.replay.prioritization:
         replay_class = PrioritizedReplayBuffer
+    else:
+        replay_class = UniformReplayBuffer
     replay_class = partial(
         replay_class,
         nstep=cfg.replay.nstep,
         gamma=cfg.replay.gamma,
     )
+    # Epoch replay batches internally and is consumed by a single DataLoader worker.
+    # Keep the replay buffer unsharded so every epoch can see every episode.
+    num_replay_workers = 0 if replay_type == "epoch" else cfg.replay.num_workers
+
     # Create replay_class with common hyperparameters
     return replay_class(
         save_dir=cfg.replay.save_dir,
@@ -65,7 +112,7 @@ def _create_default_replay_buffer(
         reward_dtype=np.float32,
         observation_elements=observation_space,
         extra_replay_elements=extra_replay_elements,
-        num_workers=cfg.replay.num_workers,
+        num_workers=num_replay_workers,
         sequential=cfg.replay.sequential,
     )
 
@@ -112,6 +159,12 @@ class Workspace:
             else work_dir
         )
         print(f"workspace: {self.work_dir}")
+        # Safety Filter
+        if cfg.get("safety_filter") and cfg.safety_filter.get("enabled", False):
+            self.safety_filter = hydra.utils.instantiate(cfg.safety_filter)
+        else:
+            self.safety_filter = None
+        print("safety_filter:", type(self.safety_filter).__name__ if self.safety_filter is not None else None)
 
         # Sanity checks
         if (
@@ -203,13 +256,7 @@ class Workspace:
         self.prioritized_replay = cfg.replay.prioritization
         self.extra_replay_elements = self.replay_buffer.extra_replay_elements
 
-        self.replay_loader = DataLoader(
-            self.replay_buffer,
-            batch_size=self.replay_buffer.batch_size,
-            num_workers=cfg.replay.num_workers,
-            pin_memory=cfg.replay.pin_memory,
-            worker_init_fn=_worker_init_fn,
-        )
+        self.replay_loader = _create_replay_loader(cfg, self.replay_buffer)
         self._replay_iter = None
 
         # Create a separate demo replay that contains successful episodes.
@@ -222,13 +269,7 @@ class Workspace:
             self.demo_replay_buffer = create_replay_fn(
                 cfg, observation_space, action_space, demo_replay=True
             )
-            self.demo_replay_loader = DataLoader(
-                self.demo_replay_buffer,
-                batch_size=self.demo_replay_buffer.batch_size,
-                num_workers=cfg.replay.num_workers,
-                pin_memory=cfg.replay.pin_memory,
-                worker_init_fn=_worker_init_fn,
-            )
+            self.demo_replay_loader = _create_replay_loader(cfg, self.demo_replay_buffer)
 
         if self.prioritized_replay:
             if self.use_demo_replay:
@@ -291,16 +332,20 @@ class Workspace:
             + self.pretrain_steps
         )
 
+    def _reset_replay_iter(self):
+        _replay_iter = iter(self.replay_loader)
+        if self.use_demo_replay:
+            _demo_replay_iter = iter(self.demo_replay_loader)
+            _replay_iter = utils.merge_replay_demo_iter(
+                _replay_iter, _demo_replay_iter
+            )
+        self._replay_iter = _replay_iter
+        return self._replay_iter
+
     @property
     def replay_iter(self):
         if self._replay_iter is None:
-            _replay_iter = iter(self.replay_loader)
-            if self.use_demo_replay:
-                _demo_replay_iter = iter(self.demo_replay_loader)
-                _replay_iter = utils.merge_replay_demo_iter(
-                    _replay_iter, _demo_replay_iter
-                )
-            self._replay_iter = _replay_iter
+            return self._reset_replay_iter()
         return self._replay_iter
 
     def train(self):
@@ -365,7 +410,7 @@ class Workspace:
                 step += 1
             if episode == 0:
                 first_rollout = np.array(self.eval_video_recorder.frames)
-            self.eval_video_recorder.save(f"{self.global_env_steps}.mp4")
+            self.eval_video_recorder.save(f"episode_{episode:03d}_envstep_{self.global_env_steps}.mp4")
             success = info.get("task_success")
             if success is not None:
                 successes += np.array(success).astype(int).item()
@@ -483,6 +528,11 @@ class Workspace:
     def _signal_handler(self, sig, frame):
         print("\nCtrl+C detected. Preparing to shutdown...")
         self._shutting_down = True
+        try:
+            self.shutdown()
+        except Exception as e:
+            print(f"Shutdown warning: {e}")
+        raise KeyboardInterrupt
 
     def _load_demos(self):
         if (num_demos := self.cfg.demos) != 0:
@@ -507,7 +557,7 @@ class Workspace:
                     "Please make sure that this is an intended behavior."
                 )
 
-    def _perform_updates(self) -> dict[str, Any]:
+    def _perform_updates(self, allow_epoch_reset: bool = True) -> dict[str, Any]:
         if self.agent.logging:
             start_time = time.time()
         metrics = {}
@@ -516,11 +566,21 @@ class Workspace:
             if (self.main_loop_iterations + i) % self.cfg.update_every_steps != 0:
                 # Skip update
                 continue
-            metrics.update(
-                self.agent.update(
-                    self.replay_iter, self.main_loop_iterations + i, self.replay_buffer
+            try:
+                metrics.update(
+                    self.agent.update(
+                        self.replay_iter, self.main_loop_iterations + i, self.replay_buffer
+                    )
                 )
-            )
+            except StopIteration:
+                if not (_uses_epoch_replay(self.cfg) and allow_epoch_reset):
+                    raise
+                self._reset_replay_iter()
+                metrics.update(
+                    self.agent.update(
+                        self.replay_iter, self.main_loop_iterations + i, self.replay_buffer
+                    )
+                )
         self.agent.train(False)
         if self.agent.logging:
             execution_time_for_update = time.time() - start_time
@@ -532,6 +592,59 @@ class Workspace:
             ) / execution_time_for_update
         return metrics
 
+    def _filter_action(self, action, env, observations, eval_mode: bool):
+        """
+        Safety-filter eval action.
+
+        Chunk-aware filters receive the full eval chunk before the first action is
+        selected by the action-sequence wrapper. Legacy single-step filters still
+        operate on the first executable action only.
+        """
+
+        if not eval_mode:
+            return action
+
+        if self.safety_filter is None:
+            return action
+        if not getattr(self.safety_filter, "enabled", True):
+            return action
+
+        # For now validate only single executable action.
+        # ACT eval action shape is usually (T, act_dim).
+        if action.ndim != 2:
+            raise ValueError(
+                f"Expected eval action shape (T, act_dim), got {action.shape}"
+            )
+
+        action_safe = action.copy()
+
+        # Extract robot state for OSCBF.
+        # This must return q_full and qd_full in the robot model frame/state convention.
+        q_full, qd_full = extract_h1_state(
+            env,
+            print_diagnostics=self.cfg.safety_filter.get("debug", False),
+        )
+
+        if hasattr(self.safety_filter, "filter_chunk") and action.ndim == 2:
+            action_safe, _safety_info = self.safety_filter.filter_chunk(
+                observations,
+                action,
+                env=env,
+                q_full=q_full,
+                qd_full=qd_full,
+            )
+        else:
+            # Filter only the action that will be executed now.
+            action_safe[0] = self.safety_filter(
+                action=action[0],
+                env=env,
+                observations=observations,
+                q_full=q_full,
+                qd_full=qd_full,
+            )
+
+        return action_safe
+    
     def _perform_env_steps(
         self, observations: dict[str, np.ndarray], env: gym.Env, eval_mode: bool
     ) -> tuple[np.ndarray, tuple, dict[str, Any]]:
@@ -563,7 +676,32 @@ class Workspace:
                 )
             if eval_mode:
                 action = action[0]  # we expect batch of 1 for eval
-
+            action = self._filter_action(
+                action=action,
+                env=env,
+                observations=observations,
+                eval_mode=eval_mode,
+            )
+            if self.safety_filter is not None:
+                safety_info = getattr(self.safety_filter, "last_info", None)
+                if isinstance(safety_info, dict):
+                    for key in (
+                        "safety_mode",
+                        "min_clearance",
+                        "first_violation",
+                        "unsafe_count",
+                        "progress_scale",
+                        "deadlock",
+                        "brake_stop_idx",
+                        "deformation_norm",
+                        "deformation_source",
+                        "chunk_deform_scale",
+                        "chunk_deform_attempts",
+                        "deform_safe",
+                        "deform_min_clearance",
+                    ):
+                        if key in safety_info:
+                            metrics[f"safety_filter/{key}"] = safety_info[key]
         if self.agent.logging:
             execution_time_for_act = time.time() - start_time
             metrics["agent_act_steps_per_second"] = (
@@ -585,27 +723,43 @@ class Workspace:
         return action, (*env_step_tuple, next_info), metrics
 
     def _pretrain_on_demos(self):
+        num_pretrain_epochs = int(self.cfg.get("num_pretrain_epochs", 0))
+        if _uses_epoch_replay(self.cfg) and num_pretrain_epochs > 0:
+            self._pretrain_on_demos_by_epoch(num_pretrain_epochs)
+            return
+
         if self.cfg.num_pretrain_steps > 0:
-            pre_train_until_step = utils.Until(self.cfg.num_pretrain_steps)
-            should_pretrain_log = utils.Every(self.cfg.log_pretrain_every)
-            should_pretrain_eval = utils.Every(self.cfg.eval_every_steps)
-            if self.cfg.log_pretrain_every > 0:
-                assert self.cfg.num_pretrain_steps % self.cfg.log_pretrain_every == 0
-            if len(self.replay_buffer) <= 0:
-                raise ValueError(
-                    "there is no sample to pre-train with in the replay buffer "
-                    f"but num_pretrain_steps ({self.cfg.num_pretrain_steps}) is > 0"
-                )
+            self._pretrain_on_demos_by_steps()
 
-            while pre_train_until_step(self.pretrain_steps):
+    def _pretrain_on_demos_by_epoch(self, num_pretrain_epochs: int):
+        should_pretrain_log = utils.Every(self.cfg.log_pretrain_every)
+        should_pretrain_eval = utils.Every(self.cfg.eval_every_steps)
+        snapshot_every_n = (
+            self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
+        )
+        should_save_snapshot = utils.Every(snapshot_every_n)
+        if len(self.replay_buffer) <= 0:
+            raise ValueError(
+                "there is no sample to pre-train with in the replay buffer "
+                f"but num_pretrain_epochs ({num_pretrain_epochs}) is > 0"
+            )
+
+        for epoch in range(num_pretrain_epochs):
+            self._reset_replay_iter()
+            while True:
                 self.agent.logging = False
-
                 if should_pretrain_log(self.pretrain_steps):
                     self.agent.logging = True
-                pretrain_metrics = self._perform_updates()
+
+                try:
+                    pretrain_metrics = self._perform_updates(allow_epoch_reset=False)
+                except StopIteration:
+                    logging.info("Finished replay epoch %d/%d", epoch + 1, num_pretrain_epochs)
+                    break
 
                 if should_pretrain_log(self.pretrain_steps):
                     pretrain_metrics.update(self._get_common_metrics())
+                    pretrain_metrics["pretrain_epoch"] = epoch
                     self.logger.log_metrics(
                         pretrain_metrics, self.pretrain_steps, prefix="pretrain"
                     )
@@ -613,11 +767,54 @@ class Workspace:
                 if should_pretrain_eval(self.pretrain_steps):
                     eval_metrics = self._eval()
                     eval_metrics.update(self._get_common_metrics())
+                    eval_metrics["pretrain_epoch"] = epoch
                     self.logger.log_metrics(
                         eval_metrics, self.pretrain_steps, prefix="pretrain_eval"
                     )
 
                 self._pretrain_step += 1
+                if should_save_snapshot(self.pretrain_steps):
+                    self.save_snapshot()
+
+    def _pretrain_on_demos_by_steps(self):
+        pre_train_until_step = utils.Until(self.cfg.num_pretrain_steps)
+        should_pretrain_log = utils.Every(self.cfg.log_pretrain_every)
+        should_pretrain_eval = utils.Every(self.cfg.eval_every_steps)
+        snapshot_every_n = (
+            self.cfg.snapshot_every_n if self.cfg.save_snapshot else 0
+        )
+        should_save_snapshot = utils.Every(snapshot_every_n)
+        if self.cfg.log_pretrain_every > 0:
+            assert self.cfg.num_pretrain_steps % self.cfg.log_pretrain_every == 0
+        if len(self.replay_buffer) <= 0:
+            raise ValueError(
+                "there is no sample to pre-train with in the replay buffer "
+                f"but num_pretrain_steps ({self.cfg.num_pretrain_steps}) is > 0"
+            )
+
+        while pre_train_until_step(self.pretrain_steps):
+            self.agent.logging = False
+
+            if should_pretrain_log(self.pretrain_steps):
+                self.agent.logging = True
+            pretrain_metrics = self._perform_updates()
+
+            if should_pretrain_log(self.pretrain_steps):
+                pretrain_metrics.update(self._get_common_metrics())
+                self.logger.log_metrics(
+                    pretrain_metrics, self.pretrain_steps, prefix="pretrain"
+                )
+
+            if should_pretrain_eval(self.pretrain_steps):
+                eval_metrics = self._eval()
+                eval_metrics.update(self._get_common_metrics())
+                self.logger.log_metrics(
+                    eval_metrics, self.pretrain_steps, prefix="pretrain_eval"
+                )
+
+            self._pretrain_step += 1
+            if should_save_snapshot(self.pretrain_steps):
+                self.save_snapshot()
 
     def _online_rl(self):
         train_until_frame = utils.Until(self.cfg.num_train_frames)
@@ -706,13 +903,45 @@ class Workspace:
         return metrics
 
     def shutdown(self):
-        if self.eval_env:
-            self.eval_env.close()
+        print("[shutdown] starting")
 
-        self.train_envs.close()
-        self.replay_buffer.shutdown()
-        if self.use_demo_replay:
-            self.demo_replay_buffer.shutdown()
+        try:
+            if self.eval_env is not None:
+                print("[shutdown] closing eval_env")
+                self.eval_env.close()
+        except Exception as e:
+            print(f"[shutdown] eval_env.close failed: {e}")
+
+        try:
+            if self.train_envs is not None:
+                print("[shutdown] closing train_envs")
+                self.train_envs.close()
+        except Exception as e:
+            print(f"[shutdown] train_envs.close failed: {e}")
+
+        try:
+            if self.replay_buffer is not None:
+                print("[shutdown] shutting down replay_buffer")
+                self.replay_buffer.shutdown()
+        except Exception as e:
+            print(f"[shutdown] replay_buffer.shutdown failed: {e}")
+
+        try:
+            if self.use_demo_replay and self.demo_replay_buffer is not None:
+                print("[shutdown] shutting down demo_replay_buffer")
+                self.demo_replay_buffer.shutdown()
+        except Exception as e:
+            print(f"[shutdown] demo_replay_buffer.shutdown failed: {e}")
+
+        try:
+            import wandb
+            if wandb.run is not None:
+                print("[shutdown] finishing wandb")
+                wandb.finish(exit_code=1)
+        except Exception as e:
+            print(f"[shutdown] wandb.finish failed: {e}")
+
+        print("[shutdown] done")
 
     def save_snapshot(self):
         snapshot = self.work_dir / "snapshots" / f"{self.global_env_steps}_snapshot.pt"
@@ -731,18 +960,20 @@ class Workspace:
         shutil.copy(snapshot, latest_snapshot)
 
     def load_snapshot(self, path_to_snapshot_to_load=None):
-        if path_to_snapshot_to_load is None:
-            path_to_snapshot_to_load = (
-                self.work_dir / "snapshots" / "latest_snapshot.pt"
-            )
-        else:
-            path_to_snapshot_to_load = Path(path_to_snapshot_to_load)
-        if not path_to_snapshot_to_load.is_file():
-            raise ValueError(
-                f"Provided file '{str(path_to_snapshot_to_load)}' is not a snapshot."
-            )
-        with path_to_snapshot_to_load.open("rb") as f:
-            payload = torch.load(f, map_location="cpu")
-        self.agent.load_state_dict(payload.pop("agent"))
+        snapshot = (
+            self.work_dir / "snapshots" / "latest_snapshot.pt"
+            if path_to_snapshot_to_load is None
+            else Path(path_to_snapshot_to_load)
+        )
+
+        if not snapshot.is_file():
+            raise ValueError(f"Provided file '{snapshot}' is not a snapshot.")
+
+        with snapshot.open("rb") as f:
+            payload = torch.load(f, map_location="cpu", weights_only=False)
+
+        agent_state = payload.pop("agent")
+        self.agent.load_state_dict(agent_state, strict=True)
+
         for k, v in payload.items():
-            self.__dict__[k] = v
+            setattr(self, k, v)

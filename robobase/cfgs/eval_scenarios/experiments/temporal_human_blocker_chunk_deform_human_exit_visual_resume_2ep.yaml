@@ -1,0 +1,18 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker_chunk_deform_human_exit_visual_resume_50ep.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_human_exit_visual_resume_2ep
+
+safety_filter:
+  overrides:
+    explicit_recovery:
+      mpc_handoff_action_agreement_source: target
+      mpc_handoff_use_selected_act_action_if_safe: true
+      mpc_handoff_bridge_ramp_on_resume_not_ready: true
+      mpc_handoff_bridge_ramp_max_steps: 4
+
+eval_args:
+  episodes: 2

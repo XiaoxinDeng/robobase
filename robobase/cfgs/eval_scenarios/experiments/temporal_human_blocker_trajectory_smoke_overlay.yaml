@@ -1,0 +1,10 @@
+# @package _global_
+
+eval_args:
+  episodes: 1
+  steps: 140
+  no_record_video: true
+  log_chunk_trajectories: true
+  log_mpc_replay_diagnostics: false
+  plot_chunk_trajectories_3d: false
+  stop_video_at_steps: 140

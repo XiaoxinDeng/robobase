@@ -1,0 +1,23 @@
+# @package _global_
+
+# Overlay for running path-consistent braking reachability and shield features
+# without a long eval CLI. This is merged on top of path_consistent_brake.yaml.
+safety_filter:
+  # Relaxed enough to test whether the prior all-brake rollout was caused by
+  # conservative clearance/reachability margins rather than policy failure.
+  min_clearance: 0.04
+  shield_substeps: 2
+  inner_shield_verification_enabled: true
+
+  reachability_certification_enabled: true
+  reachability_fail_closed: false
+  reachability_robot_radius: 0.04
+  reachability_obstacle_radius: 0.0
+  reachability_robot_points_source: q_base
+
+  reachability_inflation_enabled: true
+  reachability_tracking_error: 0.005
+  reachability_measurement_error: 0.005
+  reachability_object_speed: 1.0
+  reachability_object_acceleration: 0.0
+  reachability_sensor_delay: 0.02

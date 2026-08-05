@@ -1,0 +1,28 @@
+# @package _global_
+
+extends:
+  - temporal_human_blocker_chunk_deform.yaml
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_no_affordance_noreset
+  description: >-
+    Ablation: disable the resume affordance gate and do not reset ACT action or
+    visual/policy-observation history after recovery. When visual reset is off,
+    eval seeds the policy observation stack from the last real recovery observations.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    safechunk_recover:
+      resume_affordance_enabled: false
+      resume_affordance_weight: 0.0
+      resume_affordance_min_score: 0.0
+      resume_affordance_min_component_score: 0.0
+
+eval_args:
+  episodes: 2
+  reset_action_history_after_recovery: false
+  reset_visual_history_after_recovery: false

@@ -405,6 +405,15 @@ class UniformReplayBuffer(ReplayBuffer):
         transition.update(kwargs)
         transition.update(observation)
 
+        # # auto-fill missing extra replay elements
+        # for element_name, space in self.extra_replay_elements.items():
+        #     if element_name not in transition:
+        #         if space.shape == ():
+        #             transition[element_name] = np.zeros((), dtype=space.dtype)
+        #         else:
+        #             transition[element_name] = np.zeros(space.shape, dtype=space.dtype)
+
+
         # Check transition shape is correct
         self._check_add_types(transition, self._storage_signature)
 
@@ -759,13 +768,13 @@ class UniformReplayBuffer(ReplayBuffer):
             # Retrieve tp1 observations
             replay_sample[name + "_tp1"] = episode[name][next_obs_idxs]
 
-        # Handle action sequences
+        # Handle action sequences and record which positions are real actions.
         action_start_idx = idx
         action_end_idx = min(idx + self._action_seq_len, ep_len)
-        # - action_idxs contains indices of all action, considering action sequences.
         action_idxs = list(range(action_start_idx, action_end_idx))
         action_seq = episode[ACTION][action_idxs]
-        # - Pad zeros to the end if action_sequences exceeds eps_len
+        mask = np.ones((len(action_seq),), dtype=np.float32)
+
         if len(action_seq) < self._action_seq_len:
             num_action_to_pad = self._action_seq_len - len(action_seq)
             action_seq = np.concatenate(
@@ -777,7 +786,15 @@ class UniformReplayBuffer(ReplayBuffer):
                 ],
                 axis=0,
             )
+            mask = np.concatenate(
+                [
+                    mask,
+                    np.zeros((num_action_to_pad,), dtype=np.float32),
+                ],
+                axis=0,
+            )
         replay_sample[ACTION] = action_seq
+        replay_sample["mask"] = mask
 
         # Add the rest
         discount_slice_len = next_idx - idx

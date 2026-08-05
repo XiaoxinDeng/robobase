@@ -1,0 +1,58 @@
+# @package _global_
+
+extends: []
+
+scenario:
+  name: default_human_arm_motion_environment
+  description: >-
+    Default human-arm runtime environment used for drawer-top-open ACT safety
+    comparisons. This mirrors the environment setup from the optimized video
+    trajectory run, while leaving the safety method to concrete scenarios.
+
+environment:
+  env: bigym/human_arm_drawer_top_open
+  # A mirror environment, we do not need it
+  safety_env: null
+  # controls where the eval script gets observation/action normalization stats for the ACT policy.
+  normalization_source: auto # eval # policy
+  # Hide human arm from policy observation
+  hide_human_arm_policy_obs: true
+  # allow human arm to collide with the robot
+  enable_human_arm_collisions: false
+  visual_only_human_arm: false
+  # Whether to freeze the human arm motion during evaluation. If set to true, the human arm will not move and will remain in its initial position throughout the evaluation.
+  freeze_human_arm: false
+  # Whether to monitor h violation the entire horizon, even during deform and recovery phase. Enable for logging.
+  live_h_monitor: false
+  override:
+    - env.episode_length=400000
+    - env.manifest=/home/xd1125/.bigym/demonstrations/0.9.0/DrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/lightweight/manifest.json
+    - env.privileged_information=false
+    - env.require_mode_label=false
+    - frame_stack=4
+
+safety_filter: {}
+
+eval_args:
+  # ACT checkpoint
+  snapshot: exp_local/pixel_act/bigym_drawer_top_open_20260528034109/snapshots/3000_snapshot.pt
+  # Number of evaluation episodes to run.
+  episodes: 1
+  # Number of steps to run the evaluation for.
+  steps: 300
+  # Load 40 demos from the manifest for action normalization
+  demos: 40
+  # Human arm motion seed.
+  seed: 1
+  # per-step raw metrics filename, other metrics will be logged to the same prefix, i.e.{out}_episodes.json, {out}_summary.json.
+  out: metrics.jsonl
+  # Use simulation time as the time base for video recording. If set to "wall", will use wall-clock time.
+  video_time_base: sim # wall
+  # Stop video recording after this many steps. If set to 0, will record the entire episode.
+  stop_video_at_steps: 300
+  # Whether to continue evaluation after a successful episode. If set to false, evaluation will stop after the first successful episode.
+  continue_after_success: false
+  # disable the terminal/progress bar output
+  no_progress: true
+  # Override human arm position to prevent collision at spawn.
+  human_arm_force_carrier_xy: [0.06, -0.31]

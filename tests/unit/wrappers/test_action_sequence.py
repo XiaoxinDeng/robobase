@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from gymnasium.vector import SyncVectorEnv
 from tests.unit.wrappers.utils import DummyEnv, ACTION_SHAPE
@@ -104,3 +105,30 @@ def test_receding_horizon_cant_be_used_with_vec_env():
             execution_length=EXE_LEN,
             temporal_ensemble=True,
         )
+
+
+class _RecordingDummyEnv(DummyEnv):
+    def step(self, action):
+        self.last_action = np.asarray(action).copy()
+        return super().step(action)
+
+
+
+
+def test_receding_horizon_reports_post_smoothing_executed_action():
+    base = _RecordingDummyEnv()
+    env = RecedingHorizonControl(
+        base,
+        sequence_length=SEQ_LEN,
+        time_limit=TIME_LIMIT,
+        execution_length=EXE_LEN,
+        temporal_ensemble=False,
+        action_smoothing_enabled=True,
+        action_smoothing_alpha=0.5,
+    )
+    env.reset()
+    env.step(np.ones((SEQ_LEN,) + ACTION_SHAPE, dtype=np.float32))
+    _, _, _, _, info = env.step(np.zeros((SEQ_LEN,) + ACTION_SHAPE, dtype=np.float32))
+    assert info["rhc_executed_action_available"] is True
+    assert np.allclose(info["rhc_executed_action"], base.last_action)
+    assert info["rhc_requested_vs_executed_l2"] > 0.0

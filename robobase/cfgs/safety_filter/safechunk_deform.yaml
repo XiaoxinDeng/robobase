@@ -1,0 +1,376 @@
+# @package _global_
+
+safety_filter:
+  _target_: robobase.safetyfilter.safechunk_deform_filter.SafeChunkDeformFilter
+  _recursive_: false
+
+  cfg:
+    safety_filter:
+      enabled: true
+      horizon: 16
+      dt: 0.05
+      action_dim: 16
+      expected_motion_dim: 14
+      control_type: absolute
+      debug: true
+
+      # SafeChunk/MPC recovery controls pelvis + H1 arm joints, including both
+      # wrist joints because wrist-camera viewpoint matters for ACT resume.
+      # Gripper/action-only dims remain outside the SafeChunk optimization.
+      # OSCBF still keeps its internal 8D shoulder/elbow CBF control model.
+      controlled_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+      controlled_state_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+      min_clearance: 0.12
+
+      diagnostics:
+        enabled: true
+        large_arm_delta_threshold: 3.0
+        large_base_delta_threshold: 0.5
+        low_act_ratio_threshold: 0.3
+        high_fallback_ratio_threshold: 0.5
+
+      # Shared calibrated action->q rollout model used by SafeChunk horizon safety,
+      # deformation, recovery, and MPC handoff. Defaults preserve existing behavior:
+      # floating-base dims are delta, arm dims are absolute targets.
+      rollout_model:
+        enabled: true
+        base_delta_always: true
+        base_delta_scale: 1.0
+        arm_target_alpha: 1.0
+        per_state_action_scale: null
+        per_state_action_bias: null
+        per_state_delta_scale: null
+        per_state_target_alpha: null
+        per_state_velocity_scale: null
+        per_state_max_step: null
+        absolute_state_indices: null
+        delta_state_indices: null
+        velocity_state_indices: null
+
+      # Temporary contact-rich guard: while the hand is likely latched/contacting
+      # the drawer handle, unsafe chunks pause/brake instead of spatially deforming
+      # the ACT trajectory. Nominal safe chunks still pass through.
+      contact_rich_pause:
+        enabled: true
+        activate_on_metadata: true
+        activate_on_gripper_command: true
+        signal_keys:
+          - contact_rich
+          - contact_rich_state
+          - in_contact
+          - gripper_latched
+          - handle_grasped
+          - drawer_handle_grasped
+          - object_grasped
+          - grasped
+          - is_grasped
+          - is_holding
+          - robot_object_contact
+          - robot_drawer_contact
+          - robot_handle_contact
+          - ee_object_contact
+          - gripper_contact
+        count_keys:
+          - contact_count
+          - contacts
+          - robot_object_contact_count
+          - robot_drawer_contact_count
+          - robot_handle_contact_count
+          - robot_human_contact_count
+        gripper_action_indices: [14, 15]
+        gripper_closed_is_high: true
+        gripper_close_threshold: 0.5
+        gripper_lookahead: 4
+        min_hold_steps: 4
+        exit_safe_steps: 2
+        # Gripper-close/contact-rich is a transient pause trigger, not a latch.
+        # If the signal stays high, release back to the main safety logic after
+        # this many filter ticks and do not retrigger until the signal clears.
+        max_pause_steps: 8
+        min_task_progress: null
+        max_task_progress: null
+
+      oscbf_operator:
+        _target_: robobase.safetyfilter.oscbf.oscbffilter.OSCBFFilter
+        urdf_path: null
+        debug: true
+        use_dummy_filter: false
+        expected_motion_dim: 14
+        dt: 0.05
+        human_margin: 0.08
+        alpha_gain: 10.0
+        control_type: absolute
+
+    intervention:
+      brake:
+        brake_progress_threshold: 0.05
+        deadlock_window: 5
+        temporary_blocker:
+          enabled: false
+        safechunk_active_safety:
+          enabled: true
+          # If the freshly proposed ACT horizon is safe, release immediately.
+          # Do not keep holding just to satisfy a dwell/hold window.
+          exit_on_nominal_safe: true
+
+      deform:
+        deformation_enabled: true
+        mode: optimized
+        chunk_deformation_scales: [0.0, 0.25, 0.5, 0.75]
+        chunk_deformation_smoothing: 1
+        sequential_oscbf_fallback: false
+        deform_after_deadlock_window: true
+        unsafe_deformation_fallback: brake
+        optimized_fallback: brake
+        detach_passthrough_dims: true
+        opt_iters: 20
+        opt_lr: 0.03
+        opt_population: 32
+        opt_elite_frac: 0.25
+        opt_seed: 0
+        lambda_safety: 500.0
+        lambda_action: 0.1
+        lambda_path: 0.2
+        lambda_smooth: 0.1
+        acceptance_clearance_tol: 0.005
+        lambda_deform_safety: 800.0
+        lambda_deform_action: 0.1
+        lambda_deform_smooth: 0.1
+        lambda_retreat: 1.0
+        deform_horizon: 4
+        pause_exit_smoothing:
+          enabled: true
+          steps: 1
+          first_alpha: 0.75
+          alpha_increment: 0.25
+          clearance_tolerance: 0.005
+
+        intervention_state:
+          enabled: true
+          intervention_policy: legacy
+          stop_counterfactual_enabled: true
+          goal_block_check_enabled: true
+          deformation_admissibility_enabled: true
+          pause_budget_steps: 0
+          resume_hysteresis_steps: 3
+          deform_commit_steps: 4
+          # The human blocker hold pose reaches the drawer interaction region
+          # at roughly 0.29 m clearance from the handle.
+          goal_block_radius: 0.30
+          goal_block_release_wait_steps: 20
+          max_terminal_deviation: 0.50
+          min_task_progress: 0.0
+          deform_valid_required_steps: 1
+          nominal_clear_required_steps: 3
+          deform_commit_min_steps: 0
+          deform_stall_required_steps: 3
+          min_deform_progress: 0.0
+          min_step_progress: 0.0
+          min_deform_velocity_ratio: 0.0
+          stop_action_threshold: 0.0
+          human_reconsider_distance: 0.03
+          nominal_change_threshold: 0.05
+          resume_blend_steps: 5
+          pause_deform_on_current_human_unsafe: true
+          pause_deform_min_clearance_threshold: 0.03
+          pause_deform_suppress_when_stop_sufficient: true
+          pause_deform_static_human_speed_threshold: 0.03
+          pause_deform_suppress_requires_goal_check: false
+          early_deform_suppress_when_stop_sufficient: true
+          early_deform_static_human_displacement_threshold: 0.02
+          stationary_human_local_escape_enabled: true
+          stationary_human_local_escape_max_steps: 6
+          policy_collision_slowdown_enabled: false
+          policy_collision_slowdown_factors: [0.95]
+          policy_collision_slowdown_max_steps: 1
+          policy_collision_slowdown_min_first_violation: 6
+          pause_guard_slowdown_enabled: true
+          pause_guard_slowdown_factors: [0.65, 0.45, 0.25, 0.10, 0.05]
+          pause_guard_slowdown_max_steps: 2
+
+        optimized_deform:
+          debug_safety_feasibility: true
+          optimizer_method: gradient
+          gradient_samples: 4
+          gradient_eps: 0.015
+          gradient_adam_beta1: 0.9
+          gradient_adam_beta2: 0.999
+          gradient_min_improvement: 0.000001
+          gradient_line_search_scales: [1.0, 0.5, 0.25]
+          gradient_batched_line_search: true
+          gradient_early_stop_on_path: true
+
+      recovery:
+        lambda_rejoin: 0.5
+        rejoin_threshold: 0.03
+        min_rejoin_offset: 2
+        use_ee_pose_rejoin: false
+        use_object_state_rejoin: false
+        brake_if_unrecoverable: true
+        lambda_return_safety: 500.0
+        lambda_return_rejoin: 10.0
+        lambda_return_smooth: 0.2
+        lambda_return_action: 0.1
+        return_horizon: 8
+        max_return_retries: 3
+
+        recoverable_deform:
+          enabled: true
+          inner_rejoin_metric: q_state
+          final_rejoin_metric: q_state
+          cache_nominal_ee: false
+          ee_rejoin_in_inner_loop: false
+          q_rejoin_threshold: 0.25
+          qd_rejoin_threshold: 3.0
+          require_qd_rejoin: true
+          qd_rejoin_hard_threshold: 6.0
+          ee_rejoin_threshold: 0.08
+          explicit_recovery: true
+          use_ee_final_check: false
+
+        explicit_recovery:
+          commit_accepted_chunks: true
+          committed_chunk_safety_check: true
+          committed_safety_tol: 0.005
+          committed_abort_only_if_contact_risk: true
+          committed_min_clearance_for_abort: 0.08
+          committed_deform_min_clearance_for_abort: null
+          repair_committed_action: true
+          monotonic_committed_repair: true
+          committed_execution_margin: 0.0
+          committed_rollout_gain: 1.0
+          closed_loop_recovery_tracking: true
+          adaptive_committed_rollout_gain: true
+          rollout_gain_ema: 0.1
+          rollout_gain_min: 0.2
+          rollout_gain_max: 1.5
+          committed_state_error_threshold: 0.25
+          committed_state_error_action: "replan"
+          committed_state_mismatch_abort_requires_unsafe: true
+          replan_committed_suffix_on_state_mismatch: true
+          committed_suffix_replan_min_remaining: 1
+          opportunistic_act_resume: true
+          opportunistic_resume_q_threshold: null
+          opportunistic_resume_min_clearance: 0.08
+          cancel_committed_on_nominal_safe: true
+          committed_cancel_min_clearance: 0.08
+          max_recover_steps_before_act_resume: 16
+          max_suffix_replans_per_recovery: 3
+          mpc_recovery_enabled: true
+          mpc_recovery_horizon: 8
+          mpc_recovery_prefix_len: 2
+          mpc_recovery_max_replans_per_recovery: 0
+          mpc_recovery_require_ordered_progress: true
+          mpc_recovery_require_live_progress: true
+          mpc_recovery_min_progress_delta: 0.0001
+          mpc_recovery_no_progress_limit: 3
+          # MPC suffix recovery targets a tube around the selected live-safe ACT
+          # nominal trajectory, rather than requiring an exact q-state rejoin.
+          mpc_recovery_target_tube_enabled: true
+          mpc_recovery_target_tube_radius: null
+          mpc_recovery_target_tube_weight: 50.0
+          mpc_recovery_target_tube_require_progress: true
+          mpc_bridge_direction_hard_gate: false
+          # Optional narrow override for noisy handoff heading/progress gates:
+          # disabled by default, and only valid when ACT first action agrees
+          # with the recovery release action under tight thresholds.
+          mpc_handoff_action_agreement_override_enabled: false
+          mpc_handoff_action_agreement_source: release
+          mpc_handoff_require_resume_readiness: false
+          mpc_handoff_action_l2_threshold: 0.15
+          mpc_handoff_action_cosine_threshold: 0.98
+          mpc_handoff_action_arm_l2_threshold: 0.15
+          # Floating pelvis commands are delta-style regardless of global control_type;
+          # avoid letting poorly controlled vertical base motion dominate handoff/state gates.
+          # Wrist joints (8, 13) receive higher tube/window weights so recovery
+          # stays close to the ACT nominal wrist-camera context.
+          mpc_state_error_weights: [1.0, 1.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 3.0, 1.0, 1.0, 1.0, 1.0, 3.0]
+          mpc_handoff_state_weights: [1.0, 1.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 3.0, 1.0, 1.0, 1.0, 1.0, 3.0]
+          mpc_residual_correction_enabled: false
+          mpc_residual_ema_alpha: 0.2
+          mpc_residual_clip: 0.25
+          mpc_replan_every_recovery_step: true
+          extend_recovery_budget_on_progress: true
+          max_recover_steps_with_progress: 24
+          recovery_budget_progress_epsilon: 0.02
+          recovery_budget_no_progress_limit: 2
+
+        safechunk_replan:
+          enabled: true
+          replan_deform_from_current_state: true
+          replan_recovery_from_current_state: true
+          suppress_stale_return: true
+          max_recovery_failure_before_replan: 1
+          allow_recovery_to_nominal_only_if_feasible: true
+          recovery_target_mode: task_progress
+          clear_failed_recovery_on_nominal_safe: true
+
+        safechunk_recover:
+          enabled: true
+          rejoin_nominal_weight: 10.0
+          task_progress_weight: 10.0
+          act_progress_weight: 15.0
+          act_heading_weight: 10.0
+          min_act_heading_cosine: 0.25
+          direction_alignment_weight: 5.0
+          min_direction_cosine: 0.05
+          # Coupled waypoint/heading objective: allow modest position error around
+          # ACT waypoints, but require the actual rolled-out robot heading to align
+          # with the nominal waypoint tangent.
+          ordered_pose_weight: 1.0
+          ordered_delta_weight: 0.5
+          ordered_heading_weight: 10.0
+          ordered_pose_threshold: 0.315
+          ordered_delta_threshold: 0.25
+          ordered_heading_cosine_threshold: 0.75
+          ordered_backtrack_tolerance: 0
+          require_ordered_path: true
+          staged_recovery_enabled: true
+          allow_ordered_path_soft_fail_on_live_progress: true
+          staged_recovery_min_progress_delta: 0.05
+          # Default route is deform/recovery first; brake remains the last fallback
+          # when no safe recoverable candidate can be accepted.
+          retry_cooldown_steps: 0
+          max_attempts_per_unsafe_streak: 0
+          # Legacy settle-period reset is kept harmless with no cooldown/attempt cap.
+          reset_attempts_after_brake_timeout: true
+          reset_attempts_brake_timeout_steps: 4
+          reset_attempts_min_hold_clearance: 0.12
+          reset_attempts_require_safe_hold: true
+          require_direction_alignment: true
+          direction_alignment_margin: 0.0
+          safety_weight: 100.0
+          clearance_penalty_scale: 5.0
+          task_progress_clearance_penalty_scale: 20.0
+          action_deviation_weight: 0.2
+          smoothness_weight: 0.1
+          require_nominal_prefix_safe_for_rejoin: true
+          nominal_rejoin_prefix_min_clearance: 0.04
+          use_latest_nominal_for_rejoin: true
+          suppress_stale_nominal_rejoin: true
+          rejoin_weight_schedule: ramp
+          rejoin_ramp_steps: 5
+
+        safechunk_recovery_corridor:
+          enabled: true
+          require_recover_path_safe: true
+          # Parsed for compatibility only. Post-escape recovery uses the filter's
+          # required_min_clearance directly for immediate, prefix, and full-path checks.
+          recover_path_min_clearance: 0.05
+          recover_immediate_hard_clearance: 0.05
+          recover_prefix_min_clearance: 0.05
+          enable_direct_rejoin: true
+          enable_recovery_bridge_seeds: true
+          enable_delayed_rejoin: true
+          suppress_repeated_unsafe_recovery: true
+          unsafe_recovery_cooldown_steps: 8
+          max_same_target_failures: 2
+          bridge_seed_scales: [0.25, 0.5, 0.75, 1.0]
+          detour_clearance_weight: 100.0
+          detour_task_rejoin_weight: 10.0
+          detour_action_norm_weight: 0.2
+          delayed_rejoin_wait_steps: 4
+          delayed_rejoin_requires_nominal_prefix_safe: true
+          require_safe_corridor_for_recovery_complete: true
+          require_post_recovery_act_window: true
+          post_recovery_min_act_steps: 5

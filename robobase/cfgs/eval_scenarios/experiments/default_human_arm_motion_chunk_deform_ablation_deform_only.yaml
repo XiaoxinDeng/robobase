@@ -1,0 +1,51 @@
+# @package _global_
+
+extends:
+  - default_human_arm_motion.yaml
+  - methods/safechunk_deform.yaml
+
+scenario:
+  name: chunk_deform_ablation_deform_only
+  description: >-
+    Ablation run with SafeChunk deformation enabled while braking-style
+    fallback and explicit recovery mechanisms are disabled.
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    deformation_enabled: true
+    deform_after_deadlock_window: false
+    unsafe_deformation_fallback: best
+    optimized_fallback: brake
+
+    brake_if_unrecoverable: false
+
+    recoverable_deform:
+      enabled: false
+      explicit_recovery: false
+      brake_if_unrecoverable: false
+
+    explicit_recovery:
+      commit_accepted_chunks: false
+      mpc_recovery_enabled: false
+      opportunistic_act_resume: false
+      cancel_committed_on_nominal_safe: false
+
+    safechunk_replan:
+      enabled: false
+      replan_recovery_from_current_state: false
+
+    safechunk_recover:
+      enabled: false
+
+    safechunk_recovery_corridor:
+      enabled: false
+
+eval_args:
+  condition: chunk_deform
+  no_record_video: false
+  log_chunk_trajectories: true
+  plot_chunk_trajectories_3d: true

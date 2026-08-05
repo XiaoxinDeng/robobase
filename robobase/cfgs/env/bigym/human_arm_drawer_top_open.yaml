@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - bigym
+  - _self_
+
+env:
+  task_name: human_arm_drawer_top_open
+  manifest: ~/.bigym/demonstrations/0.9.0/HumanArmDrawerTopOpen/JointPositionActionMode_floating_pelvis_x_pelvis_y_pelvis_z_pelvis_rz_absolute/full/manifest.json
+  require_mode_label: true # The model dose not support external RGB yet
+  stddev_schedule: linear(1.0,0.1,500000)
+  episode_length: 22500
+  demo_down_sample_rate: 25
+  enable_all_floating_dof: true
+  arm_action_mode: scripted
+  enable_temporary_human_blocker: false
+  trigger_dist: 1.20
+  enter_duration: 1.2
+  hold_duration: 1.2
+  exit_duration: 1.2
+  natural_motion_scale: 1.0
+  exit_after_y_peak: true
+  max_blocker_joint_speed: 2.0
+  human_joint_names:
+    - cylinder_arm/arm_tx
+    - cylinder_arm/arm_ty
+    - cylinder_arm/arm_shoulder_base
+    - cylinder_arm/arm_shoulder_yaw
+    - cylinder_arm/arm_shoulder_pitch
+    - cylinder_arm/arm_elbow
+  q_outside: [0.06, -0.31, 0.0, 0.0, -0.35, 1.20]
+  q_block: [0.06, 0.31, 0.0, 1.57, -0.45, 1.00]
+  q_exit: null
+  ee_site_name: right_end_effector
+  handle_site_name: drawer_small_4
+  privileged_information: true

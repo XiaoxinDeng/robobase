@@ -1,0 +1,151 @@
+# @package _global_
+
+safety_filter:
+  enabled: true
+  _target_: robobase.safetyfilter.path_consistent_brake_filter.PathConsistentBrakeFilter
+  _recursive_: false
+
+  horizon: 16
+  dt: 0.05
+  action_dim: 16
+  expected_motion_dim: 14
+  control_type: absolute
+  debug: true
+
+  # Base+arm safety-control indices. Dims 0..3 are floating-base/pelvis
+  # controls; dims 4..12 are arm joints used by the H1 OSCBF model.
+  controlled_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12]
+  controlled_state_indices: [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12]
+
+  min_clearance: 0.12
+  brake_progress_threshold: 0.05
+  deadlock_window: 5
+  deformation_enabled: false
+  mode: optimized
+  chunk_deformation_scales: [0.0, 0.25, 0.5, 0.75]
+  chunk_deformation_smoothing: 1
+  sequential_oscbf_fallback: false
+  deform_after_deadlock_window: true
+  unsafe_deformation_fallback: brake
+  opt_iters: 20
+  opt_lr: 0.03
+  lambda_safety: 500.0
+  lambda_action: 0.1
+  lambda_path: 0.2
+  lambda_smooth: 0.1
+  optimized_fallback: brake
+  detach_passthrough_dims: true
+
+  waypoint_substeps: 2
+  max_waypoint_delta: null
+  slowdown_enabled: true
+  slowdown_lookahead: 2
+  slowdown_min_scale: 0.0
+  certified_backup_enabled: true
+  trajectory_generation_enabled: true
+  trajectory_max_velocity: 2.0
+  trajectory_max_acceleration: 8.0
+  trajectory_max_jerk: 80.0
+  trajectory_initial_speed: 0.0
+  trajectory_backend: auto
+  trajectory_min_position: null
+  trajectory_max_position: null
+  shield_substeps: 1
+  inner_shield_verification_enabled: true
+  skip_inner_shield_when_rejected: true
+  reuse_operator_human_rollout_cache: true
+  background_check_only: false
+  reachability_certification_enabled: false
+  reachability_fail_closed: false
+  reachability_robot_radius: 0.08
+  reachability_obstacle_radius: 0.0
+  reachability_robot_points_source: auto
+  reachability_inflation_enabled: false
+  reachability_tracking_error: 0.0
+  reachability_measurement_error: 0.0
+  reachability_object_speed: 0.0
+  reachability_object_acceleration: 0.0
+  reachability_sensor_delay: 0.0
+  safety_constraint_type: ssm
+  pfl_energy_threshold: null
+  pfl_contact_margin: 0.0
+  pfl_joint_inertia: 1.0
+  pfl_energy_thresholds: {}
+  pfl_active_threshold_key: null
+
+  safechunk_active_safety:
+    enabled: false
+    check_hold_horizon_safety: false
+    emergency_deform_when_hold_unsafe: false
+    optimize_when_hold_unsafe: false
+  recoverable_deform:
+    enabled: true
+    lambda_rejoin: 0.5
+    rejoin_threshold: 0.03
+    inner_rejoin_metric: q_state
+    final_rejoin_metric: q_state
+    cache_nominal_ee: false
+    ee_rejoin_in_inner_loop: false
+    q_rejoin_threshold: 0.5
+    ee_rejoin_threshold: 0.08
+    explicit_return: true
+    acceptance_clearance_tol: 0.005
+    lambda_deform_safety: 800.0
+    lambda_deform_action: 0.1
+    lambda_deform_smooth: 0.1
+    lambda_retreat: 1.0
+    lambda_return_safety: 500.0
+    lambda_return_rejoin: 5.0
+    lambda_return_smooth: 0.2
+    lambda_return_action: 0.1
+    deform_horizon: 4
+    return_horizon: 8
+    max_return_retries: 3
+    use_ee_final_check: false
+    min_rejoin_offset: 2
+    use_ee_pose_rejoin: false
+    use_object_state_rejoin: false
+    brake_if_unrecoverable: true
+  optimized_deform:
+    debug_safety_feasibility: true
+    optimizer_method: gradient
+    gradient_samples: 4
+    gradient_eps: 0.015
+    gradient_adam_beta1: 0.9
+    gradient_adam_beta2: 0.999
+    gradient_min_improvement: 0.000001
+    gradient_line_search_scales: [1.0, 0.5, 0.25]
+    gradient_batched_line_search: true
+    gradient_early_stop_on_path: true
+  explicit_recovery:
+    commit_accepted_chunks: true
+    committed_chunk_safety_check: true
+    committed_safety_tol: 0.005
+    committed_abort_only_if_contact_risk: true
+    committed_min_clearance_for_abort: 0.08
+    repair_committed_action: true
+    monotonic_committed_repair: true
+    committed_execution_margin: 0.02
+    committed_rollout_gain: 1.0
+    committed_state_error_threshold: 0.25
+    committed_state_error_action: replan
+  diagnostics:
+    enabled: true
+    large_arm_delta_threshold: 3.0
+    large_base_delta_threshold: 0.5
+    low_act_ratio_threshold: 0.3
+    high_fallback_ratio_threshold: 0.5
+  opt_population: 32
+  opt_elite_frac: 0.25
+  opt_seed: 0
+
+  oscbf_operator:
+    _target_: robobase.safetyfilter.oscbf.oscbffilter.OSCBFFilter
+    urdf_path: null
+    debug: true
+    use_dummy_filter: false
+    expected_motion_dim: 14
+    dt: 0.05
+    human_margin: 0.08
+    alpha_gain: 10.0
+    control_type: absolute

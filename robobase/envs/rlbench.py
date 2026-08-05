@@ -672,6 +672,7 @@ class RLBenchEnvFactory(EnvFactory):
                     cfg.action_sequence,
                 )
             else:
+                action_smoothing = cfg.get("action_smoothing", {})
                 env = RecedingHorizonControl(
                     env,
                     cfg.action_sequence,
@@ -679,6 +680,11 @@ class RLBenchEnvFactory(EnvFactory):
                     cfg.execution_length,
                     cfg.temporal_ensemble,
                     cfg.temporal_ensemble_gain,
+                    action_smoothing_enabled=action_smoothing.get("enabled", False),
+                    action_smoothing_alpha=action_smoothing.get("alpha", 0.0),
+                    action_smoothing_ignore_last_dims=action_smoothing.get(
+                        "ignore_last_dims", 0
+                    ),
                 )
 
         env = AppendDemoInfo(env)

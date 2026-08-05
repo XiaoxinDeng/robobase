@@ -1,0 +1,21 @@
+# @package _global_
+
+scenario:
+  name: temporal_human_blocker_chunk_deform_handoff_4frame_ablation_ep2_ep3
+
+hydra:
+  run:
+    dir: eval_safety/${scenario.name}_${now:%Y%m%d_%H%M%S}
+
+safety_filter:
+  overrides:
+    explicit_recovery:
+      # Diagnostic only: test four-frame bridge seeding with the old target-only
+      # override. Active behavior remains source=both and readiness-required.
+      mpc_handoff_action_agreement_source: target
+      mpc_handoff_require_resume_readiness: false
+      mpc_handoff_use_selected_act_action_if_safe: true
+
+
+eval_args:
+  reset_visual_history_after_recovery: false
